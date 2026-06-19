@@ -265,7 +265,9 @@ def consumers(last: str = Query("24h")):
 
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
-    return DASHBOARD_HTML
+    # Single-sourced from overlaat.__version__ (the running version), substituted
+    # into the static template's footer byline at request time.
+    return DASHBOARD_HTML.replace("{{OVERLAAT_VERSION}}", SERVICE_VERSION)
 
 
 DASHBOARD_HTML = r"""<!DOCTYPE html>
@@ -311,6 +313,7 @@ footer{color:var(--dim);font-size:11px;text-align:center;padding:14px}
 </style></head><body>
 <header>
   <h1>Overlaat metrics</h1>
+  <span class="dim" style="font-family:var(--mono);font-size:11px">v{{OVERLAAT_VERSION}}</span>
   <span class="verdict" id="verdict">…</span>
   <span class="spacer"></span>
   <label class="dim" style="font-size:11px">window

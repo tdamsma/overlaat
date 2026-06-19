@@ -10,7 +10,7 @@ untouched — these tests build their own `sqlite:` URL per-test.
 
 import json
 
-from overlaat import db
+from overlaat import __version__, db
 from overlaat import host_logger as hl
 from overlaat import metrics_db as m
 from overlaat import queue_proxy as qp
@@ -56,6 +56,7 @@ def test_end_to_end_roundtrip(tmp_path, monkeypatch):
             "http_status": 200,
             "prompt_tokens": 10,
             "completion_tokens": 20,
+            "overlaat_version": qp.SERVICE_VERSION,
         },
         {
             "t_enqueue": 0.0,
@@ -69,6 +70,7 @@ def test_end_to_end_roundtrip(tmp_path, monkeypatch):
             "http_status": 200,
             "prompt_tokens": 10,
             "completion_tokens": 40,
+            "overlaat_version": qp.SERVICE_VERSION,
         },
     ]
     _write_events_via_proxy_path(url, events)
@@ -99,6 +101,13 @@ def test_end_to_end_roundtrip(tmp_path, monkeypatch):
     assert len(got) == 2
     assert {e["model_requested"] for e in got} == {"m1"}
     assert sorted(e["completion_tokens"] for e in got) == [20, 40]
+
+    # The proxy writer fills overlaat_version automatically from overlaat.__version__;
+    # every round-tripped request_events row records the running version.
+    with db.connect(url) as c, c.cursor() as cur:
+        cur.execute("SELECT overlaat_version FROM request_events")
+        versions = [r[0] for r in cur.fetchall()]
+    assert versions == [__version__, __version__]
 
     samples = m.fetch_host_samples(url, since=0.0)
     assert len(samples) == 1

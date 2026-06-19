@@ -70,6 +70,8 @@ async def test_forward_uncapped_emits_one_event(monkeypatch, mock_upstream):
     assert captured["outcome"] == "completed"
     assert captured["prompt_tokens"] == 7
     assert captured["completion_tokens"] == 9
+    # The proxy stamps every event with the running Overlaat version.
+    assert captured["overlaat_version"] == qp.SERVICE_VERSION
     await qp.app.state.client.aclose()
 
 
