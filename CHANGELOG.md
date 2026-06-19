@@ -8,6 +8,13 @@ versions without a compatibility guarantee.
 
 ## [Unreleased]
 
+### Changed
+- SQLite connections now set `PRAGMA busy_timeout=5000` (alongside `journal_mode=WAL`) at every connection point — read path (`db.connect`), writer (`db.connect_sqlite_write`), and the host sampler's connect helper — so concurrent dashboard reads and the single writer wait briefly instead of immediately raising "database is locked".
+- Documented SQLite operations (WAL `-wal`/`-shm` sidecar files, single-writer/no-`--workers` rule, schema init via `python -m overlaat.db init`, and online backup with `sqlite3 ".backup"` / `VACUUM INTO`) in the README and `docs/OBSERVABILITY.md`.
+
+### Fixed
+- `db.normalize_backends_json` now emits a one-line warning when `host_samples.backends_json` fails to parse (returning `None` as before), so silently corrupted JSON becomes visible instead of disappearing into a NULL.
+
 ## [0.0.2] — 2026-06-19
 
 ### Added

@@ -30,8 +30,24 @@ import json
 import os
 import sqlite3
 import sys
+import warnings
 from pathlib import Path
 from typing import Any
+
+# Shared SQLite pragmas, applied at every connection point (read + write). WAL
+# lets the single writer and concurrent dashboard reads coexist; busy_timeout
+# makes a reader/writer that finds the db momentarily locked wait up to this
+# many milliseconds instead of immediately raising "database is locked".
+_SQLITE_BUSY_TIMEOUT_MS = 5000
+
+
+def _apply_sqlite_pragmas(conn: sqlite3.Connection) -> None:
+    """Set WAL journaling + a busy timeout on a freshly opened SQLite connection.
+
+    # KEEP IN SYNC with overlaat.host_logger._sqlite_connect (stdlib-only there)."""
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(f"PRAGMA busy_timeout={_SQLITE_BUSY_TIMEOUT_MS}")
+
 
 # ── dialect detection ─────────────────────────────────────────────────────────
 
@@ -94,7 +110,7 @@ def connect(url: str):
     """
     if dialect_for(url) == "sqlite":
         conn = _SqliteConn(sqlite_path(url), timeout=5.0)
-        conn.execute("PRAGMA journal_mode=WAL")
+        _apply_sqlite_pragmas(conn)
         return conn
     import psycopg  # lazy: only needed on the Postgres path
 
@@ -137,7 +153,7 @@ def connect_sqlite_write(url: str) -> sqlite3.Connection:
     commit() commits the whole batch as one transaction (the queue-proxy writer
     relies on this for atomic batched event writes)."""
     conn = sqlite3.connect(sqlite_path(url), timeout=15.0)
-    conn.execute("PRAGMA journal_mode=WAL")
+    _apply_sqlite_pragmas(conn)
     return conn
 
 
@@ -158,7 +174,15 @@ def normalize_backends_json(value: Any) -> Any:
     if isinstance(value, (str, bytes, bytearray)):
         try:
             return json.loads(value)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError) as e:
+            # Surface silent corruption: a malformed backends_json would otherwise
+            # come back as NULL with no indication of why. One concise warning per
+            # failing call (warnings dedupes identical messages by default anyway).
+            warnings.warn(
+                f"normalize_backends_json: dropping unparseable host_samples.backends_json "
+                f"({type(e).__name__}: {e})",
+                stacklevel=2,
+            )
             return None
     return value
 

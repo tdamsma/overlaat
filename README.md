@@ -136,6 +136,17 @@ concurrency.
 > SQLite runs in WAL mode, so the read-only dashboard reads alongside it without
 > blocking. Postgres remains the default and the choice for any shared/multi-host setup.
 
+> **SQLite, operationally.** WAL mode writes two sidecar files (`overlaat.db-wal`
+> and `overlaat.db-shm`) next to the `.db`; that is expected. The single-writer
+> model is why SQLite fits here — the queue-proxy is one process, so **never run it
+> with `--workers N`**. Initialize or upgrade the schema (idempotent) with
+> `python -m overlaat.db init "$DATABASE_URL"`. To back up safely while the proxy is
+> running, use SQLite's online backup rather than copying the file by hand:
+>
+> ```bash
+> sqlite3 overlaat.db ".backup backup.db"     # or: VACUUM INTO 'backup.db'
+> ```
+
 > The proxy runs a **single uvicorn worker on purpose**: the in-memory per-model
 > semaphores and the instrumentation live in that one process, so FIFO ordering and
 > event emission must not be sharded across workers. This is a feature, not a TODO.

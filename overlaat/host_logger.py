@@ -121,8 +121,13 @@ def sqlite_path(url: str) -> str:
 
 
 def _sqlite_connect(url: str) -> sqlite3.Connection:
+    # WAL lets the single writer and the dashboard's reads coexist; busy_timeout
+    # makes a momentarily-locked connection wait instead of immediately raising
+    # "database is locked". Kept inline so this module stays stdlib-only.
+    # KEEP IN SYNC with overlaat.db._apply_sqlite_pragmas.
     conn = sqlite3.connect(sqlite_path(url), timeout=15.0)
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     return conn
 
 
