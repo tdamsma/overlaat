@@ -6,6 +6,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html) — though whi
 status is **experimental**, the APIs and the Postgres schema may change between
 versions without a compatibility guarantee.
 
+## [Unreleased]
+
+### Added
+- Wheel-install smoke-test CI job: installs the built wheel into a fresh `uv` virtualenv and imports the package and its submodules, guarding against packaging regressions.
+- Contributor scaffolding: `CONTRIBUTING.md` (uv-based dev setup, test/lint commands, the version/tag-guard release rule), GitHub issue templates, and a `docs/` index.
+- Tests for contended queue behavior: FIFO admission under a full per-model semaphore, cancel-while-queued vs in-flight, and the lifecycle outcome strings (`cancelled_queued`, `completed`, `upstream_error`, `client_abandoned`).
+
+### Changed
+- README: added PyPI version, CI status, Python-versions, and MIT license badges; the quickstart now leads with `uv pip install overlaat` and demotes the editable install to a uv-based development note.
+
 ## [0.0.1] — 2026-06-19
 
 First public release. Overlaat is a sidecar that sits in *front* of a self-hosted,
