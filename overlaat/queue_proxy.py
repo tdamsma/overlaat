@@ -84,22 +84,23 @@ _EVENT_COLS = (
     "http_status",
     "prompt_tokens",
     "completion_tokens",
+    "overlaat_version",
 )
 # Postgres uses psycopg named params (the writer feeds dict rows via executemany);
 # SQLite uses positional `?` params (rows projected to a tuple in _EVENT_COLS order).
 _INSERT_SQL_PG = (
     "INSERT INTO request_events "
     "(t_enqueue, t_acquire, t_first_token, t_done, model_requested, key_fp, "
-    " streamed, outcome, http_status, prompt_tokens, completion_tokens) "
+    " streamed, outcome, http_status, prompt_tokens, completion_tokens, overlaat_version) "
     "VALUES (%(t_enqueue)s, %(t_acquire)s, %(t_first_token)s, %(t_done)s, "
     "%(model_requested)s, %(key_fp)s, %(streamed)s, %(outcome)s, "
-    "%(http_status)s, %(prompt_tokens)s, %(completion_tokens)s)"
+    "%(http_status)s, %(prompt_tokens)s, %(completion_tokens)s, %(overlaat_version)s)"
 )
 _INSERT_SQL_SQLITE = (
     "INSERT INTO request_events "
     "(t_enqueue, t_acquire, t_first_token, t_done, model_requested, key_fp, "
-    " streamed, outcome, http_status, prompt_tokens, completion_tokens) "
-    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    " streamed, outcome, http_status, prompt_tokens, completion_tokens, overlaat_version) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
 # Back-compat alias: the Postgres statement remains the module-level default.
 _INSERT_SQL = _INSERT_SQL_PG
@@ -584,6 +585,7 @@ async def proxy(full_path: str, request: Request):
             "model_requested": model,
             "key_fp": _key_fp(request),
             "streamed": streamed,
+            "overlaat_version": SERVICE_VERSION,
         }
 
     if sem is None:

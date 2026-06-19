@@ -13,6 +13,8 @@ versions without a compatibility guarantee.
 - Contributor scaffolding: `CONTRIBUTING.md` (uv-based dev setup, test/lint commands, the version/tag-guard release rule), GitHub issue templates, and a `docs/` index.
 - Tests for contended queue behavior: FIFO admission under a full per-model semaphore, cancel-while-queued vs in-flight, and the lifecycle outcome strings (`cancelled_queued`, `completed`, `upstream_error`, `client_abandoned`).
 - Optional SQLite storage backend, selected by the `DATABASE_URL` scheme (`sqlite:///path.db`); Postgres remains the default. Adds an `overlaat.db` dialect layer and a `python -m overlaat.db init [DATABASE_URL]` schema initializer that works for both backends. No new mandatory dependencies (SQLite uses the standard-library `sqlite3`).
+- The running Overlaat version is now shown in the usage-API dashboard.
+- Each request_events row records the Overlaat version that served it (new `overlaat_version` column).
 
 ### Changed
 - README: added PyPI version, CI status, Python-versions, and MIT license badges; the quickstart now leads with `uv pip install overlaat` and demotes the editable install to a uv-based development note.

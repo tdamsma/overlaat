@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS request_events (
   outcome           TEXT NOT NULL,               -- completed | client_abandoned | upstream_error | cancelled_queued
   http_status       INTEGER,
   prompt_tokens     INTEGER,                     -- NULL = backend did not report usage (never zero-filled)
-  completion_tokens INTEGER
+  completion_tokens INTEGER,
+  overlaat_version  TEXT                          -- Overlaat version that served this request; NULL for pre-upgrade rows
 );
 CREATE INDEX IF NOT EXISTS ix_re_tenq    ON request_events (t_enqueue);
 CREATE INDEX IF NOT EXISTS ix_re_tdone   ON request_events (t_done);

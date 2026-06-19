@@ -3,6 +3,7 @@ status scrape are mocked, so no Postgres or running proxy is needed."""
 
 import httpx
 
+from overlaat import __version__
 from overlaat import metrics_db as mdb
 from overlaat import usage_api as ua
 
@@ -104,3 +105,20 @@ async def test_consumers(monkeypatch):
     async with asgi() as c:
         r = await c.get("/consumers?last=24h")
     assert r.status_code == 200
+
+
+async def test_dashboard_shows_version():
+    async with asgi() as c:
+        r = await c.get("/")
+    assert r.status_code == 200
+    # The running Overlaat version is rendered in the dashboard byline, sourced
+    # from overlaat.__version__ (no template placeholder leaks through).
+    assert f"v{__version__}" in r.text
+    assert "{{OVERLAAT_VERSION}}" not in r.text
+
+
+async def test_healthz_reports_version(monkeypatch):
+    monkeypatch.setattr(mdb, "_connect", lambda db: _FakeConn())
+    async with asgi() as c:
+        r = await c.get("/healthz")
+    assert r.json()["version"] == __version__
