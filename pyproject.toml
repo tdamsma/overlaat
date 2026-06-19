@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "overlaat"
+version = "0.0.1"
+description = "Controlled overflow for self-hosted LLMs: a fair waiting-queue, honest usage accounting, and a read-only dashboard in front of a multi-backend LLM gateway."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [
+    { name = "Thijs Damsma" },
+]
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "httpx",
+    "pyyaml",
+    "psycopg[binary]",
+]
+
+[project.urls]
+Homepage = "https://github.com/tdamsma/overlaat"
+
+[tool.hatch.build.targets.wheel]
+packages = ["overlaat"]

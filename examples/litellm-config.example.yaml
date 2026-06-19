@@ -1,0 +1,110 @@
+# LiteLLM Proxy config — example for use behind the Overlaat queue-proxy.
+#
+# WHAT OVERLAAT READS FROM THIS FILE:
+# The queue-proxy parses this LiteLLM config for exactly ONE thing: the
+# `max_parallel_requests` integer under each model's `litellm_params`. That
+# integer is the per-model semaphore cap — the number of requests Overlaat will
+# let through to the backend concurrently before the rest WAIT in a FIFO queue
+# (instead of being rejected with a 429). Everything else here (api_base,
+# routing, master_key, ...) is LiteLLM's own concern; the proxy does not
+# interpret it. So: this file is the single source of truth for the caps, and
+# the caps live next to the model they govern.
+#
+# The cap is NOT a tuning knob you invent in isolation — it is DERIVED from the
+# backend's real concurrency capacity (engine process count, server
+# `--parallel`-style flags, GPU residency limits). If you change a cap here,
+# also change the backend that actually serves it, or the two drift apart and
+# the queue will either starve a capable backend or oversubscribe a serial one.
+#
+# Default config path is `./litellm-config.yaml`; override with an env var
+# (e.g. OVERLAAT_LITELLM_CONFIG) if you keep it elsewhere. Secrets come from an
+# env-file (default `./overlaat.env`), never from this file.
+
+model_list:
+
+  # ─── Example 1: a chat model behind Ollama ────────────────────────────────
+  # `model_name` is what the consumer asks for; `litellm_params.model` is what
+  # the backend receives. The cap below is what the queue-proxy reads as this
+  # model's per-model semaphore: how many of these requests may be in flight at
+  # the backend at once. Here it is DERIVED from the backend's own parallelism
+  # setting (e.g. an Ollama server started with NUM_PARALLEL=4). Keep the two in
+  # lockstep: bump one, bump the other.
+  - model_name: chat-model
+    litellm_params:
+      model: ollama_chat/your-chat-model
+      api_base: http://127.0.0.1:11434
+      max_parallel_requests: 4   # ← per-model semaphore cap read by the queue-proxy. Matches the backend's parallelism (NUM_PARALLEL=4).
+      # `think` is an Ollama extension passed through via extra_body; harmless
+      # to omit. Shown only to illustrate that LiteLLM forwards extra fields.
+      extra_body: {"think": false}
+
+  # ─── Example 2: an embeddings model ───────────────────────────────────────
+  # Embeddings are short and cheap; a modest cap is plenty. The cap is still the
+  # queue-proxy semaphore — requests beyond it WAIT in FIFO rather than fail.
+  - model_name: embeddings-model
+    litellm_params:
+      model: openai/your-embeddings-model
+      api_base: http://127.0.0.1:8085/v1
+      api_key: dummy
+      max_parallel_requests: 2   # ← per-model semaphore cap read by the queue-proxy.
+
+  # ─── Example 3: a rerank-style cross-encoder (model-a) ────────────────────
+  # A second-stage reranker (cross-encoder) after a first-stage retrieval. The
+  # provider POSTs a Cohere-schema {query, documents, ...} to {api_base}/rerank;
+  # `model_info.mode: rerank` routes it via LiteLLM's /rerank endpoint.
+  #
+  # cap=6 here illustrates a deliberate choice: the backend is a single-process
+  # GPU server with no real parallelism — the 6 requests are ultimately queued
+  # at the GPU, NOT served simultaneously. So why a cap above 1? Because a
+  # GENEROUS semaphore keeps many short interactive rerank calls from
+  # head-of-line blocking each other behind one slow large-batch call. The cap
+  # is a FAIRNESS/admission knob here, not a literal "this many run at once"
+  # claim. Set it to reflect the behaviour you want at the queue, then size the
+  # backend to match.
+  - model_name: model-a
+    litellm_params:
+      model: your-rerank-provider/your-reranker
+      api_base: http://127.0.0.1:8086
+      max_parallel_requests: 6   # ← per-model semaphore cap read by the queue-proxy. Generous on purpose to avoid head-of-line blocking; see comment above.
+    model_info:
+      mode: rerank
+
+  # ─── Illustrative note: a single-stream engine ────────────────────────────
+  # For a backend that is ONE large model on ONE engine process that does not
+  # parallelize internally (a "single-stream engine"), the honest cap is 1: a
+  # cap of 1 gives clean FIFO through the queue-proxy with no head-of-line
+  # surprises, because the engine truly serves one request at a time. If you run
+  # N such engines behind a round-robin wrapper, the cap is N (the parallelism
+  # comes from the process count, not from any one engine). The cap must always
+  # move together with whatever fronts those engines.
+
+# ─── Routing ──────────────────────────────────────────────────────────────────
+# NO cross-model fallbacks (deliberate). Silent degradation to a different or
+# simpler model is undesirable: the consumer asked for a SPECIFIC model and must
+# either get that model or see a clean error — not quietly receive a different
+# quality. The orchestration layer (the harness/caller) decides what to do on
+# failure, not this gateway. LiteLLM fallback is meant for redundant EQUIVALENT
+# deployments (same model, multiple keys/regions), which is not this setup.
+router_settings:
+  num_retries: 1
+  timeout: 1200   # Large-context synthesis (long prefill) under contention can run past 600s; 1200s gives headroom but stays bounded. Must be ≥ the queue-proxy's read-timeout.
+
+# ─── General ──────────────────────────────────────────────────────────────────
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL          # Postgres; the same DB Overlaat writes its lifecycle events to.
+  store_model_in_db: false                       # this config file stays authoritative
+  ui_username: admin
+  ui_password: os.environ/LITELLM_UI_PW
+
+litellm_settings:
+  drop_params: true   # ignore unknown request fields
+  # The prometheus callback exposes /metrics with litellm_request_in_progress,
+  # litellm_request_total_tokens, etc. — useful for in-flight tracking, since
+  # LiteLLM's own SpendLogs only writes on completion (and so misses queued and
+  # client-abandoned calls — which is exactly why Overlaat emits its own
+  # one-event-per-request lifecycle row to Postgres instead).
+  callbacks: ["prometheus"]
+  require_auth_for_metrics_endpoint: false   # loopback-only; network ACL is the auth layer
+  set_verbose: false
+  request_timeout: 1200   # keep in sync with router_settings.timeout

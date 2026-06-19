@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.env
+!*.env.example
+tmp/
+.DS_Store
+*.log
+dist/
+build/
+*.egg-info/
+CLAUDE.md
+PUBLISH.md
+# Diagram build inputs — we publish only the .excalidraw.svg (it embeds the
+# editable scene). The PNG screenshot and the .excalidraw source stay local.
+docs/overlaat-llm-stack.png
+docs/dashboard.png
+docs/*.excalidraw
