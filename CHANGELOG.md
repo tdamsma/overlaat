@@ -8,6 +8,8 @@ versions without a compatibility guarantee.
 
 ## [Unreleased]
 
+## [0.0.2] — 2026-06-19
+
 ### Added
 - Wheel-install smoke-test CI job: installs the built wheel into a fresh `uv` virtualenv and imports the package and its submodules, guarding against packaging regressions.
 - Contributor scaffolding: `CONTRIBUTING.md` (uv-based dev setup, test/lint commands, the version/tag-guard release rule), GitHub issue templates, and a `docs/` index.
@@ -74,4 +76,6 @@ version implements:
 - **Cost-weighted admission** is design-only (see `docs/COST-SCHEDULER.md`); the queue
   is plain per-model FIFO in this version.
 
+[Unreleased]: https://github.com/tdamsma/overlaat/compare/v0.0.2...HEAD
+[0.0.2]: https://github.com/tdamsma/overlaat/releases/tag/v0.0.2
 [0.0.1]: https://github.com/tdamsma/overlaat/releases/tag/v0.0.1
