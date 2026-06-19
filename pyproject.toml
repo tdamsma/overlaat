@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "overlaat"
 version = "0.0.1"
-description = "Controlled overflow for self-hosted LLMs: a fair waiting-queue, honest usage accounting, and a read-only dashboard in front of a multi-backend LLM gateway."
+description = "Fair waiting-queue + honest usage accounting for a Mac Studio shared as a small, trusted team's personal LLM compute server — a sidecar in front of a multi-backend LiteLLM gateway."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"

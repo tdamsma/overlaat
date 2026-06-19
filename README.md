@@ -1,6 +1,6 @@
 # Overlaat
 
-**A fair waiting-queue and honest usage-accounting sidecar for a self-hosted multi-backend LLM gateway.**
+**A fair waiting-queue and honest usage-accounting sidecar for a self-hosted multi-backend LLM gateway — built around a Mac Studio shared as a small, trusted team's personal compute server.**
 
 *Overlaat* is Dutch for a **controlled spillway** in a dike: it sheds overflow by
 design instead of breaching. Same posture toward load — when requests outrun your
@@ -13,9 +13,11 @@ backends, the excess pools in a fair FIFO queue and drains in order, rather than
 
 ## The problem it solves
 
-You are self-hosting a handful of models for a small team — a couple of GPUs (or one
-big Apple-Silicon box), several models behind a [LiteLLM](https://github.com/BerriAI/litellm)
-gateway, a mix of interactive chat and bursty batch jobs. Two things hurt:
+You are running a **Mac Studio (or similar big Apple-Silicon box) as a personal compute
+server**, shared by a small, trusted team — several models behind a
+[LiteLLM](https://github.com/BerriAI/litellm) gateway, a mix of interactive chat and
+bursty batch jobs, on one trusted network where API keys are attribution, not secrets.
+Two things hurt:
 
 1. **Overflow is a cliff, not a queue.** LiteLLM's `max_parallel_requests` (and any
    swap-layer concurrency limit) *reject* on overflow — they return `429` rather than
