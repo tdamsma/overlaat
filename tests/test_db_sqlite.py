@@ -10,6 +10,8 @@ untouched — these tests build their own `sqlite:` URL per-test.
 
 import json
 
+import pytest
+
 from overlaat import __version__, db
 from overlaat import host_logger as hl
 from overlaat import metrics_db as m
@@ -247,3 +249,61 @@ def test_resolve_key_aliases_sqlite_empty(tmp_path):
     url = _sqlite_url(tmp_path)
     db.init_db(url)  # no LiteLLM_VerificationToken table exists
     assert m.resolve_key_aliases(url) == {}
+
+
+# ── 5. SQLite pragmas: WAL + busy_timeout on every connection point ──────────────
+
+
+def _busy_timeout(conn) -> int:
+    return conn.execute("PRAGMA busy_timeout").fetchone()[0]
+
+
+def _journal_mode(conn) -> str:
+    return conn.execute("PRAGMA journal_mode").fetchone()[0].lower()
+
+
+def test_read_connection_sets_busy_timeout_and_wal(tmp_path):
+    url = _sqlite_url(tmp_path)
+    db.init_db(url)
+    with db.connect(url) as conn:
+        assert _busy_timeout(conn) == db._SQLITE_BUSY_TIMEOUT_MS
+        assert _journal_mode(conn) == "wal"
+
+
+def test_write_connection_sets_busy_timeout_and_wal(tmp_path):
+    url = _sqlite_url(tmp_path)
+    db.init_db(url)
+    conn = db.connect_sqlite_write(url)
+    try:
+        assert _busy_timeout(conn) == db._SQLITE_BUSY_TIMEOUT_MS
+        assert _journal_mode(conn) == "wal"
+    finally:
+        conn.close()
+
+
+def test_host_logger_connection_sets_busy_timeout_and_wal(tmp_path):
+    url = _sqlite_url(tmp_path)
+    db.init_db(url)
+    conn = hl._sqlite_connect(url)
+    try:
+        # host_logger stays stdlib-only and self-contained, so it hardcodes 5000 ms
+        # rather than importing db; assert the concrete value to catch drift.
+        assert _busy_timeout(conn) == 5000
+        assert _journal_mode(conn) == "wal"
+    finally:
+        conn.close()
+
+
+# ── 6. normalize_backends_json warns (and returns None) on malformed JSON ────────
+
+
+def test_normalize_backends_json_warns_on_bad_json():
+    with pytest.warns(UserWarning, match="backends_json"):
+        assert db.normalize_backends_json("{not valid json") is None
+
+
+def test_normalize_backends_json_silent_on_good_input(recwarn):
+    assert db.normalize_backends_json('[{"name": "x"}]') == [{"name": "x"}]
+    assert db.normalize_backends_json(None) is None
+    assert db.normalize_backends_json([{"name": "x"}]) == [{"name": "x"}]
+    assert len(recwarn) == 0

@@ -57,6 +57,12 @@ read). For SQLite, initialize the file with `python -m overlaat.db init
 "$DATABASE_URL"` (the same entry point works for Postgres too); `psql -f
 schema.sql` remains the Postgres-native way.
 
+SQLite runs in WAL mode, which writes `-wal` and `-shm` sidecar files next to the
+`.db` (expected, not an error). The single-writer model — the queue-proxy is one
+process, so never run it with `--workers N` — is exactly what SQLite wants. To back
+up while the services are live, use `sqlite3 file.db ".backup backup.db"` or
+`VACUUM INTO 'backup.db'` rather than copying the file by hand.
+
 ### `request_events` — one row per request
 
 Written by the queue-proxy when a request reaches a terminal state.
