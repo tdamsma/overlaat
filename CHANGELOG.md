@@ -18,6 +18,11 @@ versions without a compatibility guarantee.
 
 ### Changed
 - README: added PyPI version, CI status, Python-versions, and MIT license badges; the quickstart now leads with `uv pip install overlaat` and demotes the editable install to a uv-based development note.
+- Rewrote the architecture diagram (`docs/overlaat-llm-stack.excalidraw.svg`) to show
+  where Overlaat fits: a custom fair-queue + honest-accounting ring (queue-proxy `:4000`,
+  usage-api `:4100`, and the event store) wrapped around an off-the-shelf serving stack,
+  with model loading/eviction drawn as a separate swap layer (e.g. llama-swap) rather
+  than something Overlaat does itself.
 
 ## [0.0.1] — 2026-06-19
 
