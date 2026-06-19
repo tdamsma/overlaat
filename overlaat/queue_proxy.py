@@ -35,6 +35,7 @@ decoding while the proxy releases its slot → the next call stalls on a busy
 backend. So release-on-disconnect does NOT stop the backend; only cancelling
 still-queued requests is safe.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -53,18 +54,23 @@ import yaml
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
+from overlaat import __version__
+
 UPSTREAM = os.environ.get("QUEUE_PROXY_UPSTREAM", "http://127.0.0.1:4002")
-LITELLM_CONFIG = Path(os.environ.get(
-    "QUEUE_PROXY_LITELLM_CONFIG", "./litellm-config.yaml"
-))
+LITELLM_CONFIG = Path(os.environ.get("QUEUE_PROXY_LITELLM_CONFIG", "./litellm-config.yaml"))
 METRICS_DB_URL = os.environ.get("METRICS_DB_URL") or os.environ.get("DATABASE_URL") or ""
-WAIT_BUFFER = 200          # per-model ring buffer for p50/p95
-USAGE_TAIL_BYTES = 16384   # rolling tail window scanned for token usage
-EVENT_QUEUE_MAX = 10000    # bounded; overflow → drop (instrumentation never blocks)
-EVENT_BATCH = 200          # max rows per INSERT batch
-PROXIED_PATHS = {"/v1/chat/completions", "/v1/completions", "/v1/embeddings",
-                 "/v1/rerank", "/rerank"}
-SERVICE_VERSION = "0.0.1"
+WAIT_BUFFER = 200  # per-model ring buffer for p50/p95
+USAGE_TAIL_BYTES = 16384  # rolling tail window scanned for token usage
+EVENT_QUEUE_MAX = 10000  # bounded; overflow → drop (instrumentation never blocks)
+EVENT_BATCH = 200  # max rows per INSERT batch
+PROXIED_PATHS = {
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/embeddings",
+    "/v1/rerank",
+    "/rerank",
+}
+SERVICE_VERSION = __version__
 
 _INSERT_SQL = (
     "INSERT INTO request_events "
@@ -74,9 +80,19 @@ _INSERT_SQL = (
     "%(model_requested)s, %(key_fp)s, %(streamed)s, %(outcome)s, "
     "%(http_status)s, %(prompt_tokens)s, %(completion_tokens)s)"
 )
-_EVENT_COLS = ("t_enqueue", "t_acquire", "t_first_token", "t_done",
-               "model_requested", "key_fp", "streamed", "outcome",
-               "http_status", "prompt_tokens", "completion_tokens")
+_EVENT_COLS = (
+    "t_enqueue",
+    "t_acquire",
+    "t_first_token",
+    "t_done",
+    "model_requested",
+    "key_fp",
+    "streamed",
+    "outcome",
+    "http_status",
+    "prompt_tokens",
+    "completion_tokens",
+)
 
 _RE_PT = re.compile(rb'"prompt_tokens"\s*:\s*(\d+)')
 _RE_CT = re.compile(rb'"completion_tokens"\s*:\s*(\d+)')
@@ -144,6 +160,7 @@ def _key_fp(request: Request) -> str:
 
 # ── event emission (non-blocking) ────────────────────────────────────────────
 
+
 def emit_event(ev: dict) -> None:
     """Enqueue a lifecycle event for the background writer. Never blocks: on a
     full queue we drop (and count it). Called from the hot path."""
@@ -184,8 +201,7 @@ async def _event_writer() -> None:
             batch.append(nxt)
         try:
             if conn is None or conn.closed:
-                conn = await psycopg.AsyncConnection.connect(
-                    METRICS_DB_URL, autocommit=True)
+                conn = await psycopg.AsyncConnection.connect(METRICS_DB_URL, autocommit=True)
             async with conn.cursor() as cur:
                 await cur.executemany(_INSERT_SQL, batch)
             EVENT_STATS["written"] += len(batch)
@@ -222,9 +238,12 @@ def get_semaphore(model: str) -> asyncio.Semaphore | None:
 def _cancelled_response(req_id: str, model: str) -> JSONResponse:
     return JSONResponse(
         status_code=499,
-        content={"error": {
-            "message": f"request {req_id} cancelled while queued for {model}",
-            "type": "queue_proxy_cancelled"}},
+        content={
+            "error": {
+                "message": f"request {req_id} cancelled while queued for {model}",
+                "type": "queue_proxy_cancelled",
+            }
+        },
     )
 
 
@@ -261,11 +280,15 @@ app = FastAPI(
 
 @app.get("/__queue/health")
 async def health():
-    return {"status": "ok", "version": SERVICE_VERSION,
-            "upstream": UPSTREAM, "caps": CAPS,
-            "events": dict(EVENT_STATS),
-            "event_queue_depth": EVENT_Q.qsize() if EVENT_Q else None,
-            "db_configured": bool(METRICS_DB_URL)}
+    return {
+        "status": "ok",
+        "version": SERVICE_VERSION,
+        "upstream": UPSTREAM,
+        "caps": CAPS,
+        "events": dict(EVENT_STATS),
+        "event_queue_depth": EVENT_Q.qsize() if EVENT_Q else None,
+        "db_configured": bool(METRICS_DB_URL),
+    }
 
 
 @app.get("/__queue/status")
@@ -277,23 +300,28 @@ async def status():
         waits = sorted(m["wait_ms_buffer"])
         n = len(waits)
         queued = sorted(QUEUED.get(model, {}).values(), key=lambda i: i["enqueued_at"])
-        rows.append({
-            "model": model,
-            "cap": CAPS.get(model),
-            "in_flight": m["in_flight"],
-            "queue_depth": m["queue_depth"],
-            "total_served": m["total_served"],
-            "total_errored": m["total_errored"],
-            "wait_ms_p50": waits[n // 2] if n else None,
-            "wait_ms_p95": waits[min(int(n * 0.95), n - 1)] if n >= 20 else None,
-            "wait_ms_max_recent": waits[-1] if waits else None,
-            "samples": n,
-            "queued": [
-                {"id": i["id"], "key_fp": i["key_fp"],
-                 "age_s": round(now - i["enqueued_at"], 1)}
-                for i in queued
-            ],
-        })
+        rows.append(
+            {
+                "model": model,
+                "cap": CAPS.get(model),
+                "in_flight": m["in_flight"],
+                "queue_depth": m["queue_depth"],
+                "total_served": m["total_served"],
+                "total_errored": m["total_errored"],
+                "wait_ms_p50": waits[n // 2] if n else None,
+                "wait_ms_p95": waits[min(int(n * 0.95), n - 1)] if n >= 20 else None,
+                "wait_ms_max_recent": waits[-1] if waits else None,
+                "samples": n,
+                "queued": [
+                    {
+                        "id": i["id"],
+                        "key_fp": i["key_fp"],
+                        "age_s": round(now - i["enqueued_at"], 1),
+                    }
+                    for i in queued
+                ],
+            }
+        )
     return {
         "service": "queue-proxy",
         "version": SERVICE_VERSION,
@@ -334,29 +362,38 @@ async def cancel_one(req_id: str):
             return {"cancelled": req_id, "model": m}
     return JSONResponse(
         status_code=404,
-        content={"error": {
-            "message": f"{req_id} not queued (already running, done, or unknown)",
-            "type": "queue_proxy_not_found"}},
+        content={
+            "error": {
+                "message": f"{req_id} not queued (already running, done, or unknown)",
+                "type": "queue_proxy_not_found",
+            }
+        },
     )
 
 
 _HOP_HEADERS_REQ = {"host", "content-length"}
-_HOP_HEADERS_RESP = {"content-encoding", "transfer-encoding",
-                     "content-length", "connection"}
+_HOP_HEADERS_RESP = {"content-encoding", "transfer-encoding", "content-length", "connection"}
 
 
-async def _forward(request: Request, full_path: str, body: bytes,
-                   model: str | None, sem: asyncio.Semaphore | None,
-                   ev: dict | None):
+async def _forward(
+    request: Request,
+    full_path: str,
+    body: bytes,
+    model: str | None,
+    sem: asyncio.Semaphore | None,
+    ev: dict | None,
+):
     """Forward to upstream with semaphore release discipline + event emission.
 
     Release rule: exactly once per acquired semaphore. The event is emitted
     exactly once (in stream_body.finally, or on a send error here)."""
     client: httpx.AsyncClient = request.app.state.client
-    headers = {k: v for k, v in request.headers.items()
-               if k.lower() not in _HOP_HEADERS_REQ}
+    headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_HEADERS_REQ}
     upstream_req = client.build_request(
-        method=request.method, url=full_path, content=body, headers=headers,
+        method=request.method,
+        url=full_path,
+        content=body,
+        headers=headers,
         params=dict(request.query_params),
     )
     released = {"done": False}
@@ -400,9 +437,12 @@ async def _forward(request: Request, full_path: str, body: bytes,
         natural = False
         try:
             async for chunk in upstream_resp.aiter_raw():
-                if (ev is not None and ev.get("streamed")
-                        and ev.get("t_first_token") is None
-                        and b'"content"' in chunk):
+                if (
+                    ev is not None
+                    and ev.get("streamed")
+                    and ev.get("t_first_token") is None
+                    and b'"content"' in chunk
+                ):
                     ev["t_first_token"] = time.time()
                 tail.extend(chunk)
                 if len(tail) > USAGE_TAIL_BYTES:
@@ -413,12 +453,16 @@ async def _forward(request: Request, full_path: str, body: bytes,
             await upstream_resp.aclose()
             release(upstream_resp.status_code)
             # natural completion vs client disconnect (GeneratorExit before done)
-            outcome = base_outcome if (natural or base_outcome == "upstream_error") \
+            outcome = (
+                base_outcome
+                if (natural or base_outcome == "upstream_error")
                 else "client_abandoned"
+            )
             finish(upstream_resp.status_code, outcome, bytes(tail))
 
-    resp_headers = {k: v for k, v in upstream_resp.headers.items()
-                    if k.lower() not in _HOP_HEADERS_RESP}
+    resp_headers = {
+        k: v for k, v in upstream_resp.headers.items() if k.lower() not in _HOP_HEADERS_RESP
+    }
     return StreamingResponse(
         stream_body(),
         status_code=upstream_resp.status_code,
@@ -427,8 +471,9 @@ async def _forward(request: Request, full_path: str, body: bytes,
     )
 
 
-@app.api_route("/{full_path:path}",
-               methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"])
+@app.api_route(
+    "/{full_path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD", "PATCH"]
+)
 async def proxy(full_path: str, request: Request):
     path = "/" + full_path
     body = await request.body()
@@ -463,8 +508,11 @@ async def proxy(full_path: str, request: Request):
     ev: dict | None = None
     if is_llm and model is not None:
         ev = {
-            "t_enqueue": time.time(), "t_acquire": None, "t_first_token": None,
-            "model_requested": model, "key_fp": _key_fp(request),
+            "t_enqueue": time.time(),
+            "t_acquire": None,
+            "t_first_token": None,
+            "model_requested": model,
+            "key_fp": _key_fp(request),
             "streamed": streamed,
         }
 
@@ -480,15 +528,17 @@ async def proxy(full_path: str, request: Request):
     req_id = hashlib.sha1(f"{time.monotonic_ns()}{id(request)}".encode()).hexdigest()[:12]
     cancel_fut: asyncio.Future = asyncio.get_event_loop().create_future()
     QUEUED[model][req_id] = {
-        "id": req_id, "model": model, "key_fp": _key_fp(request),
-        "enqueued_at": time.time(), "cancel_fut": cancel_fut,
+        "id": req_id,
+        "model": model,
+        "key_fp": _key_fp(request),
+        "enqueued_at": time.time(),
+        "cancel_fut": cancel_fut,
     }
     metrics["queue_depth"] += 1
     enqueue_ts = time.monotonic()
     acquire_task = asyncio.ensure_future(sem.acquire())
     try:
-        await asyncio.wait({acquire_task, cancel_fut},
-                           return_when=asyncio.FIRST_COMPLETED)
+        await asyncio.wait({acquire_task, cancel_fut}, return_when=asyncio.FIRST_COMPLETED)
     finally:
         metrics["queue_depth"] -= 1
         QUEUED[model].pop(req_id, None)
@@ -509,11 +559,11 @@ async def proxy(full_path: str, request: Request):
             got = await acquire_task
         except asyncio.CancelledError:
             got = False
-        if got:                       # acquired after all → give it back
+        if got:  # acquired after all → give it back
             sem.release()
         _emit_cancelled()
         return _cancelled_response(req_id, model)
-    if cancel_fut.done():             # slot + cancel at once → give the slot back
+    if cancel_fut.done():  # slot + cancel at once → give the slot back
         sem.release()
         _emit_cancelled()
         return _cancelled_response(req_id, model)

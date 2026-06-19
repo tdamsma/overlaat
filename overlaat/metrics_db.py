@@ -19,6 +19,7 @@ Concurrency curves (per model), each defined once:
   active(t)  = # requests with t_acquire <= t < t_done   (backend busy, slot held)
   queued(t)  = offered(t) - active(t)                     (backlog)
 """
+
 from __future__ import annotations
 
 import bisect
@@ -26,20 +27,30 @@ from typing import Any
 
 import psycopg
 
-MIN_SAMPLES = 5          # below this, a per-concurrency cell is "insufficient", not a trend
-TOP_KEYS = 8             # stacked attribution: top N keys + <other>
-MAX_PLAUSIBLE_DECODE = 500   # tok/s hardware ceiling; above this a decode rate is a
-                             # near-zero-window artifact (e.g. a reasoning model whose
-                             # content burst lands at stream end → done≈first_token)
+MIN_SAMPLES = 5  # below this, a per-concurrency cell is "insufficient", not a trend
+TOP_KEYS = 8  # stacked attribution: top N keys + <other>
+MAX_PLAUSIBLE_DECODE = 500  # tok/s hardware ceiling; above this a decode rate is a
+# near-zero-window artifact (e.g. a reasoning model whose
+# content burst lands at stream end → done≈first_token)
 
 _EVENT_SELECT = (
     "SELECT t_enqueue, t_acquire, t_first_token, t_done, model_requested, "
     "key_fp, streamed, outcome, http_status, prompt_tokens, completion_tokens "
     "FROM request_events"
 )
-_EVENT_FIELDS = ("t_enqueue", "t_acquire", "t_first_token", "t_done",
-                 "model_requested", "key_fp", "streamed", "outcome",
-                 "http_status", "prompt_tokens", "completion_tokens")
+_EVENT_FIELDS = (
+    "t_enqueue",
+    "t_acquire",
+    "t_first_token",
+    "t_done",
+    "model_requested",
+    "key_fp",
+    "streamed",
+    "outcome",
+    "http_status",
+    "prompt_tokens",
+    "completion_tokens",
+)
 
 
 def _connect(db_url: str):
@@ -47,6 +58,7 @@ def _connect(db_url: str):
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
+
 
 def _pct(vals: list[float], p: float) -> float | None:
     xs = sorted(v for v in vals if v is not None)
@@ -86,9 +98,9 @@ class _ConcIntegral:
                 pts.append((s, 1))
                 pts.append((e, -1))
         pts.sort()
-        self.xs: list[float] = []      # distinct breakpoint times
-        self.seg: list[int] = []       # active count over [xs[k], xs[k+1])
-        self.F: list[float] = [0.0]    # F[k] = ∫ from xs[0] to xs[k] of C(t) dt
+        self.xs: list[float] = []  # distinct breakpoint times
+        self.seg: list[int] = []  # active count over [xs[k], xs[k+1])
+        self.F: list[float] = [0.0]  # F[k] = ∫ from xs[0] to xs[k] of C(t) dt
         run = 0
         i, n = 0, len(pts)
         while i < n:
@@ -116,8 +128,9 @@ class _ConcIntegral:
         return (self._integ(b) - self._integ(a)) / (b - a)
 
 
-def _bucket_concurrency(intervals: list[tuple[float, float]],
-                        t0: float, bucket_s: float, nbuckets: int) -> list[float]:
+def _bucket_concurrency(
+    intervals: list[tuple[float, float]], t0: float, bucket_s: float, nbuckets: int
+) -> list[float]:
     """Per-bucket time-weighted average concurrency from a set of intervals."""
     secs = [0.0] * nbuckets
     for s, e in intervals:
@@ -138,6 +151,7 @@ def _bucket_concurrency(intervals: list[tuple[float, float]],
 
 # ── fetch ───────────────────────────────────────────────────────────────────
 
+
 def resolve_key_aliases(db_url: str) -> dict[str, str]:
     """key_fp (sha256(token)[:8]) → key_alias, from the gateway's verification-token
     table (token[:8] == our key_fp). Falls back to the fp itself if unknown.
@@ -148,8 +162,10 @@ def resolve_key_aliases(db_url: str) -> dict[str, str]:
     out: dict[str, str] = {}
     try:
         with _connect(db_url) as c, c.cursor() as cur:
-            cur.execute('SELECT left(token,8), COALESCE(key_alias, key_name) '
-                        'FROM "LiteLLM_VerificationToken"')
+            cur.execute(
+                "SELECT left(token,8), COALESCE(key_alias, key_name) "
+                'FROM "LiteLLM_VerificationToken"'
+            )
             for fp, alias in cur.fetchall():
                 if fp:
                     out[fp] = alias or fp
@@ -170,39 +186,64 @@ def fetch_events(db_url: str, since: float, until: float | None = None) -> list[
     with _connect(db_url) as c, c.cursor() as cur:
         cur.execute(sql, params)
         rows = cur.fetchall()
-    return [dict(zip(_EVENT_FIELDS, r)) for r in rows]
+    return [dict(zip(_EVENT_FIELDS, r, strict=False)) for r in rows]
 
 
 def fetch_host_samples(db_url: str, since: float) -> list[dict]:
-    sql = ("SELECT ts, gpu_pct, gpu_freq_mhz, ram_wired_gb, ram_active_gb, "
-           "ram_inactive_gb, ram_compressed_gb, ram_free_gb, ram_total_gb, "
-           "cpu_load1, backends_json FROM host_samples "
-           "WHERE ts >= %s ORDER BY ts")
-    fields = ("ts", "gpu_pct", "gpu_freq_mhz", "ram_wired_gb", "ram_active_gb",
-              "ram_inactive_gb", "ram_compressed_gb", "ram_free_gb",
-              "ram_total_gb", "cpu_load1", "backends_json")
+    sql = (
+        "SELECT ts, gpu_pct, gpu_freq_mhz, ram_wired_gb, ram_active_gb, "
+        "ram_inactive_gb, ram_compressed_gb, ram_free_gb, ram_total_gb, "
+        "cpu_load1, backends_json FROM host_samples "
+        "WHERE ts >= %s ORDER BY ts"
+    )
+    fields = (
+        "ts",
+        "gpu_pct",
+        "gpu_freq_mhz",
+        "ram_wired_gb",
+        "ram_active_gb",
+        "ram_inactive_gb",
+        "ram_compressed_gb",
+        "ram_free_gb",
+        "ram_total_gb",
+        "cpu_load1",
+        "backends_json",
+    )
     with _connect(db_url) as c, c.cursor() as cur:
         cur.execute(sql, (since,))
         rows = cur.fetchall()
-    return [dict(zip(fields, r)) for r in rows]
+    return [dict(zip(fields, r, strict=False)) for r in rows]
 
 
 def latest_host(db_url: str) -> dict | None:
-    sql = ("SELECT ts, gpu_pct, gpu_freq_mhz, ram_wired_gb, ram_active_gb, "
-           "ram_free_gb, ram_total_gb, cpu_load1, backends_json "
-           "FROM host_samples ORDER BY ts DESC LIMIT 1")
-    fields = ("ts", "gpu_pct", "gpu_freq_mhz", "ram_wired_gb", "ram_active_gb",
-              "ram_free_gb", "ram_total_gb", "cpu_load1", "backends_json")
+    sql = (
+        "SELECT ts, gpu_pct, gpu_freq_mhz, ram_wired_gb, ram_active_gb, "
+        "ram_free_gb, ram_total_gb, cpu_load1, backends_json "
+        "FROM host_samples ORDER BY ts DESC LIMIT 1"
+    )
+    fields = (
+        "ts",
+        "gpu_pct",
+        "gpu_freq_mhz",
+        "ram_wired_gb",
+        "ram_active_gb",
+        "ram_free_gb",
+        "ram_total_gb",
+        "cpu_load1",
+        "backends_json",
+    )
     with _connect(db_url) as c, c.cursor() as cur:
         cur.execute(sql)
         r = cur.fetchone()
-    return dict(zip(fields, r)) if r else None
+    return dict(zip(fields, r, strict=False)) if r else None
 
 
 # ── views ─────────────────────────────────────────────────────────────────────
 
-def build_timeline(db_url: str, since: float, now: float, bucket_s: float,
-                   aliases: dict[str, str]) -> dict:
+
+def build_timeline(
+    db_url: str, since: float, now: float, bucket_s: float, aliases: dict[str, str]
+) -> dict:
     """Per-bucket concurrency curves (offered/active per model + active per key)
     plus host GPU%/wired + backend RSS. Drives all charts."""
     nbuckets = max(1, int((now - since) // bucket_s) + 1)
@@ -226,8 +267,12 @@ def build_timeline(db_url: str, since: float, now: float, bucket_s: float,
     model_series = {}
     for m, md in models.items():
         model_series[m] = {
-            "offered": [round(x, 3) for x in _bucket_concurrency(md["offered"], t0, bucket_s, nbuckets)],
-            "active":  [round(x, 3) for x in _bucket_concurrency(md["active"], t0, bucket_s, nbuckets)],
+            "offered": [
+                round(x, 3) for x in _bucket_concurrency(md["offered"], t0, bucket_s, nbuckets)
+            ],
+            "active": [
+                round(x, 3) for x in _bucket_concurrency(md["active"], t0, bucket_s, nbuckets)
+            ],
         }
 
     # top keys by total active-seconds
@@ -235,11 +280,15 @@ def build_timeline(db_url: str, since: float, now: float, bucket_s: float,
     ranked = sorted(key_totals, key=lambda k: key_totals[k], reverse=True)
     top = ranked[:TOP_KEYS]
     has_other = len(ranked) > TOP_KEYS
-    key_series = {k: [round(x, 3) for x in _bucket_concurrency(keys_active[k], t0, bucket_s, nbuckets)]
-                  for k in top}
+    key_series = {
+        k: [round(x, 3) for x in _bucket_concurrency(keys_active[k], t0, bucket_s, nbuckets)]
+        for k in top
+    }
     if has_other:
         other_iv = [iv for k in ranked[TOP_KEYS:] for iv in keys_active[k]]
-        key_series["<other>"] = [round(x, 3) for x in _bucket_concurrency(other_iv, t0, bucket_s, nbuckets)]
+        key_series["<other>"] = [
+            round(x, 3) for x in _bucket_concurrency(other_iv, t0, bucket_s, nbuckets)
+        ]
 
     # host samples → align to buckets (last sample wins per bucket)
     hs = fetch_host_samples(db_url, since - bucket_s)
@@ -284,8 +333,11 @@ def build_models(db_url: str, since: float, now: float, aliases: dict[str, str])
         completed = [e for e in evs if e["outcome"] == "completed"]
         # latency distributions (completed only)
         qwait = [(e["t_acquire"] - e["t_enqueue"]) * 1000 for e in completed if e["t_acquire"]]
-        ttft = [(e["t_first_token"] - e["t_acquire"]) * 1000 for e in completed
-                if e["t_first_token"] and e["t_acquire"]]
+        ttft = [
+            (e["t_first_token"] - e["t_acquire"]) * 1000
+            for e in completed
+            if e["t_first_token"] and e["t_acquire"]
+        ]
         service = [(e["t_done"] - e["t_acquire"]) for e in completed if e["t_acquire"]]
         total = [(e["t_done"] - e["t_enqueue"]) for e in completed]
 
@@ -305,45 +357,60 @@ def build_models(db_url: str, since: float, now: float, aliases: dict[str, str])
                 cell["tok"] += e["completion_tokens"]
                 cell["svc"] += svc
                 if e["t_first_token"] and e["t_done"] > e["t_first_token"]:
-                    cell["decrates"].append(e["completion_tokens"] / (e["t_done"] - e["t_first_token"]))
+                    cell["decrates"].append(
+                        e["completion_tokens"] / (e["t_done"] - e["t_first_token"])
+                    )
 
         throughput = []
         for n in sorted(conc_cells):
             c = conc_cells[n]
             enough = c["n"] >= MIN_SAMPLES
-            throughput.append({
-                "concurrency": n,
-                "calls": c["n"],
-                "aggregate_tok_s": round(c["tok"] / c["svc"], 1) if (enough and c["svc"] > 0) else None,
-                "decode_tok_s_p50": round(_pct(c["decrates"], 0.5), 1) if (enough and c["decrates"]) else None,
-                "sufficient": enough,
-            })
+            throughput.append(
+                {
+                    "concurrency": n,
+                    "calls": c["n"],
+                    "aggregate_tok_s": round(c["tok"] / c["svc"], 1)
+                    if (enough and c["svc"] > 0)
+                    else None,
+                    "decode_tok_s_p50": round(_pct(c["decrates"], 0.5), 1)
+                    if (enough and c["decrates"])
+                    else None,
+                    "sufficient": enough,
+                }
+            )
 
-        out.append({
-            "model": model,
-            "requests": len(evs),
-            "outcomes": outcomes,
-            "completed": len(completed),
-            "abandoned": outcomes.get("client_abandoned", 0),
-            "errored": outcomes.get("upstream_error", 0),
-            "cancelled_queued": outcomes.get("cancelled_queued", 0),
-            "latency_ms": {
-                "queue_wait_p50": round(_pct(qwait, 0.5)) if qwait else None,
-                "queue_wait_p95": round(_pct(qwait, 0.95)) if qwait else None,
-                "ttft_p50": round(_pct(ttft, 0.5)) if ttft else None,
-                "service_p50": round(_pct([s * 1000 for s in service], 0.5)) if service else None,
-                "service_p95": round(_pct([s * 1000 for s in service], 0.95)) if service else None,
-                "total_p50": round(_pct([s * 1000 for s in total], 0.5)) if total else None,
-                "total_p95": round(_pct([s * 1000 for s in total], 0.95)) if total else None,
-            },
-            "throughput_by_concurrency": throughput,
-        })
+        out.append(
+            {
+                "model": model,
+                "requests": len(evs),
+                "outcomes": outcomes,
+                "completed": len(completed),
+                "abandoned": outcomes.get("client_abandoned", 0),
+                "errored": outcomes.get("upstream_error", 0),
+                "cancelled_queued": outcomes.get("cancelled_queued", 0),
+                "latency_ms": {
+                    "queue_wait_p50": round(_pct(qwait, 0.5)) if qwait else None,
+                    "queue_wait_p95": round(_pct(qwait, 0.95)) if qwait else None,
+                    "ttft_p50": round(_pct(ttft, 0.5)) if ttft else None,
+                    "service_p50": round(_pct([s * 1000 for s in service], 0.5))
+                    if service
+                    else None,
+                    "service_p95": round(_pct([s * 1000 for s in service], 0.95))
+                    if service
+                    else None,
+                    "total_p50": round(_pct([s * 1000 for s in total], 0.5)) if total else None,
+                    "total_p95": round(_pct([s * 1000 for s in total], 0.95)) if total else None,
+                },
+                "throughput_by_concurrency": throughput,
+            }
+        )
     out.sort(key=lambda m: m["requests"], reverse=True)
     return out
 
 
-def build_perf_trend(db_url: str, since: float, now: float, bucket_s: float,
-                     aliases: dict[str, str]) -> dict:
+def build_perf_trend(
+    db_url: str, since: float, now: float, bucket_s: float, aliases: dict[str, str]
+) -> dict:
     """Per-model decode throughput (tok/s) over time — the monitoring view for
     server-health drift (e.g. an inference server that gets slower over long
     uptime; a sustained drop on the solo line is the signal to restart it).
@@ -387,7 +454,7 @@ def build_perf_trend(db_url: str, since: float, now: float, bucket_s: float,
             if not e["streamed"] or ft is None or ct is None or dn <= ft:
                 continue
             rate = ct / (dn - ft)
-            if rate > MAX_PLAUSIBLE_DECODE:   # near-zero-window artifact, not a real rate
+            if rate > MAX_PLAUSIBLE_DECODE:  # near-zero-window artifact, not a real rate
                 continue
             all_b[bi].append(rate)
             if e["t_acquire"] is not None and conc.mean(e["t_acquire"], dn) < 1.5:
@@ -416,11 +483,21 @@ def build_consumers(db_url: str, since: float, now: float, aliases: dict[str, st
     by_key: dict[str, dict] = {}
     for e in events:
         alias = aliases.get(e["key_fp"], e["key_fp"])
-        d = by_key.setdefault(alias, {
-            "key": alias, "requests": 0, "completed": 0, "abandoned": 0,
-            "errored": 0, "cancelled_queued": 0, "prompt_tokens": 0,
-            "completion_tokens": 0, "service_s": 0.0, "models": {},
-        })
+        d = by_key.setdefault(
+            alias,
+            {
+                "key": alias,
+                "requests": 0,
+                "completed": 0,
+                "abandoned": 0,
+                "errored": 0,
+                "cancelled_queued": 0,
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "service_s": 0.0,
+                "models": {},
+            },
+        )
         d["requests"] += 1
         oc = e["outcome"]
         if oc == "completed":

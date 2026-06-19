@@ -32,6 +32,7 @@ Environment overrides:
   SLOT_RUNNING_URL optional URL of a model-swap server's /running endpoint, used
                    only for cold-load tracking (default off).
 """
+
 from __future__ import annotations  # support older Python 3.9 (PEP 604 unions)
 
 import argparse
@@ -43,15 +44,15 @@ import subprocess
 import sys
 import time
 import urllib.request
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
-INTERVAL_S = 5               # 5s sampling (small, but ~12x denser than 60s)
-POWERMETRICS_DUR_MS = 1000   # 1s sample inside each loop
-PAGE_SIZE = 16384            # Apple Silicon page size
+INTERVAL_S = 5  # 5s sampling (small, but ~12x denser than 60s)
+POWERMETRICS_DUR_MS = 1000  # 1s sample inside each loop
+PAGE_SIZE = 16384  # Apple Silicon page size
 TOTAL_MEM_GB = float(os.environ.get("TOTAL_MEM_GB", "256.0"))  # host RAM size
-RSS_MIN_GB = 1.0             # only record processes holding >= this much RAM
-RSS_TOP_N = 20               # cap the per-sample backend list
+RSS_MIN_GB = 1.0  # only record processes holding >= this much RAM
+RSS_TOP_N = 20  # cap the per-sample backend list
 
 # psql binary: default to whatever is on PATH; override with PSQL.
 PSQL = os.environ.get("PSQL", "psql")
@@ -65,10 +66,10 @@ OVERLAAT_ENV = Path(os.environ.get("OVERLAAT_ENV", "./overlaat.env"))
 # the gateway, the database). It is only used to recognize port-suffixed names;
 # any process over RSS_MIN_GB is still recorded regardless.
 BACKEND_EXE_PREFIXES = (
-    "python",      # e.g. an mlx/transformers server launched via python
-    "ollama",      # a local model server + its runner subprocesses
+    "python",  # e.g. an mlx/transformers server launched via python
+    "ollama",  # a local model server + its runner subprocesses
     "model-server",  # a custom inference engine binary (rename to yours)
-    "mlx_lm",      # an MLX language-model server
+    "mlx_lm",  # an MLX language-model server
 )
 
 # Optional: a model-swap server's /running endpoint for cold-load tracking.
@@ -118,22 +119,28 @@ def loadavg() -> dict:
     m = re.search(r"load averages?:\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)", out)
     if not m:
         return {}
-    return {"load1": float(m.group(1)), "load5": float(m.group(2)),
-            "load15": float(m.group(3))}
+    return {"load1": float(m.group(1)), "load5": float(m.group(2)), "load15": float(m.group(3))}
 
 
 def powermetrics_sample() -> tuple[dict, list[dict]]:
     """Return (gpu_summary, [per_process_gpu]). Per-process GPU is kept only for
     annotating the backend list; it is ~always 0 for Metal/MLX (see module doc)."""
-    cmd = ["/usr/bin/powermetrics", "--samplers", "gpu_power,tasks",
-           "--show-process-gpu", "-i", str(POWERMETRICS_DUR_MS), "-n", "1"]
+    cmd = [
+        "/usr/bin/powermetrics",
+        "--samplers",
+        "gpu_power,tasks",
+        "--show-process-gpu",
+        "-i",
+        str(POWERMETRICS_DUR_MS),
+        "-n",
+        "1",
+    ]
     if os.geteuid() != 0:
         # As a normal user, go through sudo -n (requires passwordless sudo for
         # powermetrics, e.g. a NOPASSWD sudoers entry).
         cmd = ["/usr/bin/sudo", "-n", *cmd]
     try:
-        out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL,
-                                      timeout=15)
+        out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL, timeout=15)
     except Exception:
         return {"active_pct": None, "freq_mhz": None}, []
 
@@ -166,8 +173,9 @@ def powermetrics_sample() -> tuple[dict, list[dict]]:
                 pid = int(parts[1])
                 gpu_ms_per_s = float(parts[-1])  # ms/s -> % via /10
                 if gpu_ms_per_s > 0:
-                    procs.append({"name": parts[0], "pid": pid,
-                                  "gpu_pct": round(gpu_ms_per_s / 10, 1)})
+                    procs.append(
+                        {"name": parts[0], "pid": pid, "gpu_pct": round(gpu_ms_per_s / 10, 1)}
+                    )
             except (ValueError, IndexError):
                 continue
     return {"active_pct": gpu_pct, "freq_mhz": gpu_freq}, procs
@@ -185,7 +193,7 @@ def derive_name(cmd: str) -> str:
     if not cmd:
         return "?"
     if cmd.startswith("postgres:"):
-        rest = cmd[len("postgres:"):].strip().split()
+        rest = cmd[len("postgres:") :].strip().split()
         return f"postgres-{rest[0]}" if rest else "postgres"
     if cmd.startswith("sshd-session"):
         return "sshd-session"
@@ -200,7 +208,7 @@ def derive_name(cmd: str) -> str:
         if tokens[1] == "runner":
             for i, t in enumerate(tokens):
                 if t == "--model" and i + 1 < len(tokens):
-                    return f"ollama-runner-{tokens[i+1]}"
+                    return f"ollama-runner-{tokens[i + 1]}"
             return "ollama-runner"
         if tokens[1] == "serve":
             return "ollama-serve"
@@ -220,8 +228,7 @@ def derive_name(cmd: str) -> str:
 def ps_snapshot() -> dict[int, dict]:
     """pid -> {pid, name, cpu_pct, rss_gb, gpu_pct}. Uses full `command` (macOS
     `comm` is truncated to 16 chars)."""
-    out = subprocess.check_output(
-        ["/bin/ps", "-axo", "pid,%cpu,rss,command"], text=True)
+    out = subprocess.check_output(["/bin/ps", "-axo", "pid,%cpu,rss,command"], text=True)
     processes: dict[int, dict] = {}
     for line in out.splitlines()[1:]:
         parts = line.split(None, 3)
@@ -244,8 +251,7 @@ def ps_snapshot() -> dict[int, dict]:
     return processes
 
 
-def backend_breakdown(processes: dict[int, dict],
-                      gpu_procs: list[dict]) -> list[dict]:
+def backend_breakdown(processes: dict[int, dict], gpu_procs: list[dict]) -> list[dict]:
     """Memory holders: processes with RSS >= RSS_MIN_GB, sorted desc, top N.
     GPU% merged in where powermetrics saw it (usually 0 for Metal/MLX)."""
     for gp in gpu_procs:
@@ -259,7 +265,7 @@ def backend_breakdown(processes: dict[int, dict],
 
 def sample() -> dict:
     t_epoch = time.time()
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    ts = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     mem = vm_stat()
     cpu = loadavg()
     gpu_stats, gpu_procs = powermetrics_sample()
@@ -300,8 +306,13 @@ def write_sample_pg(rec: dict) -> None:
         f"{_num(cpu.get('load5'))},'{backends}'::jsonb) "
         "ON CONFLICT (ts) DO NOTHING;"
     )
-    subprocess.run([PSQL, DB_URL, "-v", "ON_ERROR_STOP=1", "-q", "-c", sql],
-                   check=True, capture_output=True, text=True, timeout=15)
+    subprocess.run(
+        [PSQL, DB_URL, "-v", "ON_ERROR_STOP=1", "-q", "-c", sql],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
 
 
 # -- cold-load tracking (optional) ----------------------------------------------
@@ -311,7 +322,7 @@ def write_sample_pg(rec: dict) -> None:
 # transition, so cold-load time stops hiding inside the first request's TTFT.
 # State is held in module memory across loop iterations. Disabled when
 # SLOT_RUNNING_URL is empty.
-_load_state: dict[str, dict] = {}   # model -> {"state": str, "t_start": float|None}
+_load_state: dict[str, dict] = {}  # model -> {"state": str, "t_start": float|None}
 
 
 def poll_slot_server() -> dict[str, str]:
@@ -327,8 +338,7 @@ def poll_slot_server() -> dict[str, str]:
         return {}
 
 
-def write_model_load_pg(model: str, t_start: float, t_ready: float | None,
-                        detail: str) -> None:
+def write_model_load_pg(model: str, t_start: float, t_ready: float | None, detail: str) -> None:
     """INSERT one cold-load row via psql. Raises on failure (caller logs)."""
     if not DB_URL:
         raise RuntimeError("no DATABASE_URL")
@@ -339,8 +349,13 @@ def write_model_load_pg(model: str, t_start: float, t_ready: float | None,
         "INSERT INTO model_loads (model,t_start,t_ready,load_s,detail) "
         f"VALUES ('{m}',{t_start:.3f},{_num(t_ready)},{_num(load_s)},'{d}');"
     )
-    subprocess.run([PSQL, DB_URL, "-v", "ON_ERROR_STOP=1", "-q", "-c", sql],
-                   check=True, capture_output=True, text=True, timeout=15)
+    subprocess.run(
+        [PSQL, DB_URL, "-v", "ON_ERROR_STOP=1", "-q", "-c", sql],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
 
 
 def track_model_loads(now_epoch: float) -> None:
@@ -354,21 +369,22 @@ def track_model_loads(now_epoch: float) -> None:
         prev = _load_state.get(model)
         if prev is None:
             # First sighting: only arm a load if it's mid-startup right now.
-            _load_state[model] = {"state": state,
-                                  "t_start": None if state == "ready" else now_epoch}
+            _load_state[model] = {
+                "state": state,
+                "t_start": None if state == "ready" else now_epoch,
+            }
             continue
         if state == prev["state"]:
             continue
         if state != "ready" and prev["t_start"] is None:
-            prev["t_start"] = now_epoch                       # load began
+            prev["t_start"] = now_epoch  # load began
         elif state == "ready" and prev["t_start"] is not None:
             try:
-                write_model_load_pg(model, prev["t_start"], now_epoch,
-                                    f"{prev['state']}->ready")
+                write_model_load_pg(model, prev["t_start"], now_epoch, f"{prev['state']}->ready")
             except Exception as e:  # noqa: BLE001
                 sys.stderr.write(f"model-load write failed: {type(e).__name__}: {e}\n")
                 sys.stderr.flush()
-            prev["t_start"] = None                            # load done
+            prev["t_start"] = None  # load done
         prev["state"] = state
     # Drop models no longer running (evicted) so a future reload re-arms cleanly.
     for model in [m for m in _load_state if m not in cur]:
@@ -385,8 +401,9 @@ def _on_term(_signum, _frame):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--once", action="store_true",
-                   help="one sample -> pretty JSON to stdout (preview mode)")
+    p.add_argument(
+        "--once", action="store_true", help="one sample -> pretty JSON to stdout (preview mode)"
+    )
     args = p.parse_args()
 
     if args.once:
@@ -395,8 +412,9 @@ def main():
 
     signal.signal(signal.SIGTERM, _on_term)
     signal.signal(signal.SIGINT, _on_term)
-    sys.stderr.write(f"host-logger started, interval={INTERVAL_S}s, "
-                     f"db={'yes' if DB_URL else 'NO'}\n")
+    sys.stderr.write(
+        f"host-logger started, interval={INTERVAL_S}s, db={'yes' if DB_URL else 'NO'}\n"
+    )
     sys.stderr.flush()
     while not _stop:
         t0 = time.monotonic()

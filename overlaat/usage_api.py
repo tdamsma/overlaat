@@ -22,26 +22,25 @@ endpoint), because request events are written on completion. Historical views
 come from the two tables. Each metric has exactly one definition (see
 metrics_db.py).
 """
+
 from __future__ import annotations
 
 import json
 import os
 import time
 import urllib.request
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from fastapi import FastAPI, Query
 from fastapi.responses import HTMLResponse
 
-from overlaat import metrics_db
+from overlaat import __version__, metrics_db
 
 DB = os.environ.get("DATABASE_URL", "")
-QUEUE_STATUS_URL = os.environ.get("QUEUE_STATUS_URL",
-                                  "http://127.0.0.1:4000/__queue/status")
-SERVICE_VERSION = "1.0.0"
+QUEUE_STATUS_URL = os.environ.get("QUEUE_STATUS_URL", "http://127.0.0.1:4000/__queue/status")
+SERVICE_VERSION = __version__
 
-app = FastAPI(title="overlaat-usage-api", version=SERVICE_VERSION,
-              docs_url="/swagger")
+app = FastAPI(title="overlaat-usage-api", version=SERVICE_VERSION, docs_url="/swagger")
 
 # ── small helpers ─────────────────────────────────────────────────────────────
 
@@ -70,9 +69,13 @@ def pick_bucket(win_s: int) -> int:
 
 
 def _meta(kind: str, ttl: int) -> dict:
-    return {"service": "overlaat-usage-api", "version": SERVICE_VERSION,
-            "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "kind": kind, "cache_ttl_hint_s": ttl}
+    return {
+        "service": "overlaat-usage-api",
+        "version": SERVICE_VERSION,
+        "generated_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "kind": kind,
+        "cache_ttl_hint_s": ttl,
+    }
 
 
 _ALIAS_CACHE = {"ts": 0.0, "map": {}}
@@ -96,6 +99,7 @@ def scrape_queue_status() -> dict:
 
 # ── endpoints ───────────────────────────────────────────────────────────────
 
+
 @app.get("/healthz")
 def healthz():
     ok_db = False
@@ -105,8 +109,7 @@ def healthz():
             ok_db = cur.fetchone()[0] == 1
     except Exception:
         ok_db = False
-    return {"ok": ok_db, "service": "overlaat-usage-api", "version": SERVICE_VERSION,
-            "db": ok_db}
+    return {"ok": ok_db, "service": "overlaat-usage-api", "version": SERVICE_VERSION, "db": ok_db}
 
 
 @app.get("/now")
@@ -122,14 +125,19 @@ def now():
     for m in qs.get("by_model", []):
         if not (m.get("in_flight") or m.get("queue_depth") or m.get("cap")):
             continue
-        queued = [{"key": aliases.get(q["key_fp"], q["key_fp"]), "age_s": q["age_s"]}
-                  for q in m.get("queued", [])]
-        row = {"model": m["model"], "cap": m.get("cap"),
-               "in_flight": m.get("in_flight", 0),
-               "queue_depth": m.get("queue_depth", 0),
-               "queued": queued,
-               "wait_ms_p50": m.get("wait_ms_p50"),
-               "wait_ms_p95": m.get("wait_ms_p95")}
+        queued = [
+            {"key": aliases.get(q["key_fp"], q["key_fp"]), "age_s": q["age_s"]}
+            for q in m.get("queued", [])
+        ]
+        row = {
+            "model": m["model"],
+            "cap": m.get("cap"),
+            "in_flight": m.get("in_flight", 0),
+            "queue_depth": m.get("queue_depth", 0),
+            "queued": queued,
+            "wait_ms_p50": m.get("wait_ms_p50"),
+            "wait_ms_p95": m.get("wait_ms_p95"),
+        }
         models.append(row)
         if m.get("in_flight"):
             busy.append(f"{m['model']} (x{m['in_flight']})")
@@ -150,9 +158,13 @@ def now():
 
     gpu_pct = host["gpu_pct"] if host else None
     backends = (host.get("backends_json") or []) if host else []
-    verdict = (f"GPU {gpu_pct:.0f}% — active: {', '.join(busy)}" if busy and gpu_pct is not None
-               else (f"GPU {gpu_pct:.0f}% — no slots in flight" if gpu_pct is not None
-                     else "no host sample"))
+    verdict = (
+        f"GPU {gpu_pct:.0f}% — active: {', '.join(busy)}"
+        if busy and gpu_pct is not None
+        else (
+            f"GPU {gpu_pct:.0f}% — no slots in flight" if gpu_pct is not None else "no host sample"
+        )
+    )
     # Slots held but the GPU is idle = a wedged backend (some engines can freeze
     # while still holding their slot), not a load question. Surface it as a
     # first-class state instead of leaving the join of gpu_pct and in_flight to
@@ -167,8 +179,10 @@ def now():
         "stall": stall,
         "queue_available": qs.get("available", True),
         "models": models,
-        "totals": {"in_flight": qs.get("total_in_flight", 0),
-                   "queue_depth": qs.get("total_queue_depth", 0)},
+        "totals": {
+            "in_flight": qs.get("total_in_flight", 0),
+            "queue_depth": qs.get("total_queue_depth", 0),
+        },
         "host": {
             "gpu_pct": gpu_pct,
             "gpu_freq_mhz": host["gpu_freq_mhz"] if host else None,
@@ -180,9 +194,9 @@ def now():
         },
         "recent_5m_by_key": sorted(recent.values(), key=lambda d: -d["calls"]),
         "caveat": "Live in-flight from the queue; tokens/latency appear once a "
-                  "call completes. Per-process GPU is unmeasurable on macOS for "
-                  "Metal/MLX workloads — memory is attributed by RSS, GPU% is "
-                  "host-wide.",
+        "call completes. Per-process GPU is unmeasurable on macOS for "
+        "Metal/MLX workloads — memory is attributed by RSS, GPU% is "
+        "host-wide.",
     }
 
 
@@ -192,8 +206,7 @@ def timeline(last: str = Query("30m")):
     bucket = pick_bucket(win)
     now_ts = time.time()
     series = metrics_db.build_timeline(DB, now_ts - win, now_ts, bucket, alias_map())
-    return {"_meta": _meta("timeline", 5),
-            "window": {"last": last, "bucket_s": bucket}, **series}
+    return {"_meta": _meta("timeline", 5), "window": {"last": last, "bucket_s": bucket}, **series}
 
 
 @app.get("/models")
@@ -201,17 +214,19 @@ def models(last: str = Query("24h")):
     win = parse_window(last)
     now_ts = time.time()
     rows = metrics_db.build_models(DB, now_ts - win, now_ts, alias_map())
-    return {"_meta": _meta("models", 30),
-            "window": {"last": last},
-            "min_samples": metrics_db.MIN_SAMPLES,
-            "models": rows,
-            "notes": [
-                "concurrency = time-weighted mean # simultaneous slot-holders a "
-                "completed call experienced over [acquire, done] (1.0 = ran alone).",
-                "aggregate_tok_s = Σ completion_tokens / Σ service_s within the cell; "
-                f"shown only when calls >= {metrics_db.MIN_SAMPLES} (else 'sufficient'=false).",
-                "latency: queue_wait/ttft/service/total split, completed calls only.",
-            ]}
+    return {
+        "_meta": _meta("models", 30),
+        "window": {"last": last},
+        "min_samples": metrics_db.MIN_SAMPLES,
+        "models": rows,
+        "notes": [
+            "concurrency = time-weighted mean # simultaneous slot-holders a "
+            "completed call experienced over [acquire, done] (1.0 = ran alone).",
+            "aggregate_tok_s = Σ completion_tokens / Σ service_s within the cell; "
+            f"shown only when calls >= {metrics_db.MIN_SAMPLES} (else 'sufficient'=false).",
+            "latency: queue_wait/ttft/service/total split, completed calls only.",
+        ],
+    }
 
 
 @app.get("/perf")
@@ -222,20 +237,22 @@ def perf(last: str = Query("24h")):
     bucket = pick_bucket(win)
     now_ts = time.time()
     series = metrics_db.build_perf_trend(DB, now_ts - win, now_ts, bucket, alias_map())
-    return {"_meta": _meta("perf", 30),
-            "window": {"last": last, "bucket_s": bucket},
-            **series,
-            "notes": [
-                "decode_tok_s = completion_tokens / (t_done - t_first_token), "
-                "streamed completed calls only.",
-                "decode_solo_p50 = median for calls at mean concurrency < 1.5 "
-                "(isolates server health from load); a sustained drop = degradation.",
-                "thinking-mode models (first token = reasoning_content) have no "
-                "decode window and don't appear here.",
-                "comp_tok_p50 = median completion tokens per completed call "
-                "(streamed + non-streamed) — output-size/behaviour trend; a step "
-                "change = thinking-mode toggle or prompt change, not load.",
-            ]}
+    return {
+        "_meta": _meta("perf", 30),
+        "window": {"last": last, "bucket_s": bucket},
+        **series,
+        "notes": [
+            "decode_tok_s = completion_tokens / (t_done - t_first_token), "
+            "streamed completed calls only.",
+            "decode_solo_p50 = median for calls at mean concurrency < 1.5 "
+            "(isolates server health from load); a sustained drop = degradation.",
+            "thinking-mode models (first token = reasoning_content) have no "
+            "decode window and don't appear here.",
+            "comp_tok_p50 = median completion tokens per completed call "
+            "(streamed + non-streamed) — output-size/behaviour trend; a step "
+            "change = thinking-mode toggle or prompt change, not load.",
+        ],
+    }
 
 
 @app.get("/consumers")
@@ -243,8 +260,7 @@ def consumers(last: str = Query("24h")):
     win = parse_window(last)
     now_ts = time.time()
     rows = metrics_db.build_consumers(DB, now_ts - win, now_ts, alias_map())
-    return {"_meta": _meta("consumers", 30),
-            "window": {"last": last}, "consumers": rows}
+    return {"_meta": _meta("consumers", 30), "window": {"last": last}, "consumers": rows}
 
 
 @app.get("/", response_class=HTMLResponse)

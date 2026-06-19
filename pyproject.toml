@@ -4,13 +4,28 @@ build-backend = "hatchling.build"
 
 [project]
 name = "overlaat"
-version = "0.0.1"
+dynamic = ["version"]
 description = "Fair waiting-queue + honest usage accounting for a Mac Studio shared as a small, trusted team's personal LLM compute server — a sidecar in front of a multi-backend LiteLLM gateway."
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 authors = [
     { name = "Thijs Damsma" },
+]
+keywords = ["llm", "litellm", "queue", "gateway", "self-hosted", "observability", "mlx", "apple-silicon"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Internet :: Proxy Servers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Monitoring",
 ]
 dependencies = [
     "fastapi",
@@ -20,8 +35,41 @@ dependencies = [
     "psycopg[binary]",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.6",
+    "build",
+    "twine",
+]
+
 [project.urls]
 Homepage = "https://github.com/tdamsma/overlaat"
+Repository = "https://github.com/tdamsma/overlaat"
+Issues = "https://github.com/tdamsma/overlaat/issues"
+Changelog = "https://github.com/tdamsma/overlaat/blob/main/CHANGELOG.md"
+
+[tool.hatch.version]
+path = "overlaat/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["overlaat"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# E/W pycodestyle, F pyflakes, I isort, UP pyupgrade, B bugbear, C4 comprehensions, SIM
+select = ["E", "W", "F", "I", "UP", "B", "C4", "SIM"]
+ignore = [
+    "E501",   # line length is handled by the formatter; long comment tables are intentional
+    "B008",   # FastAPI uses function calls in argument defaults (Query(...))
+    "SIM105", # try/except/pass is clearer than contextlib.suppress in the hot path
+]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+addopts = "-q"
