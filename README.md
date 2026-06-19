@@ -1,46 +1,48 @@
 # Overlaat
 
-**A fair waiting-queue and honest usage-accounting sidecar for a self-hosted multi-backend LLM gateway — built around a Mac Studio shared as a small, trusted team's personal compute server.**
+Overlaat puts a **fair waiting-queue** and **honest usage accounting** in front of a
+self-hosted, multi-backend LLM gateway ([LiteLLM](https://github.com/BerriAI/litellm)).
+It is two small services and one Postgres schema. That is the whole thing.
 
-*Overlaat* is Dutch for a **controlled spillway** in a dike: it sheds overflow by
-design instead of breaching. Same posture toward load — when requests outrun your
+It is built for one specific situation, and we wrote it for ours: a **Mac Studio (or a
+similar big Apple-Silicon box) running as a small, trusted team's personal compute
+server** — a handful of models behind one gateway, a mix of interactive chat and bursty
+batch jobs, on one trusted network where API keys are *attribution*, not secrets.
+
+It is deliberately narrow. It is **not** a load balancer, **not** multi-tenant billing,
+**not** an enterprise analytics stack, and **not** trying to be. It does two things and
+tries to do them without lying to you.
+
+*Overlaat* is Dutch for a controlled spillway in a dike: it sheds overflow by design
+instead of breaching. That is the posture toward load — when requests outrun your
 backends, the excess pools in a fair FIFO queue and drains in order, rather than a
 `429`-cascade tearing through every caller's retry loop.
 
 ![Where Overlaat sits in a self-hosted LLM stack](docs/overlaat-llm-stack.excalidraw.svg)
 
----
+## Why it exists
 
-## The problem it solves
-
-You are running a **Mac Studio (or similar big Apple-Silicon box) as a personal compute
-server**, shared by a small, trusted team — several models behind a
-[LiteLLM](https://github.com/BerriAI/litellm) gateway, a mix of interactive chat and
-bursty batch jobs, on one trusted network where API keys are attribution, not secrets.
-Two things hurt:
+Share one box between a few people and a few agents and two things start to hurt.
 
 1. **Overflow is a cliff, not a queue.** LiteLLM's `max_parallel_requests` (and any
    swap-layer concurrency limit) *reject* on overflow — they return `429` rather than
-   making the caller wait. A burst of parallel jobs against a single-slot model turns
-   into a `429`-cascade, and every caller has to grow its own backoff logic.
+   making the caller wait. A burst of parallel jobs against a single-slot model becomes
+   a `429`-cascade, and every caller has to grow its own backoff logic. Nobody wants to
+   write that backoff loop. Several people writing it independently is worse.
 2. **Usage accounting lies by omission.** Insert-on-completion spend logging only ever
    writes a row for a call that *ran to completion*. Calls that sat queued, calls the
-   client abandoned mid-stream, long-running calls still in flight — all invisible.
-   You cannot answer "what was actually happening on the box at 14:03" from rows that
-   only appear after the fact.
+   client abandoned mid-stream, long-running calls still in flight — all invisible. You
+   cannot answer "what was actually happening on the box at 14:03" from rows that only
+   appear after the fact.
 
-Overlaat sits in the niche between **"Ollama on my laptop"** (no queueing, no
-accounting, fine for one user) and **"enterprise gateway with a full analytics stack"**
-(more machinery than a small self-hosted setup wants to run). It gives a small team
-fair queueing and truthful usage attribution with two small services and one Postgres
-table.
-
----
+Overlaat sits in the gap between "Ollama on my laptop" (no queueing, no accounting, fine
+for one person) and "enterprise gateway with a full analytics stack" (more machinery
+than a personal compute server should have to run). Fair queueing and truthful usage
+attribution, with as little machinery as we could get away with.
 
 ## What it is
 
-Overlaat is a **sidecar that sits in *front* of LiteLLM**, plus a **read-only usage
-dashboard**:
+A **sidecar in *front* of LiteLLM**, plus a **read-only dashboard**:
 
 - **queue-proxy** (`:4000`) — the single network entry point. Every request flows
   through here and is FIFO-queued behind a **per-model semaphore**; the slot size for
@@ -49,13 +51,12 @@ dashboard**:
   emits **exactly one lifecycle event per request** to Postgres — *including* queued and
   client-abandoned calls that insert-on-completion logging structurally misses.
 - **usage-api** (`:4100`) — a read-only FastAPI dashboard over those events. It never
-  writes; it only reads. Restart it freely, independently of the proxy.
+  writes; it only reads. Restart it whenever you like, independently of the proxy.
 
-The guiding principle: **instrument the call path once, derive everything else.** The
-proxy writes one honest row per request; the host sampler writes host facts every few
-seconds; the dashboard is pure query.
-
----
+The one principle the whole thing is built on: **instrument the call path once, derive
+everything else.** The proxy writes one honest row per request; the host sampler writes
+host facts every few seconds; the dashboard is pure query. No second source of truth to
+reconcile, no survivor bias, no two endpoints that compute "latency" three different ways.
 
 ## Architecture
 
@@ -88,10 +89,9 @@ flowchart TD
     class proxy,usage overlaat;
 ```
 
-Keep LiteLLM bound to loopback so the proxy is the *only* entry point — and therefore
-the single, complete instrumentation site.
-
----
+Keep LiteLLM bound to loopback. That is the trick that makes the proxy the *only* entry
+point — and therefore the single, complete instrumentation site. If there is a second
+door into the gateway, your accounting has a hole in it.
 
 ## Quickstart
 
@@ -116,15 +116,14 @@ OVERLAAT_ENV=./overlaat.env ./run-queue-proxy.sh        # :4000 entry, in front 
 OVERLAAT_ENV=./overlaat.env ./run-usage-api.sh          # :4100 read-only dashboard
 ```
 
-Point clients at `:4000` instead of LiteLLM directly. Open `http://your-host:4100/`
-for the dashboard. The queue-proxy derives one semaphore per model from
-`litellm-config.yaml`, so that file is the single source of truth for concurrency.
+Point your clients at `:4000` instead of LiteLLM directly. Open
+`http://your-host:4100/` for the dashboard. The queue-proxy derives one semaphore per
+model from `litellm-config.yaml`, so that file is the single source of truth for
+concurrency.
 
 > The proxy runs a **single uvicorn worker on purpose**: the in-memory per-model
 > semaphores and the instrumentation live in that one process, so FIFO ordering and
-> event emission must not be sharded across workers.
-
----
+> event emission must not be sharded across workers. This is a feature, not a TODO.
 
 ## Honest concurrency: three curves
 
@@ -134,13 +133,12 @@ t_done` — everything in the system, including still-queued), **active** (`t_ac
 < t_done` — actually occupying a backend slot, bounded by the cap *by definition*), and
 **queued** = offered − active. Throughput-vs-concurrency buckets each completed call on
 the time-weighted average `active(t)` over its own `[acquire, done]` interval, and cells
-with too few samples are marked insufficient and never shown as a trend.
+with too few samples are marked insufficient and never shown as a trend. If we don't have
+the data, the dashboard says so instead of drawing a confident line.
 
 See [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) for the curves and their caveats,
 and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the call-path and instrumentation
 design.
-
----
 
 ## Roadmap
 
@@ -182,26 +180,49 @@ design.
   **Postgres**. The event schema is intentionally simple (epoch-second timestamps, no
   DB-specific types), so this is mostly an insert/query adapter plus dialect-aware DDL.
 
----
+## Built with LLMs, said openly
 
-## Status
+This software was developed with **strong assistance from large language models** —
+Claude, and the very local models it queues — with humans leading the ideas, the
+architecture, the testing, and the debugging. We say this openly because it shaped how
+the project was built: a lot of the code, the docs, and this README were drafted by a
+model and then dogfooded against the real gateway it sits in front of. If you are not
+happy with AI-assisted code, this software is not for you.
 
-- **Experimental.** This is shared as-is. **No support promise**, no compatibility
-  guarantee between versions.
+The flip side of saying it openly: the design decisions are human-owned and it runs in
+real use, but it is experimental — read the code before you rely on it.
+
+## Acknowledgements
+
+Overlaat is a thin layer, and it would not exist without the work it sits on top of:
+
+- [LiteLLM](https://github.com/BerriAI/litellm) — the gateway it stands in front of.
+- [FastAPI](https://fastapi.tiangolo.com/) / [Starlette](https://www.starlette.io/) /
+  [uvicorn](https://www.uvicorn.org/) — the two services.
+- [httpx](https://www.python-httpx.org/) — the streaming pass-through.
+- [psycopg](https://www.psycopg.org/) and [PostgreSQL](https://www.postgresql.org/) —
+  the one honest event store.
+- and the local-inference ecosystem it exists to queue:
+  [MLX](https://github.com/ml-explore/mlx),
+  [llama.cpp](https://github.com/ggml-org/llama.cpp),
+  [Ollama](https://github.com/ollama/ollama),
+  [vLLM](https://github.com/vllm-project/vllm),
+  [llama-swap](https://github.com/mostlygeek/llama-swap).
+
+## Status and caveats
+
+- **Experimental.** Shared as-is. **No support promise**, no compatibility guarantee
+  between versions.
 - **MIT licensed.** See [`LICENSE`](LICENSE).
-- Built and battle-tested on an **Apple-Silicon multi-backend** setup, but it is
-  **backend-agnostic**: it only needs an OpenAI-compatible LiteLLM gateway in front of
+- Built and dogfooded on an **Apple-Silicon multi-backend** setup, but it is
+  **backend-agnostic**: all it needs is an OpenAI-compatible LiteLLM gateway in front of
   whatever engines you run, and a Postgres to write events to.
-- **Heavily LLM-assisted.** Large parts of this codebase, its docs, and these comments
-  were written with the help of LLMs (and dogfooded against the very gateway this sits
-  in front of). The design decisions are human-owned and the code runs in real use, but
-  read it with that in mind: review before you rely on it.
 
-### Known caveats (honest by design)
+Known caveats, stated up front because that is the whole point of the project:
 
-- **Per-process GPU is not reliably measurable** on all platforms — notably
-  Metal/MLX workloads on macOS report 0. GPU% is therefore kept host-wide; **memory is
-  attributed per-backend via RSS**.
+- **Per-process GPU is not reliably measurable** on all platforms — notably Metal/MLX
+  workloads on macOS report 0. GPU% is therefore kept host-wide; **memory is attributed
+  per-backend via RSS**.
 - **Token counts are NULL** when a backend reports no `usage`. The proxy injects
   `stream_options.include_usage=true` on streaming chat to minimize this; NULL is never
   counted as zero.
