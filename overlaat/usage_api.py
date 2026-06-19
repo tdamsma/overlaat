@@ -178,6 +178,8 @@ def now():
         "verdict": verdict,
         "stall": stall,
         "queue_available": qs.get("available", True),
+        "scheduler": qs.get("scheduler"),
+        "budget": qs.get("budget"),
         "models": models,
         "totals": {
             "in_flight": qs.get("total_in_flight", 0),
@@ -505,6 +507,8 @@ function renderNow(now){
     ['in flight',now.totals.in_flight,''],
     ['queued',now.totals.queue_depth,now.totals.queue_depth>0?'warn':''],
   ];
+  if(now.budget){const bp=now.budget.budget_pct;
+    kc.push(['budget used',bp==null?'—':bp.toFixed(0)+'%',bp>=95?'hot':bp>=70?'warn':'ok']);}
   $('#kpis').innerHTML=kc.map(([l,v,c])=>`<div class="kpi"><div class="v ${c}">${v}</div><div class="l">${l}</div></div>`).join('');
   const tb=$('#now-models tbody');
   tb.innerHTML=(now.models||[]).map(m=>{

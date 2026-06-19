@@ -1,14 +1,19 @@
 # LiteLLM Proxy config — example for use behind the Overlaat queue-proxy.
 #
 # WHAT OVERLAAT READS FROM THIS FILE:
-# The queue-proxy parses this LiteLLM config for exactly ONE thing: the
+# The queue-proxy parses this LiteLLM config for the per-model cap — the
 # `max_parallel_requests` integer under each model's `litellm_params`. That
-# integer is the per-model semaphore cap — the number of requests Overlaat will
-# let through to the backend concurrently before the rest WAIT in a FIFO queue
-# (instead of being rejected with a 429). Everything else here (api_base,
-# routing, master_key, ...) is LiteLLM's own concern; the proxy does not
-# interpret it. So: this file is the single source of truth for the caps, and
-# the caps live next to the model they govern.
+# integer is the per-model concurrency cap: the number of requests Overlaat will
+# let through to the backend concurrently before the rest WAIT in a queue
+# (instead of being rejected with a 429). With the cost-weighted scheduler (on by
+# default; see docs/COST-SCHEDULER.md) it also reads two OPTIONAL `model_info`
+# keys per model: `overlaat_cost` (explicit GPU-fraction cost override; default
+# is 1/cap) and `overlaat_slot` (swap-slot "fat-slot" group name; every member is
+# forced to cost 1.0). Everything else here (api_base, routing, master_key, ...)
+# is LiteLLM's own concern; the proxy does not interpret it. So: this file is the
+# single source of truth for the caps and scheduler costs, living next to the
+# model they govern. (Per-key priority is NOT here — it comes from the LiteLLM
+# key metadata field `overlaat_priority`; see docs/COST-SCHEDULER.md §4c.)
 #
 # The cap is NOT a tuning knob you invent in isolation — it is DERIVED from the
 # backend's real concurrency capacity (engine process count, server
@@ -68,6 +73,39 @@ model_list:
       max_parallel_requests: 6   # ← per-model semaphore cap read by the queue-proxy. Generous on purpose to avoid head-of-line blocking; see comment above.
     model_info:
       mode: rerank
+      # overlaat_cost: <float> — OPTIONAL explicit GPU-fraction cost for the
+      # cost-weighted scheduler (docs/COST-SCHEDULER.md). Overrides the default
+      # cost = 1/max_parallel_requests. Use it when 1/cap mis-states a model's
+      # real GPU footprint — e.g. here the cap is a generous FAIRNESS knob (6),
+      # but the backend is one single-stream GPU server, so the honest budget
+      # cost of a run is ~1.0, not 1/6. Without this line the scheduler would
+      # think six of these only fill 1/6 of the GPU each.
+      overlaat_cost: 1.0
+
+  # ─── Example 4: a swap-on-demand "fat slot" group (model-b, model-c) ───────
+  # Several large models behind a mutex where only ONE is resident at a time and
+  # loading another evicts the current one (the swap-slot tracked by model_loads).
+  # Mark every member with the SAME `overlaat_slot` group name: the scheduler
+  # then forces each member's cost to 1.0 (= the whole budget B), so admitting
+  # one takes `used` to B and no other run — swap-slot or otherwise — is
+  # admittable until it completes. The "one big model at a time" mutex falls out
+  # of the budget arithmetic; there is NO separate lock. cap is still honoured
+  # (and is the per-model FIFO ceiling), but the cost is what enforces the mutex.
+  - model_name: model-b
+    litellm_params:
+      model: your-large-provider/large-model-b
+      api_base: http://127.0.0.1:8087
+      max_parallel_requests: 1
+    model_info:
+      overlaat_slot: fat-slot   # ← swap-slot group; every member forced to cost 1.0 (mutex)
+
+  - model_name: model-c
+    litellm_params:
+      model: your-large-provider/large-model-c
+      api_base: http://127.0.0.1:8088
+      max_parallel_requests: 1
+    model_info:
+      overlaat_slot: fat-slot   # ← same group → mutually exclusive with model-b
 
   # ─── Illustrative note: a single-stream engine ────────────────────────────
   # For a backend that is ONE large model on ONE engine process that does not

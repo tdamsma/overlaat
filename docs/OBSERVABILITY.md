@@ -78,6 +78,17 @@ Written by the queue-proxy when a request reaches a terminal state.
 | `streamed` | bool |
 | `outcome` | `completed` \| `client_abandoned` \| `upstream_error` \| `cancelled_queued` |
 | `http_status`, `prompt_tokens`, `completion_tokens` | tokens from the gateway's own `usage` block (`NULL` = not reported, **never zero-filled**) |
+| `priority` | effective base priority used at admission (request `priority` clamped to the per-key ceiling). `NULL` when the scheduler is off or the row predates 0.0.3 |
+| `cost` | GPU-fraction cost charged for this run (`1/cap` by default; an `overlaat_cost` override; `1.0` for a swap-slot member or an uncapped model). `NULL` when the scheduler is off |
+| `wait_reason` | why the request waited before admission: `none` (admitted on first pump) \| `reserved` (was the reserved head, admitted once the budget drained for it) \| `aged_in` (aging lifted it above equal-priority peers) \| `budget_full` (shared budget had no room) \| `model_cap` (per-model backend cap was full). `NULL` when the scheduler is off |
+
+The cost-weighted scheduler (on by default since 0.0.3) populates `priority`, `cost`,
+and `wait_reason`; see [`COST-SCHEDULER.md`](COST-SCHEDULER.md) for the algorithm. With
+`OVERLAAT_SCHEDULER=off` (the kill-switch restoring per-model FIFO semaphores) and for
+rows written before 0.0.3, all three are `NULL`. `wait_reason` is the cheapest way to
+see *why* a queue is deep: a run of `budget_full` means the shared GPU budget `B` is the
+bottleneck (models contending for one GPU), whereas `model_cap` means a single backend's
+own cap is the bottleneck (that one model is saturated while the GPU has room).
 
 `key_fp` is a fingerprint, not a secret: it is the first 8 hex chars of the
 SHA-256 of the bearer token. It is enough to group requests by caller and to
@@ -127,11 +138,39 @@ curves, and each is defined in exactly **one** place. They are computed from
   not a bug; it is the supply side.
 - **queued(t)** = offered − active — the backlog.
 
-Because `active(t)` is capped by the semaphore, `offered` is the only curve that
-can exceed the cap, and `queued` is exactly the part of demand the queue is
+Because `active(t)` is bounded by admission, `offered` is the only curve that
+can exceed it, and `queued` is exactly the part of demand the queue is
 absorbing. Plotting all three together is how you see a spillway doing its job:
 demand spikes above the line, the queue takes the overflow, the backend stays at
 its designed capacity instead of thrashing.
+
+## Budget utilization (cost-weighted scheduler)
+
+When the scheduler is on (the default since 0.0.3), the single shared budget `B`
+is the global ceiling that the per-model curves above sum *into*. The live budget
+state is exposed by the queue-proxy on `:4000/__queue/health` and
+`:4000/__queue/status` under a `budget` object:
+
+```jsonc
+"budget": {
+  "budget": 1.0,          // B — the whole GPU
+  "used": 0.75,           // sum of cost(model) over all in-flight runs
+  "budget_pct": 75.0,     // used / B, as a percentage
+  "queue_depth": 3,       // total waiters across all models
+  "in_flight": { "model-a": 2, "model-b": 1 },
+  "reserved_for": "ab12cd34ef56"  // req_id of the reserved head, or null
+}
+```
+
+`used` is the summed cost of every in-flight run, so `budget_pct` near 100% means
+the GPU is fully committed (and new arrivals wait on the budget, not on any one
+model's cap). A non-null `reserved_for` means an expensive head is holding budget
+while cheap jobs drain — the work-conserving-vs-fairness tradeoff (§ COST-SCHEDULER
+3c) is actively biting. Per queued request, `/__queue/status` also surfaces
+`priority`, `effective_priority` (priority after aging), `cost`, and the live
+`wait_reason`, so a deep queue can be read by *why* each entry is waiting. With
+`OVERLAAT_SCHEDULER=off`, the `budget` object is `null` and these per-entry fields
+are absent.
 
 ## Throughput vs concurrency — done honestly
 
