@@ -363,6 +363,14 @@ They live in the same Postgres database the gateway uses for its own state (e.g.
 of insert-on-completion spend logging — it replaces that role entirely as the source
 of request-level truth.
 
+**Backend selection is by `DATABASE_URL` scheme.** Postgres (`postgres://` /
+`postgresql://`, via `psycopg`) is the default; a `sqlite:///` URL is an opt-in,
+zero-extra-services alternative for a single-box deployment. The dialect layer
+(`overlaat/db.py`) picks the driver, parameter placeholder, and DDL from the scheme,
+so the write and read paths are otherwise identical — SQLite fits because the proxy is
+the only writer and SQLite's WAL mode lets the read-only usage-API read without
+blocking it.
+
 ---
 
 ## 10. Configuration surface

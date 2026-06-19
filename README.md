@@ -100,7 +100,8 @@ door into the gateway, your accounting has a hole in it.
 
 ## Quickstart
 
-You need a reachable Postgres (the same one LiteLLM uses is fine) and a configured
+You need a database — either a reachable Postgres (the same one LiteLLM uses is fine,
+the default) or, for a single-box deployment, a local SQLite file — and a configured
 LiteLLM gateway on loopback.
 
 ```bash
@@ -108,7 +109,9 @@ LiteLLM gateway on loopback.
 uv pip install overlaat        # or, for a project: uv add overlaat
 
 # 2. Apply the schema (idempotent)
-psql "$DATABASE_URL" -f schema.sql
+psql "$DATABASE_URL" -f schema.sql               # Postgres (native)
+# or, for either backend:
+python -m overlaat.db init "$DATABASE_URL"        # works for Postgres AND SQLite
 
 # 3. Configure
 cp examples/overlaat.env.example overlaat.env          # fill in DATABASE_URL etc.
@@ -125,6 +128,13 @@ Point your clients at `:4000` instead of LiteLLM directly. Open
 `http://your-host:4100/` for the dashboard. The queue-proxy derives one semaphore per
 model from `litellm-config.yaml`, so that file is the single source of truth for
 concurrency.
+
+> **SQLite, the single-box alternative.** Set `DATABASE_URL=sqlite:///./overlaat.db`
+> (instead of a `postgresql://` URL) and initialize it with
+> `python -m overlaat.db init "$DATABASE_URL"`. That is the whole setup — no separate
+> database service. It works because the proxy is the only writer (single process) and
+> SQLite runs in WAL mode, so the read-only dashboard reads alongside it without
+> blocking. Postgres remains the default and the choice for any shared/multi-host setup.
 
 > The proxy runs a **single uvicorn worker on purpose**: the in-memory per-model
 > semaphores and the instrumentation live in that one process, so FIFO ordering and
@@ -185,12 +195,19 @@ design.
   > (e.g. llama-swap); Overlaat only **observes and logs** it (`model_loads`). The
   > scheduler above folds that switching into its own budget arithmetic.
 
-- **Storage-backend agnostic (at least Postgres + SQLite)** — *not yet implemented.*
-  Today both writers and the dashboard talk to Postgres directly (`psycopg`). The plan
-  is a thin storage abstraction over the three tables so a single-box deployment can
-  run on **SQLite** with zero extra services, while a shared/multi-host setup keeps
-  **Postgres**. The event schema is intentionally simple (epoch-second timestamps, no
-  DB-specific types), so this is mostly an insert/query adapter plus dialect-aware DDL.
+- **Storage-backend agnostic (Postgres + SQLite)** — *implemented, opt-in.* Postgres
+  is still the default and the source of truth for the schema. A single-box deployment
+  that does not want to run a Postgres can instead point `DATABASE_URL` at a
+  `sqlite:///` URL and run on **SQLite** with zero extra services. Backend selection is
+  by URL scheme; the dialect layer (`overlaat/db.py`) only differs in two SQL details
+  (parameter placeholder and one substring function) plus a small DDL translation. The
+  event schema is the same on both — epoch-second timestamps, no DB-specific types in
+  the queries — so the dashboard and the curves are identical regardless of backend.
+
+  SQLite fits the single-box case for a structural reason, not just convenience: the
+  queue-proxy is a **single process and therefore the only writer**, and SQLite runs in
+  **WAL mode**, so the read-only dashboard reads concurrently and never blocks that one
+  writer. One box, one writer, one file — no separate database service to run.
 
 ## Built with LLMs, said openly
 
