@@ -66,6 +66,26 @@ jobs:
           name: dist
           path: dist/*
 
+  smoke-install:
+    name: Wheel install smoke test
+    needs: [build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.12"
+      - name: Install built wheel into a fresh venv
+        run: |
+          uv venv
+          uv pip install dist/*.whl
+      - name: Import package and key submodules
+        run: |
+          uv run python -c "import overlaat, overlaat.queue_proxy, overlaat.usage_api, overlaat.metrics_db"
+
   release:
     name: Release
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'

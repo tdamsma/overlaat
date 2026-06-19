@@ -1,5 +1,10 @@
 # Overlaat
 
+[![PyPI version](https://img.shields.io/pypi/v/overlaat)](https://pypi.org/project/overlaat/)
+[![CI](https://github.com/tdamsma/overlaat/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/tdamsma/overlaat/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/pypi/pyversions/overlaat)](https://pypi.org/project/overlaat/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
+
 Overlaat puts a **fair waiting-queue** and **honest usage accounting** in front of a
 self-hosted, multi-backend LLM gateway ([LiteLLM](https://github.com/BerriAI/litellm)).
 It is two small services and one Postgres schema. That is the whole thing.
@@ -100,7 +105,7 @@ LiteLLM gateway on loopback.
 
 ```bash
 # 1. Install
-pip install -e .        # or: uv pip install -e .
+uv pip install overlaat        # or, for a project: uv add overlaat
 
 # 2. Apply the schema (idempotent)
 psql "$DATABASE_URL" -f schema.sql
@@ -124,6 +129,13 @@ concurrency.
 > The proxy runs a **single uvicorn worker on purpose**: the in-memory per-model
 > semaphores and the instrumentation live in that one process, so FIFO ordering and
 > event emission must not be sharded across workers. This is a feature, not a TODO.
+
+> **Development install.** Hacking on Overlaat itself? Clone the repo and install it
+> editable with the dev extras instead of from PyPI:
+>
+> ```bash
+> uv pip install -e '.[dev]'        # editable + pytest, ruff, build, twine
+> ```
 
 ## Honest concurrency: three curves
 
