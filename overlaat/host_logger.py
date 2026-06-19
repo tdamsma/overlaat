@@ -40,6 +40,7 @@ import json
 import os
 import re
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -90,6 +91,39 @@ def database_url() -> str:
 
 
 DB_URL = database_url()
+
+
+def is_sqlite(url: str) -> bool:
+    """A `sqlite:` URL selects the opt-in SQLite backend; anything else is
+    Postgres (the default). Kept inline so this module stays stdlib-only and
+    self-contained (it can run without the package's deps installed)."""
+    return (url or "").startswith("sqlite:")
+
+
+def sqlite_path(url: str) -> str:
+    """Filesystem path from a `sqlite:` URL, mirroring overlaat.db.sqlite_path:
+    `sqlite:///abs/path.db` → `/abs/path.db`, `sqlite:///./rel.db` → `./rel.db`,
+    `sqlite:///.hidden/x.db` → `/.hidden/x.db`, `sqlite:////abs.db` → `/abs.db`.
+
+    # KEEP IN SYNC with overlaat.db.sqlite_path
+    """
+    rest = url[len("sqlite:") :]
+    rest = rest.removeprefix("//")  # `sqlite://…` → `/…` or `…`
+    # Treat the result as relative ONLY when an explicit relative marker follows
+    # the leading slash (`/./…` or `/../…`) — then drop that slash. Any other
+    # leading-slash path is absolute; collapse a run of leading slashes
+    # (e.g. `sqlite:////abs.db` → `//abs.db`) to a single `/`.
+    if rest.startswith("/./") or rest.startswith("/../"):
+        rest = rest[1:]
+    elif rest.startswith("/"):
+        rest = "/" + rest.lstrip("/")
+    return rest or ":memory:"
+
+
+def _sqlite_connect(url: str) -> sqlite3.Connection:
+    conn = sqlite3.connect(sqlite_path(url), timeout=15.0)
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
 
 
 def vm_stat() -> dict:
@@ -315,6 +349,43 @@ def write_sample_pg(rec: dict) -> None:
     )
 
 
+def write_sample_sqlite(rec: dict) -> None:
+    """INSERT one host sample into SQLite via parameterized stdlib sqlite3 (no
+    quote-escaping needed). The JSON breakdown is stored as a TEXT string.
+    Raises on failure (caller logs)."""
+    if not DB_URL:
+        raise RuntimeError("no DATABASE_URL")
+    mem, gpu, cpu = rec["mem"], rec["gpu"], rec["cpu"]
+    backends = json.dumps(rec["backends"], ensure_ascii=False)
+    sql = (
+        "INSERT INTO host_samples "
+        "(ts,gpu_pct,gpu_freq_mhz,ram_total_gb,ram_wired_gb,ram_active_gb,"
+        "ram_inactive_gb,ram_compressed_gb,ram_free_gb,cpu_load1,cpu_load5,"
+        "backends_json) VALUES (?,?,?,?,?,?,?,?,?,?,?,?) "
+        "ON CONFLICT (ts) DO NOTHING"
+    )
+    params = (
+        round(rec["ts_epoch"], 3),
+        gpu.get("active_pct"),
+        gpu.get("freq_mhz"),
+        mem.get("total_gb"),
+        mem.get("wired_gb"),
+        mem.get("active_gb"),
+        mem.get("inactive_gb"),
+        mem.get("compressed_gb"),
+        mem.get("free_gb"),
+        cpu.get("load1"),
+        cpu.get("load5"),
+        backends,
+    )
+    conn = _sqlite_connect(DB_URL)
+    try:
+        conn.execute(sql, params)
+        conn.commit()
+    finally:
+        conn.close()
+
+
 # -- cold-load tracking (optional) ----------------------------------------------
 # If you run a model-swap server that loads one large model at a time, its
 # /running endpoint reports each member's state (starting -> ready -> [evicted]).
@@ -358,6 +429,39 @@ def write_model_load_pg(model: str, t_start: float, t_ready: float | None, detai
     )
 
 
+def write_model_load_sqlite(model: str, t_start: float, t_ready: float | None, detail: str) -> None:
+    """INSERT one cold-load row into SQLite via parameterized stdlib sqlite3.
+    Raises on failure (caller logs)."""
+    if not DB_URL:
+        raise RuntimeError("no DATABASE_URL")
+    load_s = None if t_ready is None else round(t_ready - t_start, 2)
+    conn = _sqlite_connect(DB_URL)
+    try:
+        conn.execute(
+            "INSERT INTO model_loads (model,t_start,t_ready,load_s,detail) VALUES (?,?,?,?,?)",
+            (model, round(t_start, 3), t_ready, load_s, detail),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# Backend-dispatch shims: pick the SQLite or Postgres writer by URL scheme. The
+# Postgres path (psql subprocess, ::jsonb cast) is unchanged; SQLite is opt-in.
+def write_sample(rec: dict) -> None:
+    if is_sqlite(DB_URL):
+        write_sample_sqlite(rec)
+    else:
+        write_sample_pg(rec)
+
+
+def write_model_load(model: str, t_start: float, t_ready: float | None, detail: str) -> None:
+    if is_sqlite(DB_URL):
+        write_model_load_sqlite(model, t_start, t_ready, detail)
+    else:
+        write_model_load_pg(model, t_start, t_ready, detail)
+
+
 def track_model_loads(now_epoch: float) -> None:
     """Poll the swap server and emit a load row when a model reaches ready after
     a non-ready period. Best-effort: a failed poll or write is swallowed
@@ -380,7 +484,7 @@ def track_model_loads(now_epoch: float) -> None:
             prev["t_start"] = now_epoch  # load began
         elif state == "ready" and prev["t_start"] is not None:
             try:
-                write_model_load_pg(model, prev["t_start"], now_epoch, f"{prev['state']}->ready")
+                write_model_load(model, prev["t_start"], now_epoch, f"{prev['state']}->ready")
             except Exception as e:  # noqa: BLE001
                 sys.stderr.write(f"model-load write failed: {type(e).__name__}: {e}\n")
                 sys.stderr.flush()
@@ -419,7 +523,7 @@ def main():
     while not _stop:
         t0 = time.monotonic()
         try:
-            write_sample_pg(sample())
+            write_sample(sample())
         except Exception as e:  # noqa: BLE001
             sys.stderr.write(f"sample failed: {type(e).__name__}: {e}\n")
             sys.stderr.flush()

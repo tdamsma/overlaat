@@ -54,7 +54,7 @@ import yaml
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
-from overlaat import __version__
+from overlaat import __version__, db
 
 UPSTREAM = os.environ.get("QUEUE_PROXY_UPSTREAM", "http://127.0.0.1:4002")
 LITELLM_CONFIG = Path(os.environ.get("QUEUE_PROXY_LITELLM_CONFIG", "./litellm-config.yaml"))
@@ -72,14 +72,6 @@ PROXIED_PATHS = {
 }
 SERVICE_VERSION = __version__
 
-_INSERT_SQL = (
-    "INSERT INTO request_events "
-    "(t_enqueue, t_acquire, t_first_token, t_done, model_requested, key_fp, "
-    " streamed, outcome, http_status, prompt_tokens, completion_tokens) "
-    "VALUES (%(t_enqueue)s, %(t_acquire)s, %(t_first_token)s, %(t_done)s, "
-    "%(model_requested)s, %(key_fp)s, %(streamed)s, %(outcome)s, "
-    "%(http_status)s, %(prompt_tokens)s, %(completion_tokens)s)"
-)
 _EVENT_COLS = (
     "t_enqueue",
     "t_acquire",
@@ -93,6 +85,24 @@ _EVENT_COLS = (
     "prompt_tokens",
     "completion_tokens",
 )
+# Postgres uses psycopg named params (the writer feeds dict rows via executemany);
+# SQLite uses positional `?` params (rows projected to a tuple in _EVENT_COLS order).
+_INSERT_SQL_PG = (
+    "INSERT INTO request_events "
+    "(t_enqueue, t_acquire, t_first_token, t_done, model_requested, key_fp, "
+    " streamed, outcome, http_status, prompt_tokens, completion_tokens) "
+    "VALUES (%(t_enqueue)s, %(t_acquire)s, %(t_first_token)s, %(t_done)s, "
+    "%(model_requested)s, %(key_fp)s, %(streamed)s, %(outcome)s, "
+    "%(http_status)s, %(prompt_tokens)s, %(completion_tokens)s)"
+)
+_INSERT_SQL_SQLITE = (
+    "INSERT INTO request_events "
+    "(t_enqueue, t_acquire, t_first_token, t_done, model_requested, key_fp, "
+    " streamed, outcome, http_status, prompt_tokens, completion_tokens) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
+# Back-compat alias: the Postgres statement remains the module-level default.
+_INSERT_SQL = _INSERT_SQL_PG
 
 _RE_PT = re.compile(rb'"prompt_tokens"\s*:\s*(\d+)')
 _RE_CT = re.compile(rb'"completion_tokens"\s*:\s*(\d+)')
@@ -176,10 +186,16 @@ def emit_event(ev: dict) -> None:
 
 
 async def _event_writer() -> None:
-    """Background task: drain EVENT_Q and batch-insert into Postgres. Reconnect
-    on error. The DB is local and expected to be up; on a write error we drop the
-    batch (counted) and reconnect for the next one — no on-disk fallback. Sentinel
-    None = stop."""
+    """Background task: drain EVENT_Q and batch-insert lifecycle events.
+
+    Dispatches on the configured backend: Postgres (psycopg AsyncConnection) or
+    the opt-in SQLite path. Reconnect on error. The DB is local and expected to
+    be up; on a write error we drop the batch (counted) and reconnect for the
+    next one — no on-disk fallback. Sentinel None = stop."""
+    if db.dialect_for(METRICS_DB_URL) == "sqlite":
+        await _event_writer_sqlite()
+        return
+
     import psycopg  # local: only needed in the writer
 
     q = EVENT_Q
@@ -220,6 +236,60 @@ async def _event_writer() -> None:
     if conn is not None:
         try:
             await conn.close()
+        except Exception:
+            pass
+
+
+def _sqlite_write_batch(conn, batch: list[dict]) -> None:
+    """Blocking: executemany the batch (positional params in _EVENT_COLS order)
+    and commit. Runs in a worker thread via asyncio.to_thread."""
+    rows = [tuple(row[c] for c in _EVENT_COLS) for row in batch]
+    conn.executemany(_INSERT_SQL_SQLITE, rows)
+    conn.commit()
+
+
+async def _event_writer_sqlite() -> None:
+    """SQLite sibling of the writer: same bounded-queue draining, EVENT_BATCH
+    batching, sentinel-None stop, and drop-and-reconnect error handling as the
+    Postgres path, but against a stdlib sqlite3 connection (WAL) driven off the
+    event loop via asyncio.to_thread so the blocking insert never stalls it."""
+    q = EVENT_Q
+    conn = None
+    while True:
+        first = await q.get()
+        if first is None:
+            break
+        batch = [first]
+        stop = False
+        while len(batch) < EVENT_BATCH:
+            try:
+                nxt = q.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if nxt is None:
+                stop = True
+                break
+            batch.append(nxt)
+        try:
+            if conn is None:
+                conn = await asyncio.to_thread(db.connect_sqlite_write, METRICS_DB_URL)
+            await asyncio.to_thread(_sqlite_write_batch, conn, batch)
+            EVENT_STATS["written"] += len(batch)
+        except Exception as e:  # noqa: BLE001
+            EVENT_STATS["dropped"] += len(batch)
+            sys.stderr.write(f"event-writer: dropped {len(batch)} ({type(e).__name__}: {e})\n")
+            sys.stderr.flush()
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = None
+        if stop:
+            break
+    if conn is not None:
+        try:
+            conn.close()
         except Exception:
             pass
 

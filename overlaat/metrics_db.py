@@ -25,7 +25,7 @@ from __future__ import annotations
 import bisect
 from typing import Any
 
-import psycopg
+from overlaat import db
 
 MIN_SAMPLES = 5  # below this, a per-concurrency cell is "insufficient", not a trend
 TOP_KEYS = 8  # stacked attribution: top N keys + <other>
@@ -54,7 +54,7 @@ _EVENT_FIELDS = (
 
 
 def _connect(db_url: str):
-    return psycopg.connect(db_url, connect_timeout=5)
+    return db.connect(db_url)
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -160,10 +160,14 @@ def resolve_key_aliases(db_url: str) -> dict[str, str]:
     (turns a key fingerprint into a human label) and is best-effort — any failure
     leaves the fingerprint in place rather than breaking a view."""
     out: dict[str, str] = {}
+    # LiteLLM_VerificationToken lives only in the LiteLLM Postgres; a SQLite
+    # backend has no such table, so there are no aliases to resolve.
+    if db.dialect_for(db_url) == "sqlite":
+        return out
     try:
         with _connect(db_url) as c, c.cursor() as cur:
             cur.execute(
-                "SELECT left(token,8), COALESCE(key_alias, key_name) "
+                f"SELECT {db.left_expr(db_url, 'token', 8)}, COALESCE(key_alias, key_name) "
                 'FROM "LiteLLM_VerificationToken"'
             )
             for fp, alias in cur.fetchall():
@@ -177,16 +181,20 @@ def resolve_key_aliases(db_url: str) -> dict[str, str]:
 def fetch_events(db_url: str, since: float, until: float | None = None) -> list[dict]:
     """All request events overlapping [since, until]: t_done >= since (and
     t_enqueue <= until if given)."""
-    sql = _EVENT_SELECT + " WHERE t_done >= %s"
+    ph = db.placeholder(db_url)
+    sql = _EVENT_SELECT + f" WHERE t_done >= {ph}"
     params: list[Any] = [since]
     if until is not None:
-        sql += " AND t_enqueue <= %s"
+        sql += f" AND t_enqueue <= {ph}"
         params.append(until)
     sql += " ORDER BY t_enqueue"
     with _connect(db_url) as c, c.cursor() as cur:
         cur.execute(sql, params)
         rows = cur.fetchall()
-    return [dict(zip(_EVENT_FIELDS, r, strict=False)) for r in rows]
+    out = [dict(zip(_EVENT_FIELDS, r, strict=False)) for r in rows]
+    for e in out:
+        e["streamed"] = db.normalize_streamed(e["streamed"])
+    return out
 
 
 def fetch_host_samples(db_url: str, since: float) -> list[dict]:
@@ -194,7 +202,7 @@ def fetch_host_samples(db_url: str, since: float) -> list[dict]:
         "SELECT ts, gpu_pct, gpu_freq_mhz, ram_wired_gb, ram_active_gb, "
         "ram_inactive_gb, ram_compressed_gb, ram_free_gb, ram_total_gb, "
         "cpu_load1, backends_json FROM host_samples "
-        "WHERE ts >= %s ORDER BY ts"
+        f"WHERE ts >= {db.placeholder(db_url)} ORDER BY ts"
     )
     fields = (
         "ts",
@@ -212,7 +220,10 @@ def fetch_host_samples(db_url: str, since: float) -> list[dict]:
     with _connect(db_url) as c, c.cursor() as cur:
         cur.execute(sql, (since,))
         rows = cur.fetchall()
-    return [dict(zip(fields, r, strict=False)) for r in rows]
+    out = [dict(zip(fields, r, strict=False)) for r in rows]
+    for s in out:
+        s["backends_json"] = db.normalize_backends_json(s["backends_json"])
+    return out
 
 
 def latest_host(db_url: str) -> dict | None:
@@ -235,7 +246,11 @@ def latest_host(db_url: str) -> dict | None:
     with _connect(db_url) as c, c.cursor() as cur:
         cur.execute(sql)
         r = cur.fetchone()
-    return dict(zip(fields, r, strict=False)) if r else None
+    if not r:
+        return None
+    out = dict(zip(fields, r, strict=False))
+    out["backends_json"] = db.normalize_backends_json(out["backends_json"])
+    return out
 
 
 # ── views ─────────────────────────────────────────────────────────────────────

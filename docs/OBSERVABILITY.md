@@ -48,6 +48,15 @@ DDL lives in `schema.sql` (idempotent). All timestamps are epoch **seconds**
 (UTC, sub-millisecond) — no timezone games. The instrumentation writes to the
 same Postgres the gateway uses (point `DATABASE_URL` at it).
 
+The same event schema is backed by either **Postgres** (the default) or, opt-in
+for a single-box deployment, **SQLite** (a `sqlite:///` `DATABASE_URL`). The
+shapes are identical across backends — timestamps are epoch-second doubles in
+both — with only the storage type of `host_samples.backends_json` differing:
+`JSONB` in Postgres, JSON-as-`TEXT` in SQLite (decoded back to an object on
+read). For SQLite, initialize the file with `python -m overlaat.db init
+"$DATABASE_URL"` (the same entry point works for Postgres too); `psql -f
+schema.sql` remains the Postgres-native way.
+
 ### `request_events` — one row per request
 
 Written by the queue-proxy when a request reaches a terminal state.
