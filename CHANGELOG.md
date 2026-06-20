@@ -8,7 +8,52 @@ versions without a compatibility guarantee.
 
 ## [Unreleased]
 
+### Added
+- **Cost-weighted priority scheduler** (`overlaat/scheduler.py`), replacing the
+  independent per-model semaphores with **one global priority queue + cost-weighted
+  admission against a single shared GPU budget `B`** (default `1.0`). Each in-flight run
+  consumes `cost = 1/cap` (a `model_info.overlaat_cost` override, or `1.0` for a
+  swap-slot member or an uncapped model); a request is admitted only when both the
+  per-model cap binds (`model_in_flight < cap`) and the shared budget has room
+  (`used + cost ≤ B + ε`). Packing is work-conserving with an eager head reservation and
+  optional linear aging so a drip of cheap jobs cannot starve an expensive one; there is
+  no preemption. Ordering is by effective priority = `min(request priority, per-key
+  ceiling) + aging`. The per-key ceiling is read from `LiteLLM_VerificationToken.metadata`
+  (`overlaat_priority`), cached in memory and refreshed ~every 60 s — never on the hot
+  path — with graceful fallback to `OVERLAAT_DEFAULT_PRIORITY`. Swap-slot ("fat-slot")
+  groups are modeled as `cost = 1.0`, so the "one big model at a time" mutex falls out of
+  the budget arithmetic with no separate lock. Full design: `docs/COST-SCHEDULER.md`.
+- New env knobs: `OVERLAAT_SCHEDULER` (default `on`; `off` is a kill-switch restoring the
+  exact per-model `asyncio.Semaphore` FIFO path), `OVERLAAT_BUDGET` (`1.0`),
+  `OVERLAAT_DEFAULT_COST` (`1.0`), `OVERLAAT_DEFAULT_PRIORITY` (`0`), `OVERLAAT_AGING_RATE`
+  (`0.0`, aging off), `OVERLAAT_RESERVATION_GRACE` (`0.0`, eager reservation).
+- New `request_events` columns `priority`, `cost`, and `wait_reason` (`none` |
+  `reserved` | `aged_in` | `budget_full` | `model_cap`), recorded per admitted/cancelled
+  request when the scheduler is on (`NULL` otherwise). The queue-proxy `/__queue/health`
+  and `/__queue/status` endpoints now expose a `budget` object (`used`/`budget`/
+  `budget_pct`/`reserved_for`) and per-queued-entry `priority`/`effective_priority`/
+  `cost`/`wait_reason`.
+
 ### Changed
+- **Behavior change (scheduler on by default):** admission is now the cost-weighted
+  global scheduler, **not** independent per-model semaphores. The shared budget `B` caps
+  the *summed* cost across all models, so peak concurrency is **lower** than the old
+  "sum of caps" (and honest about the single GPU). With nothing configured — `cost =
+  1/cap`, `B = 1.0`, equal priority, aging off — a single model reduces to per-model
+  FIFO, matching the old semaphore; set `OVERLAAT_SCHEDULER=off` to restore the previous
+  path byte-for-byte.
+- **Upgrade step for existing deployments:** the three new `request_events` columns are
+  in `schema.sql` (idempotent — `python -m overlaat.db init "$DATABASE_URL"` or `psql -f
+  schema.sql` adds them on a fresh table). To add them to an **existing** Postgres table
+  without recreating it:
+  ```sql
+  ALTER TABLE request_events ADD COLUMN IF NOT EXISTS priority    INTEGER;
+  ALTER TABLE request_events ADD COLUMN IF NOT EXISTS cost        DOUBLE PRECISION;
+  ALTER TABLE request_events ADD COLUMN IF NOT EXISTS wait_reason TEXT;
+  ```
+  (SQLite: `ALTER TABLE request_events ADD COLUMN priority INTEGER;` etc. — SQLite has no
+  `IF NOT EXISTS` for columns, so run each once.) Pre-upgrade rows keep `NULL` in all
+  three, which the dashboard and curves treat as "scheduler off".
 - The package version is now derived from the git tag via `hatch-vcs` (`[tool.hatch.version] source = "vcs"`); the hardcoded `__version__` literal and the CI tag↔version guard have been removed. Cutting a release is just pushing a `vX.Y.Z` tag — CI builds and publishes from it. At runtime `overlaat.__version__` is read back from the installed package metadata.
 - SQLite connections now set `PRAGMA busy_timeout=5000` (alongside `journal_mode=WAL`) at every connection point — read path (`db.connect`), writer (`db.connect_sqlite_write`), and the host sampler's connect helper — so concurrent dashboard reads and the single writer wait briefly instead of immediately raising "database is locked".
 - Documented SQLite operations (WAL `-wal`/`-shm` sidecar files, single-writer/no-`--workers` rule, schema init via `python -m overlaat.db init`, and online backup with `sqlite3 ".backup"` / `VACUUM INTO`) in the README and `docs/OBSERVABILITY.md`.

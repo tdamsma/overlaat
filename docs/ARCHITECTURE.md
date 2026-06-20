@@ -47,17 +47,42 @@ produces:
 Overlaat replaces "reject and make the caller cope" with "**wait in line**":
 
 - It owns the network-facing port and forwards every request to the gateway on
-  loopback *after* the request has been admitted by a **per-model `asyncio.Semaphore`**.
-- Requests beyond the cap **block in FIFO order** until a slot frees up. No 429, no
-  retry overhead, no race for a freed slot — first in, first served.
-- The semaphore size for each model is **derived from the gateway config**: the
-  proxy reads `max_parallel_requests` from the LiteLLM config's `litellm_params` for
-  that model. It is not a second, independently-tuned number that can drift away from
-  the backend's real capacity. One source of truth for the cap, living next to the
-  model it governs. Change the backend's true parallelism, change the cap in the
-  gateway config, and the proxy picks it up — not the other way around.
+  loopback *after* the request has been **admitted**.
+- Requests beyond what the GPU can serve **wait** until admission frees up. No 429, no
+  retry overhead, no race for a freed slot.
+- The per-model cap is **derived from the gateway config**: the proxy reads
+  `max_parallel_requests` from the LiteLLM config's `litellm_params` for that model. It
+  is not a second, independently-tuned number that can drift away from the backend's
+  real capacity. One source of truth for the cap, living next to the model it governs.
+  Change the backend's true parallelism, change the cap in the gateway config, and the
+  proxy picks it up — not the other way around.
 
-Models that have no cap in the config are passed through without a queue.
+### The admission decision: cost-weighted scheduler (default) or per-model FIFO
+
+Admission has two modes, selected by `OVERLAAT_SCHEDULER` (default `on`):
+
+- **Cost-weighted global scheduler (default, since 0.0.3).** One global priority queue
+  guarded by cost-weighted admission against a single shared budget `B` (the whole GPU,
+  default `1.0`). Each run costs its GPU fraction — `cost = 1/cap` by default, an
+  explicit `model_info.overlaat_cost` override, or `1.0` for a swap-slot member or an
+  uncapped model. A request is admittable only if **both** the per-model cap binds
+  (`model_in_flight < cap`) **and** the shared budget has room (`used + cost ≤ B`), so
+  `B` caps the *summed* cost across all models — the honest single-GPU ceiling that
+  independent caps lacked. Ordering is by effective priority (the request's `priority`
+  clamped to a per-key ceiling from LiteLLM key metadata, plus linear aging by wait
+  time); packing is work-conserving with an eager head reservation so a drip of cheap
+  jobs cannot starve an expensive one. There is **no preemption** — admission is the
+  only lever. The full algorithm, the starvation argument, and the scalar-cost caveat
+  live in [`COST-SCHEDULER.md`](COST-SCHEDULER.md); the implementation is
+  `overlaat/scheduler.py`, a lock-free single-process state machine.
+- **Per-model FIFO semaphores (`OVERLAAT_SCHEDULER=off`, kill-switch).** The original
+  path: one `asyncio.Semaphore(cap)` per model, overflow blocking in strict FIFO order.
+  With the scheduler on but nothing configured (cost `1/cap`, `B = 1.0`, equal priority,
+  aging off), a single model reduces to exactly this FIFO behavior.
+
+Either way, **a model with no cap in the config is never 429'd**: under the scheduler it
+is admitted against the budget at `OVERLAAT_DEFAULT_COST`; under the kill-switch it
+passes through without a queue.
 
 ### Why the cap is *derived*, not tuned
 
@@ -83,10 +108,11 @@ oversubscribe a serial one.
 ### What the queue deliberately does *not* do
 
 It does not load-balance traffic, it does not divide GPU-time fairly between
-consumers, and it does not predict which prompt is expensive. It only prevents the
-backend from being handed more concurrent work than it can serve, and it imposes a
-global FIFO order on the overflow. Fairness beyond FIFO (per-key quotas, priority
-classes) is out of scope for the queue itself.
+consumers, and it does not predict which prompt is expensive. It only decides
+*admission* — which request may start and when — never which model serves it.
+Priority ordering (per-key ceiling + aging) **is** in scope as of 0.0.3; what is
+still out of scope is per-key throughput quotas (a single key flooding the queue with
+equal-priority work) — see the open item in `COST-SCHEDULER.md` §8.
 
 ---
 
@@ -123,12 +149,16 @@ timestamps that define the request's life:
 | `t_first_token` | first content byte (TTFT marker); **NULL** for non-stream / no tokens |
 | `t_done` | last byte / connection closed = slot released |
 
-…plus `model_requested` (the alias that hit the semaphore), `key_fp`
+…plus `model_requested` (the alias that hit the scheduler), `key_fp`
 (`sha256(bearer)[:8]`, resolvable to a key alias for attribution), `streamed`,
 `outcome` ∈ {`completed`, `client_abandoned`, `upstream_error`, `cancelled_queued`},
 `http_status`, and `prompt_tokens` / `completion_tokens` taken from the gateway's own
 `usage` block (**NULL when the backend did not report usage — never zero-filled**, so
-a missing count never silently reads as zero).
+a missing count never silently reads as zero). Under the cost-weighted scheduler each
+row also carries `priority` (effective base priority at admission), `cost` (GPU-fraction
+charged), and `wait_reason` (`none` | `reserved` | `aged_in` | `budget_full` |
+`model_cap`); all three are **NULL** on the kill-switch path and for uncounted
+pass-throughs. See `OBSERVABILITY.md` for their meaning.
 
 Everything else is **derived once**, in `metrics_db.py`, never re-defined per
 endpoint:
@@ -382,7 +412,19 @@ runs out of a checkout without site-specific paths.
 |---|---|---|
 | `DATABASE_URL` | — | Postgres the proxy/sampler write to and the usage-API reads. No on-disk fallback; if it is down the proxy fails the request cleanly. |
 | `QUEUE_PROXY_UPSTREAM` | `http://127.0.0.1:4002` | the loopback LiteLLM gateway the proxy forwards to |
-| `QUEUE_PROXY_LITELLM_CONFIG` | `./litellm-config.yaml` | the gateway config the proxy parses to size one semaphore per model (it reads only `max_parallel_requests`) |
+| `QUEUE_PROXY_LITELLM_CONFIG` | `./litellm-config.yaml` | the gateway config the proxy parses for per-model `max_parallel_requests` (the cap) plus the scheduler's `model_info.overlaat_cost` / `overlaat_slot` |
+| `OVERLAAT_SCHEDULER` | `on` | cost-weighted global scheduler; `off` is a kill-switch restoring the per-model `asyncio.Semaphore` FIFO path |
+| `OVERLAAT_BUDGET` | `1.0` | shared budget `B` (the whole GPU); caps the summed cost across all in-flight runs |
+| `OVERLAAT_DEFAULT_COST` | `1.0` | cost charged for a model with no declared cap (keeps a no-cap run from being silently uncounted) |
+| `OVERLAAT_DEFAULT_PRIORITY` | `0` | priority when neither the request nor the key supplies one; also the fallback per-key ceiling |
+| `OVERLAAT_AGING_RATE` | `0.0` | linear priority gain per second waited (`0.0` = aging off → pure FIFO at equal priority) |
+| `OVERLAAT_RESERVATION_GRACE` | `0.0` | reservation is eager at `0.0`; a non-zero grace is parsed but reserved for a future refinement |
+
+Per-model `model_info.overlaat_cost` (explicit cost override) and
+`model_info.overlaat_slot` (swap-slot group → cost forced to `1.0`) live in the LiteLLM
+config. The per-key priority *ceiling* is read from `LiteLLM_VerificationToken.metadata`
+JSON (field `overlaat_priority`), cached in memory and refreshed ~every 60 s — never on
+the hot path — with graceful fallback to `OVERLAAT_DEFAULT_PRIORITY`.
 
 Secrets (Postgres credentials, gateway master key) come from an env-file (default
 `./overlaat.env`, `chmod 600`), never from the LiteLLM config YAML and never committed.
@@ -398,8 +440,10 @@ restart at any time.
 
 ## 11. Non-goals (so the scope stays honest)
 
-- **Not a load balancer.** No GPU-time fairness between consumers, no cost prediction,
-  no request scheduling beyond per-model FIFO admission.
+- **Not a load balancer.** No GPU-time fairness between consumers and no cost
+  prediction. It does cost-weighted priority *admission* against a single shared GPU
+  budget (since 0.0.3), but it never moves a request to a different model and never
+  preempts a running one — admission is the only lever.
 - **Not multi-tenant billing.** Keys are attribution fingerprints, not metered
   secrets; "spend" is informational, not authoritative.
 - **Not horizontally scaled.** One async worker owns the queue and the

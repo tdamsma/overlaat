@@ -173,38 +173,73 @@ See [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) for the curves and their ca
 and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the call-path and instrumentation
 design.
 
+## Capacity-aware priority scheduler
+
+*Implemented since 0.0.3, **on by default**.* Instead of independent per-model FIFO
+semaphores (where each model admits up to its own cap and the caps sum freely — so two
+models can each be "under cap" while collectively oversubscribing the single GPU),
+Overlaat runs **one global priority queue + cost-weighted admission against a single
+shared GPU budget** (`B = 1.0`).
+
+Each run costs its fraction of the GPU (`cost = 1 / cap`, so a `cap=4` model costs
+`0.25`); the scheduler admits the highest-priority request that *fits* the remaining
+budget and releases that cost on completion — so multiple models run **in parallel up to
+real capacity** instead of up to the sum of their caps. **`B` caps the *summed* cost
+across all models**, which is the honest single-GPU ceiling. Packing is
+**work-conserving** (leftover budget keeps serving cheap jobs) with a **reservation +
+aging** guard so a drip of cheap high-priority jobs can't starve an expensive one.
+Backend hard caps still bind (`model_in_flight < cap` **and** `used + cost ≤ B`), and
+**large-model switching** falls out for free: a swap-slot ("fat-slot") group where only
+one big model is resident at a time is modeled as `cost = 1.0`, so admitting one fills
+the budget and blocks the rest until it completes. **Per-key priority** is un-gameable
+(`effective_priority = min(requested, key_ceiling) + aging`, batch keys provisioned with
+a low ceiling). There is **no preemption** — Metal can't reorder dispatched GPU kernels,
+so the only lever is *admission*.
+
+The trade is deliberate: a shared budget is **lower peak concurrency** than summed caps
+but **honest about the one GPU and free of thrash**, and it keeps the same "wait, don't
+reject" spillway posture. With the scheduler on but nothing configured — `cost = 1/cap`,
+`B = 1.0`, equal priority, aging off — a single model reduces to per-model FIFO, exactly
+matching the old semaphore. Full design (packing policy, starvation argument, the
+scalar-cost VRAM-vs-compute caveat): [`docs/COST-SCHEDULER.md`](docs/COST-SCHEDULER.md).
+
+### Configuring the scheduler
+
+The scheduler is **on by default**. `OVERLAAT_SCHEDULER=off` is a kill-switch that
+restores the exact per-model semaphore FIFO path. All knobs are optional — the defaults
+reduce to FIFO for a single model.
+
+| env var | default | meaning |
+|---|---|---|
+| `OVERLAAT_SCHEDULER` | `on` | `off` = kill-switch, restore per-model `asyncio.Semaphore` FIFO |
+| `OVERLAAT_BUDGET` | `1.0` | shared budget `B` (the whole GPU); caps the summed cost of all in-flight runs |
+| `OVERLAAT_DEFAULT_COST` | `1.0` | cost charged for a model with no declared cap (so a no-cap run is not silently uncounted) |
+| `OVERLAAT_DEFAULT_PRIORITY` | `0` | priority used when neither the request nor the key supplies one; also the fallback ceiling |
+| `OVERLAAT_AGING_RATE` | `0.0` | linear priority gain per second waited (`0.0` = aging off → pure FIFO at equal priority) |
+| `OVERLAAT_RESERVATION_GRACE` | `0.0` | reservation is **eager** (`0.0`); a non-zero grace is reserved for a future refinement |
+
+Per-model knobs come from the LiteLLM config's `model_info` block (next to the model
+they govern, like `max_parallel_requests`):
+
+- **`model_info.overlaat_cost: <float>`** — explicit GPU-fraction cost override; takes
+  precedence over `1/cap`.
+- **`model_info.overlaat_slot: <group>`** — swap-slot ("fat-slot") group membership;
+  every member's cost is forced to `1.0`, so the "one big model at a time" mutex falls
+  out of the budget arithmetic with no separate lock.
+
+Per-key priority ceiling comes from **LiteLLM key metadata**, not an env map: the
+`LiteLLM_VerificationToken` row's `metadata` JSON, field **`overlaat_priority`** (an
+integer). It is cached in memory and refreshed ~every 60 s — never read on the hot path —
+and falls back to `OVERLAAT_DEFAULT_PRIORITY` when a key has no `overlaat_priority` or the
+table is unreachable (e.g. a SQLite single-box deployment). A client sets per-request
+urgency with a `priority` integer in the request body; the effective priority is clamped
+to the key's ceiling, so a batch key cannot impersonate an interactive one.
+
+> Note: large-model switching is performed by the underlying swap layer (e.g.
+> llama-swap); Overlaat only **observes and logs** it (`model_loads`). The scheduler
+> folds that switching into its own budget arithmetic via the `overlaat_slot` group.
+
 ## Roadmap
-
-- **Capacity-aware priority scheduler** — *not yet implemented.* Today's code runs
-  independent **per-model FIFO semaphores**: each model admits up to its own cap, and
-  the caps sum freely. That is a fine v1, but it lets two models be individually
-  "under cap" while collectively oversubscribing the single GPU.
-
-  The planned next step replaces those independent semaphores with **one global
-  priority queue + cost-weighted admission against a single shared GPU budget**
-  (`B = 1.0`). Each run costs its fraction of the GPU (`cost = 1 / cap`, so a `cap=4`
-  model costs `0.25`); the scheduler admits the highest-priority request that *fits*
-  the remaining budget and releases that cost on completion — so multiple models run
-  **in parallel up to real capacity** instead of up to the sum of their caps. Packing
-  is **work-conserving** (leftover budget keeps serving cheap jobs) with a
-  **reservation + aging** guard so a drip of cheap high-priority jobs can't starve an
-  expensive one. Backend hard caps still bind (`model_in_flight < cap` **and**
-  `used + cost ≤ B`), and **large-model switching** falls out for free: a swap-slot
-  ("fat-slot") group where only one big model is resident at a time is modeled as
-  `cost = 1.0`, so admitting one fills the budget and blocks the rest until it
-  completes. Optional **per-key priority** is un-gameable (`effective_priority =
-  min(requested, key_max)`, batch keys capped low). There is **no preemption** —
-  Metal can't reorder dispatched GPU kernels, so the only lever is *admission*.
-
-  The trade is deliberate: a shared budget is **lower peak concurrency** than summed
-  caps but **honest about the one GPU and free of thrash**, and it keeps the same
-  "wait, don't reject" spillway posture. Full design (packing policy, starvation
-  proof, the scalar-cost VRAM-vs-compute caveat):
-  [`docs/COST-SCHEDULER.md`](docs/COST-SCHEDULER.md).
-
-  > Note: today, large-model switching is performed by the underlying swap layer
-  > (e.g. llama-swap); Overlaat only **observes and logs** it (`model_loads`). The
-  > scheduler above folds that switching into its own budget arithmetic.
 
 - **Storage-backend agnostic (Postgres + SQLite)** — *implemented, opt-in.* Postgres
   is still the default and the source of truth for the schema. A single-box deployment

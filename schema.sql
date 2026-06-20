@@ -24,7 +24,10 @@ CREATE TABLE IF NOT EXISTS request_events (
   http_status       INTEGER,
   prompt_tokens     INTEGER,                     -- NULL = backend did not report usage (never zero-filled)
   completion_tokens INTEGER,
-  overlaat_version  TEXT                          -- Overlaat version that served this request; NULL for pre-upgrade rows
+  overlaat_version  TEXT,                         -- Overlaat version that served this request; NULL for pre-upgrade rows
+  priority          INTEGER,                      -- effective base priority used at admission (cost-scheduler); NULL = scheduler off / pre-upgrade
+  cost              DOUBLE PRECISION,             -- GPU-fraction cost charged for this run (1/cap by default); NULL = scheduler off / no cap
+  wait_reason       TEXT                          -- why the request waited: none|reserved|aged_in|budget_full|model_cap; NULL = scheduler off
 );
 CREATE INDEX IF NOT EXISTS ix_re_tenq    ON request_events (t_enqueue);
 CREATE INDEX IF NOT EXISTS ix_re_tdone   ON request_events (t_done);

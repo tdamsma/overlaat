@@ -210,7 +210,10 @@ CREATE TABLE IF NOT EXISTS request_events (
   http_status       INTEGER,
   prompt_tokens     INTEGER,
   completion_tokens INTEGER,
-  overlaat_version  TEXT
+  overlaat_version  TEXT,
+  priority          INTEGER,
+  cost              DOUBLE PRECISION,
+  wait_reason       TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_re_tenq    ON request_events (t_enqueue);
 CREATE INDEX IF NOT EXISTS ix_re_tdone   ON request_events (t_done);

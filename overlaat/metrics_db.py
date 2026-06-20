@@ -35,7 +35,8 @@ MAX_PLAUSIBLE_DECODE = 500  # tok/s hardware ceiling; above this a decode rate i
 
 _EVENT_SELECT = (
     "SELECT t_enqueue, t_acquire, t_first_token, t_done, model_requested, "
-    "key_fp, streamed, outcome, http_status, prompt_tokens, completion_tokens "
+    "key_fp, streamed, outcome, http_status, prompt_tokens, completion_tokens, "
+    "priority, cost, wait_reason "
     "FROM request_events"
 )
 _EVENT_FIELDS = (
@@ -50,6 +51,9 @@ _EVENT_FIELDS = (
     "http_status",
     "prompt_tokens",
     "completion_tokens",
+    "priority",
+    "cost",
+    "wait_reason",
 )
 
 

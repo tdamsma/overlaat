@@ -1,13 +1,15 @@
-# Cost-weighted scheduler (PLANNED)
+# Cost-weighted scheduler
 
-> **Status: NOT YET IMPLEMENTED — roadmap / design doc.**
-> This describes the *next-generation* admission scheduler for Overlaat. None of
-> it is in the shipping code today. Today Overlaat runs **independent per-model
-> semaphores** (`overlaat/queue_proxy.py`): one `asyncio.Semaphore(cap)` per
-> model, with `cap` read from `litellm-config.yaml::max_parallel_requests`. This
-> document captures where we want to take that and *why*. It is a proposal to be
-> reviewed, not a specification of current behavior. Experimental project, no
-> support promise.
+> **Status: IMPLEMENTED (since 0.0.3), ON BY DEFAULT.**
+> This describes Overlaat's admission scheduler. It is the shipping behavior: the
+> queue-proxy (`overlaat/queue_proxy.py`) wires every admitted request through the
+> global cost-weighted scheduler in `overlaat/scheduler.py`. The scheduler is **on
+> by default**; setting `OVERLAAT_SCHEDULER=off` is a kill-switch that restores the
+> previous **independent per-model semaphores** (one `asyncio.Semaphore(cap)` per
+> model, `cap` from `litellm-config.yaml::max_parallel_requests`) byte-for-byte.
+> This document is the authority for the algorithm and *why* it is shaped this way.
+> Experimental project, no support promise. §8 records the design decisions that
+> were open during the proposal and are now baked into the code.
 
 ---
 
@@ -176,25 +178,36 @@ admittable until it completes. One scalar, one rule, and the "one big model at a
 time" invariant falls out of the budget check rather than needing a separate
 lock.
 
-### 4c. Optional per-key priority (un-gameable)
+### 4c. Per-key priority ceiling (un-gameable)
 
-Priority is not purely first-come. Each API key may carry a **`max_priority`** —
-the ceiling of priority it is allowed to request. A request's **effective
-priority** is:
+Priority is not purely first-come. Each API key may carry a **priority ceiling** —
+the highest priority it is allowed to request. A request's **effective priority**
+adds aging (§3c) to the ceiling-clamped request priority:
 
 ```
-effective_priority = min(requested_priority, key_max_priority)
+effective_priority = min(requested_priority, key_ceiling) + aging_rate * wait_s
 ```
 
 This is **un-gameable by design**: a batch/background key is provisioned with a
-*low* `max_priority`, so even if a batch client sets `priority: 9999` on every
-request, its effective priority is clamped to the key's ceiling. Interactive keys
-get a higher ceiling; batch keys cannot impersonate them. Priority becomes an
+*low* ceiling, so even if a batch client sets `priority: 9999` on every request,
+its effective priority is clamped to the key's ceiling. Interactive keys get a
+higher ceiling; batch keys cannot impersonate them. Priority becomes an
 *operator-granted budget of urgency* attached to the key, not a free-text field
-the client controls. (Keys are already fingerprinted on the call path as
+the client controls.
+
+The ceiling is read from **LiteLLM key metadata**, not an env map: the
+`LiteLLM_VerificationToken` table's `metadata` JSON, field **`overlaat_priority`**
+(an integer). Keys are already fingerprinted on the call path as
 `key_fp = sha256(bearer)[:8]`, matching `LiteLLM_VerificationToken.token[:8]`, so
-the scheduler can resolve a key to its `max_priority` without handling the raw
-secret.)
+the scheduler resolves a key to its ceiling without handling the raw secret.
+
+**Hot-path safe:** the table is *never* read per request. A background task
+refreshes a `key_fp -> ceiling` cache every ~60 s (mirroring how the usage-API
+refreshes its key aliases). Resolution degrades gracefully: a key with no
+`overlaat_priority`, or an unreachable table (e.g. a SQLite single-box deployment
+that has no LiteLLM key table at all), falls back to `OVERLAAT_DEFAULT_PRIORITY`.
+The request-supplied `priority` field (integer; absent → `OVERLAAT_DEFAULT_PRIORITY`)
+is the *requested* side of the clamp.
 
 ---
 
@@ -224,12 +237,12 @@ discipline.
 
 ## 6. Behavior change vs. today
 
-| | Today (independent per-model semaphores) | Planned (shared budget, cost-weighted) |
+| | Kill-switch (`OVERLAAT_SCHEDULER=off`, independent per-model semaphores) | Default (shared budget, cost-weighted) |
 |---|---|---|
 | Resource model | N pools, one per model | 1 pool = the GPU (`B = 1.0`) |
 | Admission test | `model_in_flight < cap` | `model_in_flight < cap` **AND** `used + cost <= B` |
 | Cross-model awareness | none — models cannot oversubscribe each other on paper, but *can* in hardware | global — the GPU cannot be oversubscribed |
-| Ordering | per-model FIFO | global priority queue (effective priority = `min(requested, key_max)`, aged by wait) |
+| Ordering | per-model FIFO | global priority queue (effective priority = `min(requested, key_ceiling)`, aged by wait) |
 | Swap-slot mutex | separate lock | falls out of `cost = 1.0` |
 | Peak concurrency | **higher** (caps sum freely) | **lower** (capped at `B`) |
 | Thrash under contention | possible | designed out |
@@ -276,32 +289,49 @@ Overlaat *Overlaat* is unchanged:
 
 ---
 
-## 8. Open questions (to resolve before implementation)
+## 8. Decisions (resolved for the 0.0.3 implementation)
 
-1. **Aging function.** Linear priority bump per second waited, or a step
-   function past a threshold? Linear is simplest; a threshold avoids reshuffling
-   the queue on every tick. Needs a measured queue to choose.
-2. **Reservation trigger.** Reserve the moment an expensive job becomes head, or
-   only once it has waited past some grace period? Eager reservation bounds wait
-   tightest but costs the most throughput.
-3. **Cost for models with no declared cap.** Today, no-cap models pass through
-   without a queue. Under a shared budget a pass-through run still consumes the
-   GPU. Options: assign a default cost, or keep no-cap models genuinely
-   uncounted (and accept they can push `used` over `B`). Leaning toward a
-   conservative default cost so the budget stays honest.
+These were the open questions during the proposal; the shipping defaults are:
+
+1. **Aging function — linear, off by default.** `effective_priority` gains
+   `OVERLAAT_AGING_RATE` priority units per second waited (recomputed on every
+   pump from `enqueued_at`). The default `OVERLAAT_AGING_RATE=0.0` means aging is
+   **off** — a single model with equal priority then reduces to pure FIFO, exactly
+   matching the old semaphore. Set it > 0 to lift long waiters. (We picked linear
+   over a step function because the queue is re-sorted on every pump anyway, so
+   continuous aging costs nothing extra and avoids a threshold knob.)
+2. **Reservation trigger — eager.** The head is reserved for the moment it is
+   blocked by budget (`OVERLAAT_RESERVATION_GRACE` defaults to `0.0`). Eager
+   reservation bounds the head's wait tightest at the cost of some throughput
+   while the budget drains; that cost is paid only when an expensive job is
+   actually starving. A non-zero grace is parsed (the env surface is stable) but
+   reserved for a future refinement — the core reserves eagerly today.
+3. **Cost for models with no declared cap — a conservative default.** No-cap
+   models are **not** uncounted under the scheduler: each is charged
+   `OVERLAAT_DEFAULT_COST` (default **1.0**, i.e. a no-cap run takes the whole
+   budget) so a pass-through run cannot silently push `used` over `B`. The budget
+   stays honest about the single GPU. (Override per model with
+   `model_info.overlaat_cost`.)
 4. **Fairness across keys vs. across models.** Aging gives *time*-fairness;
-   per-key priority gives *operator-intent* fairness. We have not specified
-   *throughput*-fairness (a single key flooding the queue). May need a per-key
-   in-flight cap as a separate guard.
+   the per-key ceiling gives *operator-intent* fairness. *Throughput*-fairness (a
+   single key flooding the queue with many equal-priority requests) is still
+   **not** specified — a per-key in-flight cap remains a possible future guard,
+   out of scope for 0.0.3.
+
+Other baked-in defaults: the scheduler is **on** (`OVERLAAT_SCHEDULER=on`),
+`OVERLAAT_BUDGET=1.0` (the whole GPU), `OVERLAAT_DEFAULT_PRIORITY=0`, and the
+budget admit test uses an epsilon (`used + cost <= B + EPS`, `EPS = 1e-9`) so an
+exact packing like `3 * (1/3)` does not phantom-overflow on float drift.
 
 ---
 
 ## 9. Why this is worth doing
 
-Independent per-model caps are a fine v1: they fix the reject-on-overflow problem
-and give a waiting queue. But they let the operator *believe* the host can do
-"sum of caps" concurrent work, when the single GPU cannot. The cost scheduler
-makes the queue's promise match the hardware's reality: one budget, honestly
+Independent per-model caps were a fine v1: they fix the reject-on-overflow problem
+and give a waiting queue (and they remain a `OVERLAAT_SCHEDULER=off` kill-switch
+away). But they let the operator *believe* the host can do "sum of caps" concurrent
+work, when the single GPU cannot. The cost scheduler — now the default — makes the
+queue's promise match the hardware's reality: one budget, honestly
 accounted, packed for throughput, guarded against starvation, with the swap-slot
 mutex and per-key priority falling out of the same arithmetic. It is the same
 philosophy as the rest of Overlaat — **instrument the call path once, derive the
