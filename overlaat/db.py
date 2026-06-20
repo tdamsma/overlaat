@@ -213,7 +213,8 @@ CREATE TABLE IF NOT EXISTS request_events (
   overlaat_version  TEXT,
   priority          INTEGER,
   cost              DOUBLE PRECISION,
-  wait_reason       TEXT
+  wait_reason       TEXT,
+  pool              TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_re_tenq    ON request_events (t_enqueue);
 CREATE INDEX IF NOT EXISTS ix_re_tdone   ON request_events (t_done);

@@ -128,6 +128,7 @@ _EVENT_COLS = (
     "priority",
     "cost",
     "wait_reason",
+    "pool",
 )
 # Postgres uses psycopg named params (the writer feeds dict rows via executemany);
 # SQLite uses positional `?` params (rows projected to a tuple in _EVENT_COLS order).
@@ -135,18 +136,18 @@ _INSERT_SQL_PG = (
     "INSERT INTO request_events "
     "(t_enqueue, t_acquire, t_first_token, t_done, model_requested, key_fp, "
     " streamed, outcome, http_status, prompt_tokens, completion_tokens, overlaat_version, "
-    " priority, cost, wait_reason) "
+    " priority, cost, wait_reason, pool) "
     "VALUES (%(t_enqueue)s, %(t_acquire)s, %(t_first_token)s, %(t_done)s, "
     "%(model_requested)s, %(key_fp)s, %(streamed)s, %(outcome)s, "
     "%(http_status)s, %(prompt_tokens)s, %(completion_tokens)s, %(overlaat_version)s, "
-    "%(priority)s, %(cost)s, %(wait_reason)s)"
+    "%(priority)s, %(cost)s, %(wait_reason)s, %(pool)s)"
 )
 _INSERT_SQL_SQLITE = (
     "INSERT INTO request_events "
     "(t_enqueue, t_acquire, t_first_token, t_done, model_requested, key_fp, "
     " streamed, outcome, http_status, prompt_tokens, completion_tokens, overlaat_version, "
-    " priority, cost, wait_reason) "
-    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    " priority, cost, wait_reason, pool) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
 # Back-compat alias: the Postgres statement remains the module-level default.
 _INSERT_SQL = _INSERT_SQL_PG
@@ -181,27 +182,33 @@ def load_caps(path: Path) -> dict[str, int]:
     return out
 
 
-def load_model_info(path: Path) -> tuple[dict[str, float], dict[str, str]]:
+def load_model_info(path: Path) -> tuple[dict[str, float], dict[str, str], dict[str, bool]]:
     """Read the scheduler-specific per-model knobs from the LiteLLM config's
-    ``model_info`` blocks: an explicit cost override (``overlaat_cost``) and the
-    swap-slot group membership (``overlaat_slot``).
+    ``model_info`` blocks: an explicit cost override (``overlaat_cost``), the
+    resource-pool assignment (``overlaat_pool``), and the deprecated swap-slot
+    alias (``overlaat_slot``).
 
-    Returns ``(costs, slot_groups)`` keyed by model_name:
-      - ``costs[model]``       — explicit GPU-fraction cost override (float > 0).
-      - ``slot_groups[model]`` — swap-slot group name; every member is forced to
-        cost 1.0 by the scheduler so the "one big model at a time" mutex falls
-        out of the budget arithmetic with no separate lock.
-    Models without either key simply don't appear (the scheduler then derives
-    cost from ``1/cap`` or the configured default).
+    Returns ``(costs, pool_of, exclusive_seed)`` keyed by model_name / pool_name:
+      - ``costs[model]``    — explicit pool-fraction cost override (float > 0).
+      - ``pool_of[model]``  — the named resource pool the model is admitted
+        against. A model with no ``overlaat_pool`` is in the ``default`` pool.
+      - ``exclusive_seed[pool]`` — True for any pool a model implied must be
+        exclusive. This carries the **legacy bridge**: a model with
+        ``overlaat_slot: NAME`` and no ``overlaat_pool`` is treated as
+        ``overlaat_pool: NAME`` with that pool auto-marked exclusive — so old
+        swap-slot configs keep working (a cap-1 slot is byte-identical).
+    Models without any of these keys simply don't appear in ``costs`` (the
+    scheduler derives cost from ``1/cap`` or the default) and land in ``default``.
     """
     if not path.exists():
-        return {}, {}
+        return {}, {}, {}
     try:
         cfg = yaml.safe_load(path.read_text()) or {}
     except Exception:
-        return {}, {}
+        return {}, {}, {}
     costs: dict[str, float] = {}
-    slots: dict[str, str] = {}
+    pool_of: dict[str, str] = {}
+    exclusive_seed: dict[str, bool] = {}
     for m in cfg.get("model_list", []):
         name = m.get("model_name")
         if not isinstance(name, str):
@@ -210,14 +217,121 @@ def load_model_info(path: Path) -> tuple[dict[str, float], dict[str, str]]:
         c = info.get("overlaat_cost")
         if isinstance(c, (int, float)) and not isinstance(c, bool) and c > 0:
             costs[name] = float(c)
-        slot = info.get("overlaat_slot")
-        if isinstance(slot, str) and slot:
-            slots[name] = slot
-    return costs, slots
+        explicit_pool = info.get("overlaat_pool")
+        legacy_slot = info.get("overlaat_slot")
+        if isinstance(explicit_pool, str) and explicit_pool:
+            pool_of[name] = explicit_pool
+        elif isinstance(legacy_slot, str) and legacy_slot:
+            # Legacy bridge: overlaat_slot: NAME -> overlaat_pool: NAME, auto-exclusive.
+            pool_of[name] = legacy_slot
+            exclusive_seed[legacy_slot] = True
+    return costs, pool_of, exclusive_seed
+
+
+def load_pools(path: Path) -> tuple[dict[str, float], set[str]]:
+    """Read the optional top-level ``overlaat.pools`` section of the LiteLLM
+    config: per-pool budget + exclusive flag.
+
+    Returns ``(pool_budget, pool_exclusive)``:
+      - ``pool_budget[pool]``  — explicit budget ``B_pool`` (float > 0). A pool
+        with no budget here uses ``OVERLAAT_BUDGET`` (the auto-pool default).
+      - ``pool_exclusive``     — set of pools declared ``exclusive: true``.
+    The ``default`` pool is implicit; declare it only to override its budget.
+    """
+    if not path.exists():
+        return {}, set()
+    try:
+        cfg = yaml.safe_load(path.read_text()) or {}
+    except Exception:
+        return {}, set()
+    section = (cfg.get("overlaat") or {}).get("pools") or {}
+    budgets: dict[str, float] = {}
+    exclusive: set[str] = set()
+    if isinstance(section, dict):
+        for pool, spec in section.items():
+            if not isinstance(pool, str) or not isinstance(spec, dict):
+                continue
+            b = spec.get("budget")
+            if isinstance(b, (int, float)) and not isinstance(b, bool) and b > 0:
+                budgets[pool] = float(b)
+            if spec.get("exclusive") is True:
+                exclusive.add(pool)
+    return budgets, exclusive
+
+
+def resolve_pool_config(
+    caps: dict[str, int],
+    costs: dict[str, float],
+    pool_of: dict[str, str],
+    exclusive_seed: dict[str, bool],
+    declared_budgets: dict[str, float],
+    declared_exclusive: set[str],
+    default_budget: float,
+    *,
+    log: bool = True,
+) -> tuple[dict[str, float], set[str]]:
+    """Merge declared pools with the pools models reference, auto-creating any
+    referenced-but-undeclared pool (non-exclusive, ``default_budget``) and folding
+    in the legacy-slot exclusivity seed. Logs each auto-created pool and any model
+    whose cost exceeds its pool budget (a never-admit guard).
+
+    Returns the final ``(pool_budget, pool_exclusive)`` to hand the Scheduler.
+    Pool budgets are returned for every referenced/declared pool (so the snapshot
+    and validation see them); the scheduler still falls back to ``default_budget``
+    for any pool it is not told about.
+    """
+    referenced = set(pool_of.values()) | {"default"}
+    pool_budget: dict[str, float] = {}
+    pool_exclusive: set[str] = set(declared_exclusive) | {
+        p for p, ex in exclusive_seed.items() if ex
+    }
+
+    for pool in referenced | set(declared_budgets) | pool_exclusive:
+        if pool in declared_budgets:
+            pool_budget[pool] = declared_budgets[pool]
+        else:
+            pool_budget[pool] = default_budget
+            # Auto-created = referenced by a model (or seeded exclusive) but never
+            # declared with a budget in the overlaat.pools section.
+            if log and pool not in declared_budgets and pool != "default":
+                exmark = " (exclusive)" if pool in pool_exclusive else ""
+                sys.stderr.write(
+                    f"queue-proxy: auto-created resource pool '{pool}'{exmark} "
+                    f"with budget {default_budget} (OVERLAAT_BUDGET)\n"
+                )
+
+    # Never-admit guard: warn loudly if any model's cost exceeds its pool budget.
+    if log:
+        for model in set(caps) | set(costs) | set(pool_of):
+            pool = pool_of.get(model, "default")
+            b = pool_budget.get(pool, default_budget)
+            if model in costs:
+                c = costs[model]
+            else:
+                cap = caps.get(model)
+                c = 1.0 / cap if cap and cap > 0 else None
+            if c is not None and c > b + 1e-9:
+                sys.stderr.write(
+                    f"queue-proxy: WARNING model '{model}' cost {c:g} exceeds its pool "
+                    f"'{pool}' budget {b:g} — it can NEVER be admitted\n"
+                )
+        sys.stderr.flush()
+
+    return pool_budget, pool_exclusive
 
 
 CAPS: dict[str, int] = load_caps(LITELLM_CONFIG)
-COSTS, SLOT_GROUPS = load_model_info(LITELLM_CONFIG)
+COSTS, POOL_OF, _EXCLUSIVE_SEED = load_model_info(LITELLM_CONFIG)
+_DECLARED_BUDGETS, _DECLARED_EXCLUSIVE = load_pools(LITELLM_CONFIG)
+POOL_BUDGET, POOL_EXCLUSIVE = resolve_pool_config(
+    CAPS,
+    COSTS,
+    POOL_OF,
+    _EXCLUSIVE_SEED,
+    _DECLARED_BUDGETS,
+    _DECLARED_EXCLUSIVE,
+    BUDGET,
+)
 SEMAPHORES: dict[str, asyncio.Semaphore] = {}
 
 # The single global scheduler instance (set in lifespan when SCHEDULER_ON). One
@@ -491,7 +605,9 @@ async def lifespan(app: FastAPI):
             budget=BUDGET,
             caps=CAPS,
             costs=COSTS,
-            slot_groups=SLOT_GROUPS,
+            pool_of=POOL_OF,
+            pool_budget=POOL_BUDGET,
+            pool_exclusive=POOL_EXCLUSIVE,
             default_cost=DEFAULT_COST,
             default_priority=DEFAULT_PRIORITY,
             aging_rate=AGING_RATE,
@@ -524,9 +640,10 @@ app = FastAPI(
 def _scheduler_view() -> dict | None:
     """Budget snapshot for the status/health endpoints, or None when OFF.
 
-    Adds budget_pct (used/B) on top of the core snapshot so a reader doesn't have
-    to recompute the utilization. All NULL-safe: returns None if the scheduler is
-    not running (kill-switch or pre-lifespan)."""
+    Adds the legacy top-level ``budget_pct`` (used/B for the ``default`` pool) on
+    top of the core snapshot so existing readers don't have to recompute it; the
+    per-pool ``pools`` map carries each pool's own ``budget_pct``. All NULL-safe:
+    returns None if the scheduler is not running (kill-switch or pre-lifespan)."""
     if SCHED is None:
         return None
     snap = SCHED.snapshot()
@@ -571,6 +688,7 @@ async def status():
             {
                 "model": model,
                 "cap": CAPS.get(model),
+                "pool": SCHED.pool(model) if SCHED is not None else None,
                 "in_flight": m["in_flight"],
                 "queue_depth": m["queue_depth"],
                 "total_served": m["total_served"],
@@ -611,6 +729,7 @@ def _queued_view(
     if "priority" in i:
         out["priority"] = i["priority"]
         out["cost"] = i["cost"]
+        out["pool"] = i.get("pool")
         w = waiters_by_id.get(i["id"])
         if w is not None and SCHED is not None and sched_now is not None:
             out["effective_priority"] = round(SCHED.effective_priority(w, sched_now), 3)
@@ -811,8 +930,8 @@ async def proxy(full_path: str, request: Request):
             pass
 
     # Event skeleton (only for real LLM calls that carry a model). The scheduler
-    # columns (priority/cost/wait_reason) default to None — they stay NULL for the
-    # no-cap pass-through and for the entire scheduler-OFF path.
+    # columns (priority/cost/wait_reason/pool) default to None — they stay NULL
+    # for the no-cap pass-through and for the entire scheduler-OFF path.
     ev: dict | None = None
     if is_llm and model is not None:
         ev = {
@@ -826,6 +945,7 @@ async def proxy(full_path: str, request: Request):
             "priority": None,
             "cost": None,
             "wait_reason": None,
+            "pool": None,
         }
 
     if SCHEDULER_ON and model is not None and SCHED is not None:
@@ -919,6 +1039,7 @@ async def _admit_scheduler(
     key_fp = _key_fp(request)
     base_priority = DEFAULT_PRIORITY if requested_priority is None else requested_priority
     cost = sched.cost(model)
+    pool = sched.pool(model)
 
     metrics = METRICS[model]
     req_id = hashlib.sha1(f"{time.monotonic_ns()}{id(request)}".encode()).hexdigest()[:12]
@@ -931,6 +1052,7 @@ async def _admit_scheduler(
         "cancel_fut": cancel_fut,
         "priority": base_priority,
         "cost": cost,
+        "pool": pool,
     }
     metrics["queue_depth"] += 1
     enqueue_ts = time.monotonic()
@@ -960,6 +1082,7 @@ async def _admit_scheduler(
             ev["priority"] = base_priority
             ev["cost"] = cost
             ev["wait_reason"] = waiter.wait_reason
+            ev["pool"] = pool
             emit_event(ev)
 
     if not waiter.fut.done():
@@ -984,5 +1107,6 @@ async def _admit_scheduler(
         ev["priority"] = base_priority
         ev["cost"] = cost
         ev["wait_reason"] = waiter.wait_reason
+        ev["pool"] = pool
 
     return await _forward(request, path, body, model, None, ev, use_scheduler=True)

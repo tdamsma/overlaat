@@ -78,6 +78,60 @@ service `cap` concurrent streams never gets a `cap+1`-th. The second conjunct is
 the new global honesty: even if a model is under its own cap, it is refused when
 the GPU as a whole is full.
 
+### Resource pools — the unit of admission (closes #11)
+
+A single global budget assumes the whole host is **one** indivisible resource.
+That is the right model for one GPU shared by everything, but it is too coarse
+when the host actually has **physically independent** resources — e.g. a swap
+engine that loads one big model at a time, plus a *separate* embeddings server on
+its own device or process. With one global budget, filling the swap engine
+(`used → B`) would wrongly block the embeddings model that shares none of its
+hardware. That is issue #11: cross-backend interference that does not exist in
+reality.
+
+The fix is to make the unit of admission a named **resource pool** rather than the
+whole host. Each model is assigned to exactly one pool via `model_info.overlaat_pool`
+(default `default`); each pool `P` has its own budget `B_P` and its own committed
+`used[P]`. The admission test becomes per-pool:
+
+```
+model_in_flight(req.model) < backend_cap(req.model)
+AND  used[pool(req.model)] + cost(req.model) <= B_pool(req.model)
+```
+
+`cost(model) = 1 / cap` is now the model's fraction **of its pool**, not of the
+whole host. A pool blocked on its own budget therefore **never idles a different
+pool** — the work-conserving packing scans the global ordered queue and admits the
+highest-priority waiter that fits *its own* pool's budget, so a busy swap engine
+can no longer stall embeddings. The global priority queue, eager head reservation,
+linear aging, and no-preemption (§3) are all preserved; they now operate **per
+pool within one globally-ordered waiters list**. Each pool's head, if blocked *by
+its pool's budget*, gets its own reservation of *that* pool's budget — reservations
+are intra-pool and never bleed across pools.
+
+Pools are declared in an OPTIONAL top-level `overlaat.pools` section of the
+LiteLLM config (the proxy already parses that file):
+
+```yaml
+overlaat:
+  pools:
+    default:            # implicit; declare only to override its budget
+      budget: 1.0       # default = OVERLAAT_BUDGET
+    fat-slot:
+      budget: 1.0
+      exclusive: true   # see §4b
+    embeddings:
+      budget: 1.0       # its own budget → isolated from the swap engine (#11)
+```
+
+Rules: a model with no `overlaat_pool` is in `default`. A pool a model references
+but does not declare is **auto-created** (non-exclusive, budget = `OVERLAAT_BUDGET`)
+and logged at startup. `overlaat_cost` still overrides `1/cap` within a pool.
+`OVERLAAT_BUDGET` is the budget of `default` and of any auto-created pool — there
+is **no new env knob**. **The default is unchanged:** with every model in the
+single `default` pool, the per-pool arithmetic is identical to the previous single
+shared budget, so existing single-pool deployments behave exactly as before.
+
 ### No preemption — by physics, not by choice
 
 The scheduler **never preempts a running request.** Metal has no GPU preemption:
@@ -154,8 +208,8 @@ a guarantee rather than a hope.
 
 ## 4. Interactions with existing constraints
 
-The cost scheduler does not replace the per-model backend caps or the swap-slot
-mutex — it sits **on top of** them and must respect both.
+The cost scheduler does not replace the per-model backend caps or the exclusive
+swap-slot mutex — it sits **on top of** them and must respect both.
 
 ### 4a. Backend hard caps still bind
 
@@ -166,17 +220,51 @@ A request must satisfy both. The cap protects an individual backend from
 oversubscription even when the *global* budget has room (e.g. a small model that
 is cheap per-run but whose engine still only handles `cap` streams).
 
-### 4b. The exclusive swap-slot group = full budget
+### 4b. The exclusive swap-slot pool — honest 1/cap, not a forced 1.0 (closes #12)
 
 Overlaat already models a **swap-on-demand slot**: a set of large models behind a
 mutex where only one is resident at a time, and loading another evicts the
-current one (see `model_loads` in `schema.sql`). In the cost scheduler this is
-modeled cleanly: **every member of the swap-slot group has `cost = 1.0`** (= full
-budget). The arithmetic then enforces the mutex for free — admitting one
-swap-slot model takes `used` to `B`, so no other run (swap-slot or otherwise) is
-admittable until it completes. One scalar, one rule, and the "one big model at a
-time" invariant falls out of the budget check rather than needing a separate
-lock.
+current one (see `model_loads` in `schema.sql`). The first cut modeled this by
+**forcing every member to `cost = 1.0`** so admitting one took `used` to `B` and
+the mutex fell out of the budget arithmetic. That was neat but **dishonest about a
+member that can serve more than one stream**: a dual-engine member with `cap = 2`
+would still be charged `1.0` and pinned to a single concurrent stream, even though
+it can genuinely run two. That is issue #12.
+
+The honest model makes the swap-slot an **exclusive pool**, and makes exclusivity
+a **separate hard constraint** rather than a cost hack. Mark the pool
+`exclusive: true` in `overlaat.pools`; assign every member to it with
+`overlaat_pool`. Costs stay honest — `cost = 1/cap` like any other pool member.
+The exclusivity rule is:
+
+> At most **one distinct member id** may be active (`in_flight > 0`) in an
+> exclusive pool at a time. While a member is resident, that member's own `cap`
+> plus the pool budget govern how many of **its** streams run concurrently; a
+> *different* member is hard-blocked (`wait_reason = exclusive`) until the
+> resident fully drains, then the mutex hands off.
+
+So a `cap = 2` member in an exclusive pool honestly costs `0.5` and, while it is
+resident, runs **both** its streams (two of its requests pack into the pool budget,
+`used → 1.0`). A `cap = 1` member costs `1.0` and runs one stream — byte-identical
+to the old forced-1.0 behavior, so a single-stream fat slot is unchanged.
+
+**The `0.5 + 0.5` trap this rule prevents.** Without the distinct-member mutex, two
+different cap-2 members (`model-b`, `model-c`, each cost `0.5`) would *both* fit a
+budget-1.0 pool — `0.5 + 0.5 = 1.0` — and the scheduler would admit both, putting
+**two different big models resident at once**, exactly the swap thrash the slot
+exists to prevent. With exclusivity as a separate constraint, once `model-b` is
+resident at `used 0.5` there is `0.5` of *budget* headroom, but a `model-c` run is
+still **rejected** (`wait_reason = exclusive`) because it is a different member.
+Only a *second `model-b`* stream may take that headroom. When both `model-b`
+streams drain, the pool goes idle and the next pump lets `model-c` become the
+resident member. The budget arithmetic alone cannot express this ("there is room,
+but not for *you*"), which is why exclusivity is a hard mutex layered on top of —
+not folded into — the cost.
+
+The legacy `model_info.overlaat_slot: NAME` key is **deprecated but bridged**: a
+model with `overlaat_slot: NAME` (and no `overlaat_pool`) is treated as
+`overlaat_pool: NAME` with that pool auto-marked `exclusive: true`. Old swap-slot
+configs keep working unchanged.
 
 ### 4c. Per-key priority ceiling (un-gameable)
 
@@ -239,11 +327,11 @@ discipline.
 
 | | Kill-switch (`OVERLAAT_SCHEDULER=off`, independent per-model semaphores) | Default (shared budget, cost-weighted) |
 |---|---|---|
-| Resource model | N pools, one per model | 1 pool = the GPU (`B = 1.0`) |
-| Admission test | `model_in_flight < cap` | `model_in_flight < cap` **AND** `used + cost <= B` |
-| Cross-model awareness | none — models cannot oversubscribe each other on paper, but *can* in hardware | global — the GPU cannot be oversubscribed |
+| Resource model | N pools, one per model | named **resource pools** (default: one `default` pool = the GPU, `B = 1.0`) |
+| Admission test | `model_in_flight < cap` | `model_in_flight < cap` **AND** `used[pool] + cost <= B_pool` |
+| Cross-model awareness | none — models cannot oversubscribe each other on paper, but *can* in hardware | global within a pool — a pool cannot be oversubscribed; separate pools are isolated (#11) |
 | Ordering | per-model FIFO | global priority queue (effective priority = `min(requested, key_ceiling)`, aged by wait) |
-| Swap-slot mutex | separate lock | falls out of `cost = 1.0` |
+| Swap-slot mutex | separate lock | an **exclusive pool**: honest `cost = 1/cap` + a one-distinct-member hard mutex (#12) |
 | Peak concurrency | **higher** (caps sum freely) | **lower** (capped at `B`) |
 | Thrash under contention | possible | designed out |
 
