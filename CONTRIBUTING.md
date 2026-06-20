@@ -28,15 +28,18 @@ before opening a PR. Config lives in `pyproject.toml` — don't override it ad h
 
 ## Releasing / version rule
 
-The version is **single-sourced** in `overlaat/__init__.py` (`__version__`), read at
-build time via `[tool.hatch.version]`. To release:
+The version is **derived from the git tag** by `hatch-vcs` (`[tool.hatch.version]
+source = "vcs"`); there is no version literal to edit. At runtime `overlaat.__version__`
+reads it back from the installed package metadata. To cut a release, just tag and push:
 
-1. Bump `__version__` in `overlaat/__init__.py`.
-2. Tag the commit `vX.Y.Z` where `X.Y.Z` **exactly matches** `__version__`.
+```bash
+git tag vX.Y.Z
+git push origin vX.Y.Z
+```
 
-CI has a guard that fails the build if the `vX.Y.Z` tag and `__version__` disagree — so a
-mismatched tag will not publish. Pushing a `v*` tag triggers the build and the trusted-
-publishing release to PyPI.
+Pushing a `v*` tag triggers CI to build the distributions (whose version *is* the tag)
+and the trusted-publishing release to PyPI — no file edit, and no tag↔version guard to
+satisfy.
 
 ## Conventions
 

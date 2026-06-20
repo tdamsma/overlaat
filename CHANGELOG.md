@@ -9,6 +9,7 @@ versions without a compatibility guarantee.
 ## [Unreleased]
 
 ### Changed
+- The package version is now derived from the git tag via `hatch-vcs` (`[tool.hatch.version] source = "vcs"`); the hardcoded `__version__` literal and the CI tag↔version guard have been removed. Cutting a release is just pushing a `vX.Y.Z` tag — CI builds and publishes from it. At runtime `overlaat.__version__` is read back from the installed package metadata.
 - SQLite connections now set `PRAGMA busy_timeout=5000` (alongside `journal_mode=WAL`) at every connection point — read path (`db.connect`), writer (`db.connect_sqlite_write`), and the host sampler's connect helper — so concurrent dashboard reads and the single writer wait briefly instead of immediately raising "database is locked".
 - Documented SQLite operations (WAL `-wal`/`-shm` sidecar files, single-writer/no-`--workers` rule, schema init via `python -m overlaat.db init`, and online backup with `sqlite3 ".backup"` / `VACUUM INTO`) in the README and `docs/OBSERVABILITY.md`.
 
