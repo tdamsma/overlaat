@@ -5,70 +5,58 @@
 [![Python](https://img.shields.io/pypi/pyversions/overlaat)](https://pypi.org/project/overlaat/)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-Overlaat puts a **fair waiting-queue** and **honest usage accounting** in front of a
-self-hosted, multi-backend LLM gateway ([LiteLLM](https://github.com/BerriAI/litellm)).
-It is two small services and one Postgres schema. That is the whole thing.
+A **fair waiting-queue** and **honest usage accounting** sidecar in front of a self-hosted,
+multi-backend LLM gateway ([LiteLLM](https://github.com/BerriAI/litellm)). Two small services
+plus one database schema — nothing more.
 
-It is built for one specific situation, and we wrote it for ours: a **Mac Studio (or a
-similar big Apple-Silicon box) running as a small, trusted team's personal compute
-server** — a handful of models behind one gateway, a mix of interactive chat and bursty
-batch jobs, on one trusted network where API keys are *attribution*, not secrets.
+Built for one case: a **Mac Studio (or similar Apple-Silicon box) as a small trusted team's
+personal compute server** — a few models behind one gateway, mixed interactive chat and bursty
+batch, on one trusted network where API keys are *attribution*, not secrets. It is **not** a
+load balancer, multi-tenant billing, or an analytics stack.
 
-It is deliberately narrow. It is **not** a load balancer, **not** multi-tenant billing,
-**not** an enterprise analytics stack, and **not** trying to be. It does two things and
-tries to do them without lying to you.
-
-*Overlaat* is Dutch for a controlled spillway in a dike: it sheds overflow by design
-instead of breaching. That is the posture toward load — when requests outrun your
-backends, the excess pools in a fair FIFO queue and drains in order, rather than a
-`429`-cascade tearing through every caller's retry loop.
+*Overlaat* is Dutch for a controlled spillway: when requests outrun your backends the excess
+pools in a fair queue and drains in order, instead of a `429`-cascade tearing through every
+caller's retry loop.
 
 ![Where Overlaat sits in a self-hosted LLM stack](docs/overlaat-llm-stack.excalidraw.svg)
 
-## Why it exists
+## Why
 
-Share one box between a few people and a few agents and two things start to hurt.
+Share one box between people and agents and two things hurt:
 
-1. **Overflow is a cliff, not a queue.** LiteLLM's `max_parallel_requests` (and any
-   swap-layer concurrency limit) *reject* on overflow — they return `429` rather than
-   making the caller wait. A burst of parallel jobs against a single-slot model becomes
-   a `429`-cascade, and every caller has to grow its own backoff logic. Nobody wants to
-   write that backoff loop. Several people writing it independently is worse.
-2. **Usage accounting lies by omission.** Insert-on-completion spend logging only ever
-   writes a row for a call that *ran to completion*. Calls that sat queued, calls the
-   client abandoned mid-stream, long-running calls still in flight — all invisible. You
-   cannot answer "what was actually happening on the box at 14:03" from rows that only
-   appear after the fact.
+1. **Overflow is a cliff, not a queue.** LiteLLM's `max_parallel_requests` (and swap-layer
+   limits) *reject* on overflow with `429` rather than make the caller wait — so every caller
+   has to grow its own backoff loop.
+2. **Insert-on-completion logging lies by omission.** It only writes rows for calls that *ran
+   to completion*. Queued calls, client-abandoned calls, and long calls still in flight are
+   invisible — so you can't answer "what was happening on the box at 14:03".
 
-Overlaat sits in the gap between "Ollama on my laptop" (no queueing, no accounting, fine
-for one person) and "enterprise gateway with a full analytics stack" (more machinery
-than a personal compute server should have to run). Fair queueing and truthful usage
-attribution, with as little machinery as we could get away with.
+Overlaat fills the gap between "Ollama on a laptop" (no queueing/accounting) and an enterprise
+gateway (more machinery than a personal box should run): fair queueing and truthful attribution
+with minimal machinery.
 
 ## What it is
 
-A **sidecar in *front* of LiteLLM**, plus a **read-only dashboard**:
+A sidecar in *front* of LiteLLM, plus a read-only dashboard:
 
-- **queue-proxy** (`:4000`) — the single network entry point. Every request flows
-  through here and is FIFO-queued behind a **per-model semaphore**; the slot size for
-  each model is *derived* from your backend config, not tuned separately. Because it is
-  the one component on the full call path, it is also the one instrumentation site: it
-  emits **exactly one lifecycle event per request** to Postgres — *including* queued and
-  client-abandoned calls that insert-on-completion logging structurally misses.
-- **usage-api** (`:4100`) — a read-only FastAPI dashboard over those events. It never
-  writes; it only reads. Restart it whenever you like, independently of the proxy.
+- **queue-proxy** (`:4000`) — the single network entry point. Every request is admitted through
+  one **global cost-weighted priority scheduler** (see below); slot sizes derive from your
+  backend config. Being the one component on the full call path, it is also the one
+  instrumentation site: it emits **exactly one lifecycle event per request** to the DB —
+  including queued and client-abandoned calls that insert-on-completion logging misses.
+- **usage-api** (`:4100`) — a read-only FastAPI dashboard over those events. Never writes;
+  restart it independently of the proxy.
 
-The one principle the whole thing is built on: **instrument the call path once, derive
-everything else.** The proxy writes one honest row per request; the host sampler writes
-host facts every few seconds; the dashboard is pure query. No second source of truth to
-reconcile, no survivor bias, no two endpoints that compute "latency" three different ways.
+**One principle: instrument the call path once, derive everything else.** The proxy writes one
+honest row per request, the optional host sampler writes host facts every few seconds, the
+dashboard is pure query — no second source of truth, no survivor bias.
 
 ## Architecture
 
 ```mermaid
 flowchart TD
     clients["Clients<br/>chat · batch jobs · agents"]
-    proxy["overlaat queue-proxy :4000<br/>per-model FIFO semaphore<br/>wait, not 429"]
+    proxy["overlaat queue-proxy :4000<br/>global cost-weighted scheduler<br/>wait, not 429"]
     gw["LiteLLM gateway :4002<br/>loopback-only · routes to every backend"]
 
     subgraph be ["GPU backends — behind LiteLLM"]
@@ -79,7 +67,7 @@ flowchart TD
         b4["Ollama<br/>embeddings"]
     end
 
-    pg[("Postgres<br/>request_events<br/>host_samples · model_loads")]
+    pg[("Postgres / SQLite<br/>request_events<br/>host_samples · model_loads")]
     usage["overlaat usage-api :4100<br/>read-only dashboard<br/>/ /now /timeline /models /consumers"]
     host["host sampler<br/>GPU% · RAM · per-backend RSS"]
 
@@ -94,214 +82,156 @@ flowchart TD
     class proxy,usage overlaat;
 ```
 
-Keep LiteLLM bound to loopback. That is the trick that makes the proxy the *only* entry
-point — and therefore the single, complete instrumentation site. If there is a second
-door into the gateway, your accounting has a hole in it.
+**Keep LiteLLM bound to loopback** — that is what makes the proxy the *only* entry point and
+therefore the single, complete instrumentation site. A second door into the gateway is a hole
+in your accounting.
 
 ## Quickstart
 
-You need a database — either a reachable Postgres (the same one LiteLLM uses is fine,
-the default) or, for a single-box deployment, a local SQLite file — and a configured
-LiteLLM gateway on loopback.
+You need a database — a reachable **Postgres** (the one LiteLLM uses is fine; the default) or,
+for a single box, a local **SQLite** file — and a LiteLLM gateway on loopback.
 
 ```bash
 # 1. Install
-uv pip install overlaat        # or, for a project: uv add overlaat
+uv pip install overlaat                          # or, for a project: uv add overlaat
 
-# 2. Apply the schema (idempotent)
-psql "$DATABASE_URL" -f schema.sql               # Postgres (native)
-# or, for either backend:
-python -m overlaat.db init "$DATABASE_URL"        # works for Postgres AND SQLite
+# 2. Init the schema (idempotent; works for Postgres AND SQLite)
+python -m overlaat.db init "$DATABASE_URL"       # or, Postgres-native: psql "$DATABASE_URL" -f schema.sql
 
 # 3. Configure
-cp examples/overlaat.env.example overlaat.env          # fill in DATABASE_URL etc.
-chmod 600 overlaat.env                                  # it holds DB credentials
-cp examples/litellm-config.example.yaml litellm-config.yaml   # your model list
-cp examples/run-queue-proxy.sh examples/run-usage-api.sh .    # the two run scripts
+cp examples/overlaat.env.example overlaat.env && chmod 600 overlaat.env   # holds DB credentials
+cp examples/litellm-config.example.yaml litellm-config.yaml               # your model list
+cp examples/run-queue-proxy.sh examples/run-usage-api.sh .
 
 # 4. Run the two services (behind a supervisor of your choice)
-OVERLAAT_ENV=./overlaat.env ./run-queue-proxy.sh        # :4000 entry, in front of LiteLLM
-OVERLAAT_ENV=./overlaat.env ./run-usage-api.sh          # :4100 read-only dashboard
+OVERLAAT_ENV=./overlaat.env ./run-queue-proxy.sh   # :4000 entry, in front of LiteLLM
+OVERLAAT_ENV=./overlaat.env ./run-usage-api.sh     # :4100 read-only dashboard
 ```
 
-Point your clients at `:4000` instead of LiteLLM directly. Open
-`http://your-host:4100/` for the dashboard. The queue-proxy derives one semaphore per
-model from `litellm-config.yaml`, so that file is the single source of truth for
-concurrency.
+Point clients at `:4000` instead of LiteLLM; open `http://your-host:4100/` for the dashboard.
+The proxy derives concurrency per model from `litellm-config.yaml`, so that file is the **single
+source of truth for concurrency**.
 
-> **SQLite, the single-box alternative.** Set `DATABASE_URL=sqlite:///./overlaat.db`
-> (instead of a `postgresql://` URL) and initialize it with
-> `python -m overlaat.db init "$DATABASE_URL"`. That is the whole setup — no separate
-> database service. It works because the proxy is the only writer (single process) and
-> SQLite runs in WAL mode, so the read-only dashboard reads alongside it without
-> blocking. Postgres remains the default and the choice for any shared/multi-host setup.
+**Single-process rule.** The proxy runs **one uvicorn worker on purpose** — the in-memory budget
+ledger, per-model in-flight counts, FIFO ordering, and event writer all live in that one
+process. **Never run it with `--workers N`**; sharding defeats both scheduling and accounting.
+Restart the proxy only when its queue is empty (`/__queue/status`); a restart drops queued calls.
 
-> **SQLite, operationally.** WAL mode writes two sidecar files (`overlaat.db-wal`
-> and `overlaat.db-shm`) next to the `.db`; that is expected. The single-writer
-> model is why SQLite fits here — the queue-proxy is one process, so **never run it
-> with `--workers N`**. Initialize or upgrade the schema (idempotent) with
-> `python -m overlaat.db init "$DATABASE_URL"`. To back up safely while the proxy is
-> running, use SQLite's online backup rather than copying the file by hand:
->
-> ```bash
-> sqlite3 overlaat.db ".backup backup.db"     # or: VACUUM INTO 'backup.db'
-> ```
+**SQLite (single-box alternative).** Set `DATABASE_URL=sqlite:///./overlaat.db` and init with
+`python -m overlaat.db init "$DATABASE_URL"` — no separate DB service. It works because the proxy
+is the only writer and SQLite runs in WAL mode, so the dashboard reads alongside it without
+blocking. WAL writes two sidecar files (`-wal`, `-shm`); back up live with
+`sqlite3 overlaat.db ".backup backup.db"` (never copy the file by hand). Postgres stays the
+default and the choice for any shared/multi-host setup.
 
-> The proxy runs a **single uvicorn worker on purpose**: the in-memory per-model
-> semaphores and the instrumentation live in that one process, so FIFO ordering and
-> event emission must not be sharded across workers. This is a feature, not a TODO.
-
-> **Development install.** Hacking on Overlaat itself? Clone the repo and install it
-> editable with the dev extras instead of from PyPI:
->
-> ```bash
-> uv pip install -e '.[dev]'        # editable + pytest, ruff, build, twine
-> ```
+**Dev install.** `uv pip install -e '.[dev]'` — editable + pytest, ruff, build, twine. Releases
+are git-tag based (`hatch-vcs`): push a `vX.Y.Z` tag.
 
 ## Honest concurrency: three curves
 
-The dashboard never invents a concurrency number. From `request_events` it derives, at
-any time *t* and per model, exactly three time series: **offered** (`t_enqueue ≤ t <
-t_done` — everything in the system, including still-queued), **active** (`t_acquire ≤ t
-< t_done` — actually occupying a backend slot, bounded by the cap *by definition*), and
-**queued** = offered − active. Throughput-vs-concurrency buckets each completed call on
-the time-weighted average `active(t)` over its own `[acquire, done]` interval, and cells
-with too few samples are marked insufficient and never shown as a trend. If we don't have
-the data, the dashboard says so instead of drawing a confident line.
+The dashboard never invents a concurrency number. From `request_events` it derives, per model at
+any time *t*, exactly three series:
 
-See [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) for the curves and their caveats,
-and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the call-path and instrumentation
-design.
+| curve | definition |
+|---|---|
+| **offered** | `t_enqueue ≤ t < t_done` — everything in the system, including still-queued |
+| **active** | `t_acquire ≤ t < t_done` — occupying a backend slot, bounded by the cap *by definition* |
+| **queued** | offered − active |
+
+Throughput-vs-concurrency buckets each completed call on the time-weighted average `active(t)`
+over its own `[acquire, done]` interval; cells with too few samples are marked insufficient and
+never drawn as a trend. If the data isn't there, the dashboard says so.
+
+See [`docs/OBSERVABILITY.md`](docs/OBSERVABILITY.md) for the curves and caveats, and
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the call-path and instrumentation design.
 
 ## Capacity-aware priority scheduler
 
-*Implemented since 0.0.3, **on by default**.* Instead of independent per-model FIFO
-semaphores (where each model admits up to its own cap and the caps sum freely — so two
-models can each be "under cap" while collectively oversubscribing the single GPU),
-Overlaat runs **one global priority queue + cost-weighted admission against a single
-shared GPU budget** (`B = 1.0`).
+*On by default since 0.0.3.* Independent per-model FIFO semaphores let caps sum freely — two
+models can each be "under cap" while collectively oversubscribing the single GPU. Instead,
+Overlaat runs **one global priority queue with cost-weighted admission against a shared GPU
+budget** `B = 1.0`.
 
-Each run costs its fraction of the GPU (`cost = 1 / cap`, so a `cap=4` model costs
-`0.25`); the scheduler admits the highest-priority request that *fits* the remaining
-budget and releases that cost on completion — so multiple models run **in parallel up to
-real capacity** instead of up to the sum of their caps. **`B` caps the *summed* cost
-across all models**, which is the honest single-GPU ceiling. Packing is
-**work-conserving** (leftover budget keeps serving cheap jobs) with a **reservation +
-aging** guard so a drip of cheap high-priority jobs can't starve an expensive one.
-Backend hard caps still bind (`model_in_flight < cap` **and** `used + cost ≤ B`), and
-**large-model switching** falls out for free: a swap-slot ("fat-slot") group where only
-one big model is resident at a time is modeled as `cost = 1.0`, so admitting one fills
-the budget and blocks the rest until it completes. **Per-key priority** is un-gameable
-(`effective_priority = min(requested, key_ceiling) + aging`, batch keys provisioned with
-a low ceiling). There is **no preemption** — Metal can't reorder dispatched GPU kernels,
-so the only lever is *admission*.
+Each run costs its GPU fraction (`cost = 1/cap`, so a `cap=4` model costs `0.25`). The scheduler
+admits the highest-priority request that *fits* the remaining budget and releases that cost on
+completion — so models run **in parallel up to real capacity**, not the sum of caps. Admission
+requires both `model_in_flight < cap` **and** `used + cost ≤ B`. Packing is **work-conserving**
+(leftover budget keeps serving cheap jobs) with **eager reservation + aging** so a drip of cheap
+high-priority jobs can't starve an expensive one. **Large-model switching** falls out for free: a
+swap-slot ("fat-slot") group where one big model is resident at a time is modeled as `cost = 1.0`,
+so admitting one fills the budget and blocks the rest. **Per-key priority** is un-gameable:
+`effective_priority = min(requested, key_ceiling) + aging`. There is **no preemption** — Metal
+can't reorder dispatched kernels, so admission is the only lever.
 
-The trade is deliberate: a shared budget is **lower peak concurrency** than summed caps
-but **honest about the one GPU and free of thrash**, and it keeps the same "wait, don't
-reject" spillway posture. With the scheduler on but nothing configured — `cost = 1/cap`,
-`B = 1.0`, equal priority, aging off — a single model reduces to per-model FIFO, exactly
-matching the old semaphore. Full design (packing policy, starvation argument, the
-scalar-cost VRAM-vs-compute caveat): [`docs/COST-SCHEDULER.md`](docs/COST-SCHEDULER.md).
+The trade: a shared budget gives **lower peak concurrency** than summed caps but is **honest
+about the one GPU and free of thrash**, keeping the "wait, don't reject" posture. With the
+scheduler on but nothing configured (`cost = 1/cap`, `B = 1.0`, equal priority, aging off), a
+single model reduces to exactly the old per-model FIFO semaphore. Full design (packing policy,
+starvation argument, scalar-cost VRAM-vs-compute caveat):
+[`docs/COST-SCHEDULER.md`](docs/COST-SCHEDULER.md).
 
-### Configuring the scheduler
-
-The scheduler is **on by default**. `OVERLAAT_SCHEDULER=off` is a kill-switch that
-restores the exact per-model semaphore FIFO path. All knobs are optional — the defaults
-reduce to FIFO for a single model.
+`OVERLAAT_SCHEDULER=off` is a kill-switch restoring the per-model `asyncio.Semaphore` FIFO path.
+All knobs are optional; defaults reduce to FIFO for a single model.
 
 | env var | default | meaning |
 |---|---|---|
-| `OVERLAAT_SCHEDULER` | `on` | `off` = kill-switch, restore per-model `asyncio.Semaphore` FIFO |
-| `OVERLAAT_BUDGET` | `1.0` | shared budget `B` (the whole GPU); caps the summed cost of all in-flight runs |
-| `OVERLAAT_DEFAULT_COST` | `1.0` | cost charged for a model with no declared cap (so a no-cap run is not silently uncounted) |
-| `OVERLAAT_DEFAULT_PRIORITY` | `0` | priority used when neither the request nor the key supplies one; also the fallback ceiling |
+| `OVERLAAT_SCHEDULER` | `on` | `off` = kill-switch, restore per-model FIFO |
+| `OVERLAAT_BUDGET` | `1.0` | shared budget `B` (the whole GPU); caps summed cost of all in-flight runs |
+| `OVERLAAT_DEFAULT_COST` | `1.0` | cost for a model with no declared cap (so it isn't silently uncounted) |
+| `OVERLAAT_DEFAULT_PRIORITY` | `0` | priority when neither request nor key supplies one; also the fallback ceiling |
 | `OVERLAAT_AGING_RATE` | `0.0` | linear priority gain per second waited (`0.0` = aging off → pure FIFO at equal priority) |
-| `OVERLAAT_RESERVATION_GRACE` | `0.0` | reservation is **eager** (`0.0`); a non-zero grace is reserved for a future refinement |
+| `OVERLAAT_RESERVATION_GRACE` | `0.0` | reservation is eager (`0.0`); non-zero reserved for future refinement |
 
-Per-model knobs come from the LiteLLM config's `model_info` block (next to the model
-they govern, like `max_parallel_requests`):
+Per-model knobs come from the LiteLLM config's `model_info` block (next to the model, like
+`max_parallel_requests`):
 
-- **`model_info.overlaat_cost: <float>`** — explicit GPU-fraction cost override; takes
-  precedence over `1/cap`.
-- **`model_info.overlaat_slot: <group>`** — swap-slot ("fat-slot") group membership;
-  every member's cost is forced to `1.0`, so the "one big model at a time" mutex falls
-  out of the budget arithmetic with no separate lock.
+- **`model_info.overlaat_cost: <float>`** — explicit GPU-fraction cost override; beats `1/cap`.
+- **`model_info.overlaat_slot: <group>`** — swap-slot group; every member's cost is forced to
+  `1.0`, so the "one big model at a time" mutex falls out of the budget arithmetic with no lock.
 
 Per-key priority ceiling comes from **LiteLLM key metadata**, not an env map: the
-`LiteLLM_VerificationToken` row's `metadata` JSON, field **`overlaat_priority`** (an
-integer). It is cached in memory and refreshed ~every 60 s — never read on the hot path —
-and falls back to `OVERLAAT_DEFAULT_PRIORITY` when a key has no `overlaat_priority` or the
-table is unreachable (e.g. a SQLite single-box deployment). A client sets per-request
-urgency with a `priority` integer in the request body; the effective priority is clamped
-to the key's ceiling, so a batch key cannot impersonate an interactive one.
+`LiteLLM_VerificationToken` row's `metadata` JSON, integer field **`overlaat_priority`**. Cached
+in memory and refreshed ~every 60 s (never read on the hot path); falls back to
+`OVERLAAT_DEFAULT_PRIORITY` when absent or the table is unreachable (e.g. a SQLite single-box
+deployment). A client sets per-request urgency with a `priority` integer in the request body,
+clamped to the key's ceiling — a batch key can't impersonate an interactive one.
 
-> Note: large-model switching is performed by the underlying swap layer (e.g.
-> llama-swap); Overlaat only **observes and logs** it (`model_loads`). The scheduler
-> folds that switching into its own budget arithmetic via the `overlaat_slot` group.
+Admission decisions are recorded on each event: `request_events` carries `priority`, `cost`, and
+`wait_reason` (`none|reserved|aged_in|budget_full|model_cap`; NULL when the scheduler is off).
 
-## Roadmap
-
-- **Storage-backend agnostic (Postgres + SQLite)** — *implemented, opt-in.* Postgres
-  is still the default and the source of truth for the schema. A single-box deployment
-  that does not want to run a Postgres can instead point `DATABASE_URL` at a
-  `sqlite:///` URL and run on **SQLite** with zero extra services. Backend selection is
-  by URL scheme; the dialect layer (`overlaat/db.py`) only differs in two SQL details
-  (parameter placeholder and one substring function) plus a small DDL translation. The
-  event schema is the same on both — epoch-second timestamps, no DB-specific types in
-  the queries — so the dashboard and the curves are identical regardless of backend.
-
-  SQLite fits the single-box case for a structural reason, not just convenience: the
-  queue-proxy is a **single process and therefore the only writer**, and SQLite runs in
-  **WAL mode**, so the read-only dashboard reads concurrently and never blocks that one
-  writer. One box, one writer, one file — no separate database service to run.
-
-## Built with LLMs, said openly
-
-This software was developed with **strong assistance from large language models** —
-Claude, and the very local models it queues — with humans leading the ideas, the
-architecture, the testing, and the debugging. We say this openly because it shaped how
-the project was built: a lot of the code, the docs, and this README were drafted by a
-model and then dogfooded against the real gateway it sits in front of. If you are not
-happy with AI-assisted code, this software is not for you.
-
-The flip side of saying it openly: the design decisions are human-owned and it runs in
-real use, but it is experimental — read the code before you rely on it.
-
-## Acknowledgements
-
-Overlaat is a thin layer, and it would not exist without the work it sits on top of:
-
-- [LiteLLM](https://github.com/BerriAI/litellm) — the gateway it stands in front of.
-- [FastAPI](https://fastapi.tiangolo.com/) / [Starlette](https://www.starlette.io/) /
-  [uvicorn](https://www.uvicorn.org/) — the two services.
-- [httpx](https://www.python-httpx.org/) — the streaming pass-through.
-- [psycopg](https://www.psycopg.org/) and [PostgreSQL](https://www.postgresql.org/) —
-  the one honest event store.
-- and the local-inference ecosystem it exists to queue:
-  [MLX](https://github.com/ml-explore/mlx),
-  [llama.cpp](https://github.com/ggml-org/llama.cpp),
-  [Ollama](https://github.com/ollama/ollama),
-  [vLLM](https://github.com/vllm-project/vllm),
-  [llama-swap](https://github.com/mostlygeek/llama-swap).
+> Note: large-model switching is performed by the underlying swap layer (e.g. llama-swap);
+> Overlaat only **observes and logs** it (`model_loads`) and folds it into budget arithmetic via
+> `overlaat_slot`.
 
 ## Status and caveats
 
-- **Experimental.** Shared as-is. **No support promise**, no compatibility guarantee
-  between versions.
-- **MIT licensed.** See [`LICENSE`](LICENSE).
-- Built and dogfooded on an **Apple-Silicon multi-backend** setup, but it is
-  **backend-agnostic**: all it needs is an OpenAI-compatible LiteLLM gateway in front of
-  whatever engines you run, and a Postgres to write events to.
+- **Experimental, MIT** ([`LICENSE`](LICENSE)). Shared as-is — **no support promise**, no
+  cross-version compatibility guarantee.
+- **Backend-agnostic.** Built and dogfooded on Apple-Silicon multi-backend, but all it needs is
+  an OpenAI-compatible LiteLLM gateway in front and a Postgres or SQLite to write events to.
+- **Built with strong LLM assistance** (Claude, and the local models it queues), humans leading
+  ideas, architecture, testing, and debugging — said openly because it shaped the work. If you're
+  not happy with AI-assisted code, this isn't for you. Read the code before you rely on it.
 
-Known caveats, stated up front because that is the whole point of the project:
+Known caveats, stated up front:
 
-- **Per-process GPU is not reliably measurable** on all platforms — notably Metal/MLX
-  workloads on macOS report 0. GPU% is therefore kept host-wide; **memory is attributed
-  per-backend via RSS**.
+- **Per-process GPU is not reliably measurable** on all platforms — Metal/MLX on macOS reports 0.
+  GPU% is kept host-wide; **memory is attributed per-backend via RSS**.
 - **Token counts are NULL** when a backend reports no `usage`. The proxy injects
-  `stream_options.include_usage=true` on streaming chat to minimize this; NULL is never
-  counted as zero.
-- **Engine tail after client-abandon.** On disconnect the slot releases at `t_done`,
-  but a single-stream engine may keep decoding briefly. The "active" curve measures
-  *slot occupancy*, not literal GPU-busy after release. In-flight requests are therefore
-  *not* safely cancellable; only still-queued requests are.
+  `stream_options.include_usage=true` on streaming chat to minimize this; NULL is never counted
+  as zero.
+- **Engine tail after client-abandon.** On disconnect the slot releases at `t_done`, but a
+  single-stream engine may keep decoding briefly. The "active" curve measures *slot occupancy*,
+  not literal GPU-busy after release. In-flight requests are therefore **not** safely cancellable;
+  only still-queued ones are.
+
+## Acknowledgements
+
+Overlaat is a thin layer on top of: [LiteLLM](https://github.com/BerriAI/litellm) (the gateway);
+[FastAPI](https://fastapi.tiangolo.com/) / [Starlette](https://www.starlette.io/) /
+[uvicorn](https://www.uvicorn.org/) (the two services); [httpx](https://www.python-httpx.org/)
+(streaming pass-through); [psycopg](https://www.psycopg.org/) /
+[PostgreSQL](https://www.postgresql.org/) (the event store); and the local-inference ecosystem it
+queues — [MLX](https://github.com/ml-explore/mlx), [llama.cpp](https://github.com/ggml-org/llama.cpp),
+[Ollama](https://github.com/ollama/ollama), [vLLM](https://github.com/vllm-project/vllm),
+[llama-swap](https://github.com/mostlygeek/llama-swap).
