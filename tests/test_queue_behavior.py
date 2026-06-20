@@ -699,4 +699,49 @@ async def test_new_event_fields_emitted(monkeypatch, isolate_state):
     assert ev["priority"] == 3
     assert abs(ev["cost"] - 0.5) < 1e-9  # 1/cap = 1/2
     assert ev["wait_reason"] == "none"  # admitted on first pump, never waited
+    assert ev["pool"] == "default"  # no overlaat_pool → default pool
+    await qp.app.state.client.aclose()
+
+
+async def test_pool_field_on_admit_and_cancel(monkeypatch, isolate_state):
+    """The lifecycle event carries the request's resource `pool` both on a normal
+    admission and on a cancelled-while-queued request (the new pool column)."""
+    events = isolate_state
+    sched = scheduler_on(
+        monkeypatch,
+        caps={"model-b": 1},
+        pool_of={"model-b": "fat-slot"},
+        pool_exclusive={"fat-slot"},
+    )
+    gate = asyncio.Event()
+    arrivals: list[str] = []
+    qp.app.state.client = gated_upstream(gate, arrivals)
+
+    async def call(tag):
+        async with asgi() as c:
+            r = await c.post(
+                "/v1/chat/completions", json={"model": "model-b", "stream": False, "tag": tag}
+            )
+        return tag, r.status_code
+
+    inflight = asyncio.ensure_future(call("inflight"))
+    await _wait_for(lambda: qp.METRICS["model-b"]["in_flight"] == 1)
+    queued = asyncio.ensure_future(call("queued"))
+    assert await _wait_for(lambda: len(qp.QUEUED["model-b"]) == 1)
+    assert sched.queue_depth() == 1
+
+    # Cancel the queued one → it emits a cancelled event carrying the pool.
+    req_id = next(iter(qp.QUEUED["model-b"]))
+    async with asgi() as c:
+        await c.post(f"/__queue/cancel/{req_id}")
+    _, q_status = await queued
+    assert q_status == 499
+
+    gate.set()
+    await inflight
+    await _wait_for(lambda: len(events) == 2)
+
+    by_outcome = {e["outcome"]: e for e in events}
+    assert by_outcome["completed"]["pool"] == "fat-slot"  # admit path
+    assert by_outcome["cancelled_queued"]["pool"] == "fat-slot"  # cancelled path
     await qp.app.state.client.aclose()

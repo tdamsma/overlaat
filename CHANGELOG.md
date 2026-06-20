@@ -8,6 +8,51 @@ versions without a compatibility guarantee.
 
 ## [Unreleased]
 
+## [0.0.4] — 2026-06-20
+
+### Added
+- **Resource pools + exclusive groups** in the cost-weighted scheduler (closes #11, #12).
+  Each model is now assigned to exactly one named **resource pool** (`model_info.overlaat_pool`,
+  default `default`), and admission is cost-weighted against THAT pool's own budget instead of
+  one global ledger. A pool blocked on budget never idles a *different* pool, so cross-backend
+  concurrency is preserved (#11) — e.g. an embeddings pool is never stalled by a busy swap
+  engine. Pools are declared in a new OPTIONAL top-level `overlaat.pools` section of the LiteLLM
+  config (`budget` + `exclusive` per pool); a pool a model references but does not declare is
+  auto-created (non-exclusive, `OVERLAAT_BUDGET`) and logged at startup. The global priority
+  queue, eager head reservation (now per-pool), linear aging, and no-preemption are unchanged.
+  **Default is unchanged:** with every model in the single `default` pool the scheduler
+  reproduces the previous single-shared-budget behavior exactly. There is **no new env knob** —
+  `OVERLAAT_BUDGET` is the budget of the `default` pool and of any auto-created pool.
+- **Honest exclusive (swap-slot) pools** replacing the forced-1.0 fat-slot cost hack (closes #12).
+  An `exclusive: true` pool is a HARD MUTEX over its *distinct members*: at most one member id
+  may be active at a time, but that resident member's own cap + the pool budget govern how many
+  of *its* streams run concurrently. So a cap-2 dual-engine member honestly costs `1/2 = 0.5`
+  and runs **both** its streams while resident — instead of being forced to `cost = 1.0` and
+  capped at one stream. This also fixes the `0.5 + 0.5` trap: with a cap-2 member resident at
+  `used 0.5` there is 0.5 of budget headroom, yet a *different* member is still rejected
+  (`wait_reason = exclusive`) until the resident fully drains and the mutex hands off.
+
+### Changed
+- New `request_events.pool` column (the resource pool a request was admitted against; `default`
+  for unconfigured models, `NULL` when the scheduler is off / pre-upgrade) and a new
+  `wait_reason` value `exclusive` (a *different* member held an exclusive pool's mutex). The
+  `/__queue/health` and `/__queue/status` endpoints now expose a per-pool snapshot (`budget` gains
+  a `pools` map of `{budget, used, exclusive, active_member, reserved_for, in_flight, budget_pct}`)
+  and per-model rows + queued entries gain `pool`; the legacy top-level `budget`/`used`/`in_flight`/
+  `reserved_for`/`budget_pct` fields are kept (they reflect the `default` pool) so existing readers
+  keep working.
+- The `model_info.overlaat_slot` key is now a **deprecated-but-bridged LEGACY ALIAS**:
+  `overlaat_slot: NAME` (with no `overlaat_pool`) is treated as `overlaat_pool: NAME` with that
+  pool auto-marked `exclusive: true`. Old swap-slot configs keep working unchanged — a cap-1
+  fat-slot is byte-identical to before.
+- **Upgrade step for existing deployments:** the new `request_events.pool` column is in
+  `schema.sql` (idempotent). To add it to an **existing** Postgres table without recreating it:
+  ```sql
+  ALTER TABLE request_events ADD COLUMN IF NOT EXISTS pool TEXT;
+  ```
+  (SQLite: `ALTER TABLE request_events ADD COLUMN pool TEXT;` — run once.) Pre-upgrade rows keep
+  `NULL`, which the dashboard treats as "scheduler off".
+
 ## [0.0.3] — 2026-06-20
 
 ### Added
@@ -131,7 +176,8 @@ version implements:
 - **Cost-weighted admission** is design-only (see `docs/COST-SCHEDULER.md`); the queue
   is plain per-model FIFO in this version.
 
-[Unreleased]: https://github.com/tdamsma/overlaat/compare/v0.0.3...HEAD
+[Unreleased]: https://github.com/tdamsma/overlaat/compare/v0.0.4...HEAD
+[0.0.4]: https://github.com/tdamsma/overlaat/releases/tag/v0.0.4
 [0.0.3]: https://github.com/tdamsma/overlaat/releases/tag/v0.0.3
 [0.0.2]: https://github.com/tdamsma/overlaat/releases/tag/v0.0.2
 [0.0.1]: https://github.com/tdamsma/overlaat/releases/tag/v0.0.1

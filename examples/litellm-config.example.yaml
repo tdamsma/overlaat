@@ -7,13 +7,18 @@
 # let through to the backend concurrently before the rest WAIT in a queue
 # (instead of being rejected with a 429). With the cost-weighted scheduler (on by
 # default; see docs/COST-SCHEDULER.md) it also reads two OPTIONAL `model_info`
-# keys per model: `overlaat_cost` (explicit GPU-fraction cost override; default
-# is 1/cap) and `overlaat_slot` (swap-slot "fat-slot" group name; every member is
-# forced to cost 1.0). Everything else here (api_base, routing, master_key, ...)
-# is LiteLLM's own concern; the proxy does not interpret it. So: this file is the
-# single source of truth for the caps and scheduler costs, living next to the
-# model they govern. (Per-key priority is NOT here — it comes from the LiteLLM
-# key metadata field `overlaat_priority`; see docs/COST-SCHEDULER.md §4c.)
+# keys per model: `overlaat_cost` (explicit pool-fraction cost override; default
+# is 1/cap) and `overlaat_pool` (the named resource pool the model is admitted
+# against; default `default`). It also reads an OPTIONAL top-level `overlaat.pools`
+# section that declares each pool's `budget` and `exclusive` flag (see the bottom
+# of this file). The deprecated `overlaat_slot` key is still accepted as a LEGACY
+# ALIAS: `overlaat_slot: NAME` is treated as `overlaat_pool: NAME` with that pool
+# auto-marked `exclusive: true`, so old swap-slot configs keep working unchanged.
+# Everything else here (api_base, routing, master_key, ...) is LiteLLM's own
+# concern; the proxy does not interpret it. So: this file is the single source of
+# truth for the caps, pools, and scheduler costs, living next to the model they
+# govern. (Per-key priority is NOT here — it comes from the LiteLLM key metadata
+# field `overlaat_priority`; see docs/COST-SCHEDULER.md §4c.)
 #
 # The cap is NOT a tuning knob you invent in isolation — it is DERIVED from the
 # backend's real concurrency capacity (engine process count, server
@@ -52,6 +57,10 @@ model_list:
       api_base: http://127.0.0.1:8085/v1
       api_key: dummy
       max_parallel_requests: 2   # ← per-model semaphore cap read by the queue-proxy.
+    model_info:
+      # A SEPARATE resource pool with its own budget → never blocked by the swap
+      # engine's fat-slot pool (#11 cross-backend isolation). cost = 1/cap = 0.5.
+      overlaat_pool: embeddings
 
   # ─── Example 3: a rerank-style cross-encoder (model-a) ────────────────────
   # A second-stage reranker (cross-encoder) after a first-stage retrieval. The
@@ -82,22 +91,30 @@ model_list:
       # think six of these only fill 1/6 of the GPU each.
       overlaat_cost: 1.0
 
-  # ─── Example 4: a swap-on-demand "fat slot" group (model-b, model-c) ───────
+  # ─── Example 4: a swap-on-demand EXCLUSIVE pool (model-b, model-c) ─────────
   # Several large models behind a mutex where only ONE is resident at a time and
   # loading another evicts the current one (the swap-slot tracked by model_loads).
-  # Mark every member with the SAME `overlaat_slot` group name: the scheduler
-  # then forces each member's cost to 1.0 (= the whole budget B), so admitting
-  # one takes `used` to B and no other run — swap-slot or otherwise — is
-  # admittable until it completes. The "one big model at a time" mutex falls out
-  # of the budget arithmetic; there is NO separate lock. cap is still honoured
-  # (and is the per-model FIFO ceiling), but the cost is what enforces the mutex.
+  # Model this as an EXCLUSIVE resource pool: assign every member the SAME
+  # `overlaat_pool` name and declare that pool `exclusive: true` in the
+  # `overlaat.pools` section below. Exclusivity is a HARD MUTEX on the distinct
+  # MEMBER: at most one member id may be active (in_flight > 0) at a time. The
+  # resident member's own cap + the pool budget then govern how many of ITS
+  # streams run concurrently — so cost is the honest 1/cap, NOT a forced 1.0.
+  #
+  # model-b below is a cap-2 dual-engine member: its cost is 1/2 = 0.5, and while
+  # it is resident BOTH its streams run (used → 1.0 fills the pool). model-c is a
+  # single-engine member (cap 1, cost 1.0), mutually exclusive with model-b.
+  # Note the 0.5 + 0.5 TRAP this prevents: with model-b resident at used 0.5 there
+  # is 0.5 of budget headroom, but a model-c run is STILL rejected (wait_reason
+  # `exclusive`) because it is a DIFFERENT member — only when model-b fully drains
+  # does the mutex hand off to model-c. See docs/COST-SCHEDULER.md §4b.
   - model_name: model-b
     litellm_params:
       model: your-large-provider/large-model-b
       api_base: http://127.0.0.1:8087
-      max_parallel_requests: 1
+      max_parallel_requests: 2
     model_info:
-      overlaat_slot: fat-slot   # ← swap-slot group; every member forced to cost 1.0 (mutex)
+      overlaat_pool: fat-slot   # ← exclusive pool; cost = 1/cap = 0.5, runs 2 streams while resident
 
   - model_name: model-c
     litellm_params:
@@ -105,7 +122,9 @@ model_list:
       api_base: http://127.0.0.1:8088
       max_parallel_requests: 1
     model_info:
-      overlaat_slot: fat-slot   # ← same group → mutually exclusive with model-b
+      overlaat_pool: fat-slot   # ← same pool → mutually exclusive with model-b (cost = 1/cap = 1.0)
+      # Legacy: `overlaat_slot: fat-slot` is still accepted here and means the
+      # same thing (overlaat_pool: fat-slot + auto exclusive: true).
 
   # ─── Illustrative note: a single-stream engine ────────────────────────────
   # For a backend that is ONE large model on ONE engine process that does not
@@ -115,6 +134,31 @@ model_list:
   # N such engines behind a round-robin wrapper, the cap is N (the parallelism
   # comes from the process count, not from any one engine). The cap must always
   # move together with whatever fronts those engines.
+
+# ─── Overlaat resource pools (OPTIONAL) ────────────────────────────────────────
+# Read ONLY by the Overlaat queue-proxy (LiteLLM ignores this top-level key). A
+# pool is the unit of admission: each model is assigned to exactly one pool (via
+# `model_info.overlaat_pool`, default `default`), and admission is cost-weighted
+# against THAT pool's own `budget` — so a pool blocked on budget never idles a
+# DIFFERENT pool (#11 cross-backend isolation). Declare a pool here only to set
+# its `budget` (default = OVERLAAT_BUDGET) or mark it `exclusive`. A pool a model
+# references but does not declare is auto-created (non-exclusive, OVERLAAT_BUDGET)
+# and logged at startup.
+#
+# `exclusive: true` makes the pool a HARD MUTEX over its distinct members: at most
+# one member id may be active at a time; the resident member's cap + this budget
+# govern how many of its streams run. This REPLACES the old forced-1.0 fat-slot
+# cost hack with honest 1/cap costs (#12). `overlaat_slot: NAME` on a model is the
+# deprecated alias that auto-creates `NAME` as an exclusive pool.
+overlaat:
+  pools:
+    default:            # implicit; declare only to override its budget
+      budget: 1.0       # default = OVERLAAT_BUDGET
+    fat-slot:
+      budget: 1.0
+      exclusive: true   # hard mutex: only ONE distinct member active at a time
+    embeddings:
+      budget: 1.0       # its own budget → isolated from the swap engine (#11)
 
 # ─── Routing ──────────────────────────────────────────────────────────────────
 # NO cross-model fallbacks (deliberate). Silent degradation to a different or

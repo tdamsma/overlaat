@@ -79,16 +79,21 @@ Written by the queue-proxy when a request reaches a terminal state.
 | `outcome` | `completed` \| `client_abandoned` \| `upstream_error` \| `cancelled_queued` |
 | `http_status`, `prompt_tokens`, `completion_tokens` | tokens from the gateway's own `usage` block (`NULL` = not reported, **never zero-filled**) |
 | `priority` | effective base priority used at admission (request `priority` clamped to the per-key ceiling). `NULL` when the scheduler is off or the row predates 0.0.3 |
-| `cost` | GPU-fraction cost charged for this run (`1/cap` by default; an `overlaat_cost` override; `1.0` for a swap-slot member or an uncapped model). `NULL` when the scheduler is off |
-| `wait_reason` | why the request waited before admission: `none` (admitted on first pump) \| `reserved` (was the reserved head, admitted once the budget drained for it) \| `aged_in` (aging lifted it above equal-priority peers) \| `budget_full` (shared budget had no room) \| `model_cap` (per-model backend cap was full). `NULL` when the scheduler is off |
+| `cost` | pool-fraction cost charged for this run (`1/cap` by default; an `overlaat_cost` override; `1.0` for an uncapped model). `NULL` when the scheduler is off |
+| `wait_reason` | why the request waited before admission: `none` (admitted on first pump) \| `reserved` (was the reserved head, admitted once the budget drained for it) \| `aged_in` (aging lifted it above equal-priority peers) \| `budget_full` (the pool budget had no room) \| `model_cap` (per-model backend cap was full) \| `exclusive` (a *different* member held the request's exclusive pool's one-distinct-member mutex). `NULL` when the scheduler is off |
+| `pool` | the resource pool the request was admitted against (`default` for an unconfigured model; an `overlaat_pool` name otherwise). `NULL` when the scheduler is off or the row predates this column |
 
 The cost-weighted scheduler (on by default since 0.0.3) populates `priority`, `cost`,
-and `wait_reason`; see [`COST-SCHEDULER.md`](COST-SCHEDULER.md) for the algorithm. With
-`OVERLAAT_SCHEDULER=off` (the kill-switch restoring per-model FIFO semaphores) and for
-rows written before 0.0.3, all three are `NULL`. `wait_reason` is the cheapest way to
-see *why* a queue is deep: a run of `budget_full` means the shared GPU budget `B` is the
-bottleneck (models contending for one GPU), whereas `model_cap` means a single backend's
-own cap is the bottleneck (that one model is saturated while the GPU has room).
+`wait_reason`, and `pool`; see [`COST-SCHEDULER.md`](COST-SCHEDULER.md) for the algorithm.
+With `OVERLAAT_SCHEDULER=off` (the kill-switch restoring per-model FIFO semaphores) and
+for rows written before these columns existed, they are `NULL`. `wait_reason` is the
+cheapest way to see *why* a queue is deep: a run of `budget_full` means the request's
+**pool** budget is the bottleneck (its models contending for that pool's share), whereas
+`model_cap` means a single backend's own cap is the bottleneck (that one model is saturated
+while the pool has room), and `exclusive` means a *different* member is resident in an
+exclusive (swap-slot) pool and the request is waiting for the mutex to hand off. `pool`
+lets you slice all of this per resource pool — a deep `budget_full` queue isolated to one
+pool tells you which backend is the bottleneck without touching the others.
 
 `key_fp` is a fingerprint, not a secret: it is the first 8 hex chars of the
 SHA-256 of the bearer token. It is enough to group requests by caller and to
@@ -146,29 +151,45 @@ its designed capacity instead of thrashing.
 
 ## Budget utilization (cost-weighted scheduler)
 
-When the scheduler is on (the default since 0.0.3), the single shared budget `B`
-is the global ceiling that the per-model curves above sum *into*. The live budget
-state is exposed by the queue-proxy on `:4000/__queue/health` and
-`:4000/__queue/status` under a `budget` object:
+When the scheduler is on (the default since 0.0.3), admission is cost-weighted
+against each model's **resource pool** budget — the per-model curves above sum
+*into* their pool. The live budget state is exposed by the queue-proxy on
+`:4000/__queue/health` and `:4000/__queue/status` under a `budget` object. It keeps
+the legacy top-level fields (reflecting the `default` pool, so existing readers and
+the `budget_pct` computation keep working) and adds a per-pool `pools` map:
 
 ```jsonc
 "budget": {
-  "budget": 1.0,          // B — the whole GPU
-  "used": 0.75,           // sum of cost(model) over all in-flight runs
-  "budget_pct": 75.0,     // used / B, as a percentage
-  "queue_depth": 3,       // total waiters across all models
-  "in_flight": { "model-a": 2, "model-b": 1 },
-  "reserved_for": "ab12cd34ef56"  // req_id of the reserved head, or null
+  // Legacy top-level fields — the `default` pool, for back-compat.
+  "budget": 1.0,          // B_default
+  "used": 0.25,           // sum of cost(model) over in-flight runs in `default`
+  "budget_pct": 25.0,     // used / B_default, as a percentage
+  "queue_depth": 3,       // total waiters across ALL pools
+  "in_flight": { "model-a": 1, "model-b": 2 },
+  "reserved_for": null,   // req_id of the `default` pool's reserved head, or null
+  // Per-pool breakdown — the unit of admission.
+  "pools": {
+    "default":  { "budget": 1.0, "used": 0.25, "exclusive": false,
+                  "active_member": null, "reserved_for": null,
+                  "in_flight": { "model-a": 1 }, "budget_pct": 25.0 },
+    "fat-slot": { "budget": 1.0, "used": 1.0,  "exclusive": true,
+                  "active_member": "model-b",  // the resident member (mutex holder)
+                  "reserved_for": null,
+                  "in_flight": { "model-b": 2 }, "budget_pct": 100.0 }
+  }
 }
 ```
 
-`used` is the summed cost of every in-flight run, so `budget_pct` near 100% means
-the GPU is fully committed (and new arrivals wait on the budget, not on any one
-model's cap). A non-null `reserved_for` means an expensive head is holding budget
-while cheap jobs drain — the work-conserving-vs-fairness tradeoff (§ COST-SCHEDULER
-3c) is actively biting. Per queued request, `/__queue/status` also surfaces
-`priority`, `effective_priority` (priority after aging), `cost`, and the live
-`wait_reason`, so a deep queue can be read by *why* each entry is waiting. With
+`used` is the summed cost of every in-flight run **in that pool**, so a pool's
+`budget_pct` near 100% means that pool is fully committed (and new arrivals to it
+wait on its budget, not on any one model's cap). A pool's non-null `reserved_for`
+means an expensive head is holding *that pool's* budget while cheap jobs drain —
+the work-conserving-vs-fairness tradeoff (§ COST-SCHEDULER 3c), now intra-pool. For
+an `exclusive` pool, `active_member` is the one resident member; a different member
+waits with `wait_reason = exclusive` until it hands off. Per queued request,
+`/__queue/status` also surfaces `priority`, `effective_priority` (priority after
+aging), `cost`, `pool`, and the live `wait_reason`, so a deep queue can be read by
+*why* each entry is waiting and *which pool* it is waiting in. With
 `OVERLAAT_SCHEDULER=off`, the `budget` object is `null` and these per-entry fields
 are absent.
 

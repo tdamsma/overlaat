@@ -314,14 +314,18 @@ async def test_aging_prevents_starvation():
 
 
 async def test_fat_slot_mutex_only_one_resident():
-    # Two members of a swap-slot group both forced to cost 1.0: admitting one
-    # takes used to B, so the other cannot be admitted until release.
+    # Spec case #4 — single-stream fat-slot unchanged, now expressed as an
+    # EXCLUSIVE pool instead of the old forced-1.0 slot hack. Two cap-1 members
+    # of an exclusive pool: admitting one makes it the resident member (cost 1.0
+    # fills the pool budget), so the other cannot be admitted until release, with
+    # the same observable behavior as the pre-change fat slot.
     s = Scheduler(
         budget=1.0,
-        caps={"llamaBig": 2, "qwenBig": 2},  # caps would suggest cost 0.5...
-        slot_groups={"llamaBig": "fat", "qwenBig": "fat"},
+        caps={"llamaBig": 1, "qwenBig": 1},
+        pool_of={"llamaBig": "fat", "qwenBig": "fat"},
+        pool_exclusive={"fat"},
     )
-    assert s.cost("llamaBig") == pytest.approx(1.0)  # forced to 1.0 by slot group
+    assert s.cost("llamaBig") == pytest.approx(1.0)  # 1/cap = 1/1
     assert s.cost("qwenBig") == pytest.approx(1.0)
 
     a = make_waiter(s, "llamaBig", req_id="a")
@@ -329,11 +333,294 @@ async def test_fat_slot_mutex_only_one_resident():
     s.enqueue(a)
     s.enqueue(b)
     assert admitted(a)
-    assert not admitted(b)  # budget full at 1.0 -> mutex falls out of arithmetic
-    assert s.used == pytest.approx(1.0)
+    assert not admitted(b)  # different member locked out: budget full AND exclusion
+    assert s.used_in("fat") == pytest.approx(1.0)
+    # Pre-change wait_reasons preserved: a was admitted on first pump ("none"),
+    # b waited. Here budget is also full, so b reports budget_full (cap is not
+    # full for b; exclusion also blocks but budget_full wins the same as before).
+    assert b.wait_reason in {"budget_full", "exclusive"}
 
     s.release("llamaBig")
     assert admitted(b)
+
+
+# --------------------------------------------------------------------------
+# Resource pools + exclusive groups (closes #11 / #12).
+# --------------------------------------------------------------------------
+
+
+async def test_pool_isolation_cross_backend():
+    # Spec case #1 (#11): an exclusive fat-slot pool (B=1, model-b cap 1, cost
+    # 1.0) and a separate embeddings pool (B=1, emb cap 2, cost 0.5). Admitting
+    # model-b fills the fat-slot budget, but an embeddings waiter is admitted
+    # IMMEDIATELY into its own pool — the fat-slot budget never idles embeddings.
+    s = Scheduler(
+        budget=1.0,
+        caps={"model-b": 1, "emb": 2},
+        pool_of={"model-b": "fat-slot", "emb": "embeddings"},
+        pool_exclusive={"fat-slot"},
+    )
+    b = make_waiter(s, "model-b", req_id="b")
+    s.enqueue(b)
+    assert admitted(b)
+    assert s.used_in("fat-slot") == pytest.approx(1.0)
+
+    e = make_waiter(s, "emb", req_id="e")
+    s.enqueue(e)
+    assert admitted(e)  # isolated pool: not blocked by the full fat-slot
+    assert e.wait_reason == "none"
+    assert s.used_in("embeddings") == pytest.approx(0.5)
+
+
+async def test_exclusive_pool_cap2_member_runs_two():
+    # Spec case #2 (#12): an exclusive pool whose resident member is cap-2
+    # (cost 0.5). Both of its streams run concurrently — exclusivity is across
+    # DISTINCT members, not within a member.
+    s = Scheduler(
+        budget=1.0,
+        caps={"model-b": 2},
+        pool_of={"model-b": "fat-slot"},
+        pool_exclusive={"fat-slot"},
+    )
+    assert s.cost("model-b") == pytest.approx(0.5)
+    b1 = make_waiter(s, "model-b", req_id="b1")
+    b2 = make_waiter(s, "model-b", req_id="b2")
+    s.enqueue(b1)
+    s.enqueue(b2)
+    assert admitted(b1) and admitted(b2)
+    assert s.used_in("fat-slot") == pytest.approx(1.0)
+    assert s.in_flight["model-b"] == 2
+
+
+async def test_exclusive_pool_distinct_member_trap_rejected_and_handoff():
+    # Spec case #3 (#12): the 0.5 + 0.5 distinct-member trap. fat-slot exclusive,
+    # model-b cap 2 (0.5) + model-c cap 2 (0.5). Admit one model-b (used 0.5);
+    # a model-c waiter is NOT admitted despite 0.5 budget headroom, because a
+    # DIFFERENT member is resident — wait_reason 'exclusive'. Releasing both
+    # model-b streams drains the pool; model-c then becomes the resident member
+    # (the mutex hand-off).
+    s = Scheduler(
+        budget=1.0,
+        caps={"model-b": 2, "model-c": 2},
+        pool_of={"model-b": "fat-slot", "model-c": "fat-slot"},
+        pool_exclusive={"fat-slot"},
+    )
+    b1 = make_waiter(s, "model-b", req_id="b1")
+    s.enqueue(b1)
+    assert admitted(b1)
+    assert s.used_in("fat-slot") == pytest.approx(0.5)  # 0.5 headroom remains
+
+    c = make_waiter(s, "model-c", req_id="c")
+    s.enqueue(c)
+    assert not admitted(c)  # rejected despite budget room — different member
+    assert c.wait_reason == "exclusive"
+
+    # A second model-b stream still fits (same resident member).
+    b2 = make_waiter(s, "model-b", req_id="b2")
+    s.enqueue(b2)
+    assert admitted(b2)
+    assert s.used_in("fat-slot") == pytest.approx(1.0)
+    assert not admitted(c)
+
+    # Drain both model-b streams → pool idle → model-c becomes resident.
+    s.release("model-b")
+    assert not admitted(c)  # one model-b still resident
+    s.release("model-b")
+    assert admitted(c)  # mutex hand-off: model-c is now the resident member
+    assert s.active_members("fat-slot") == {"model-c"}
+
+
+async def test_legacy_overlaat_slot_bridge_matches_explicit_pool():
+    # Spec case #5: a config that declares only the legacy overlaat_slot loads to
+    # an exclusive pool, behaving identically to an explicit overlaat_pool +
+    # exclusive. We exercise the proxy loader's bridge directly here.
+    from pathlib import Path
+    from tempfile import NamedTemporaryFile
+
+    from overlaat import queue_proxy as qp
+
+    cfg = """
+model_list:
+  - model_name: model-b
+    litellm_params: { model: x/large-b, max_parallel_requests: 1 }
+    model_info: { overlaat_slot: fat-slot }
+  - model_name: model-c
+    litellm_params: { model: x/large-c, max_parallel_requests: 1 }
+    model_info: { overlaat_slot: fat-slot }
+"""
+    with NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
+        f.write(cfg)
+        path = Path(f.name)
+
+    caps = qp.load_caps(path)
+    costs, pool_of, exclusive_seed = qp.load_model_info(path)
+    declared_budgets, declared_exclusive = qp.load_pools(path)
+    pool_budget, pool_exclusive = qp.resolve_pool_config(
+        caps, costs, pool_of, exclusive_seed, declared_budgets, declared_exclusive, 1.0, log=False
+    )
+    # The bridge: both members assigned to pool 'fat-slot', which is exclusive.
+    assert pool_of == {"model-b": "fat-slot", "model-c": "fat-slot"}
+    assert "fat-slot" in pool_exclusive
+
+    s = Scheduler(
+        budget=1.0,
+        caps=caps,
+        costs=costs,
+        pool_of=pool_of,
+        pool_budget=pool_budget,
+        pool_exclusive=pool_exclusive,
+    )
+    b = make_waiter(s, "model-b", req_id="b")
+    c = make_waiter(s, "model-c", req_id="c")
+    s.enqueue(b)
+    s.enqueue(c)
+    assert admitted(b)
+    assert not admitted(c)  # exclusive: different member locked out
+    s.release("model-b")
+    assert admitted(c)
+
+
+async def test_cross_pool_reservation_isolation():
+    # Spec case #7: pool A's head is budget-blocked and reserves in A; a cheap
+    # waiter in pool B is admitted because B's reservable is the full B_B —
+    # A's reservation never bleeds into B.
+    s = Scheduler(
+        budget=1.0,
+        caps={"a-big": 1, "a-cheap": 4, "b-cheap": 4},
+        costs={"a-big": 1.0, "a-cheap": 0.5, "b-cheap": 0.25},
+        pool_of={"a-big": "A", "a-cheap": "A", "b-cheap": "B"},
+        pool_budget={"A": 1.0, "B": 1.0},
+    )
+    # Fill pool A to 0.5 with one a-cheap, then a-big becomes the budget-blocked head.
+    occ = make_waiter(s, "a-cheap", req_id="occ", priority=0)
+    s.enqueue(occ)
+    assert admitted(occ)
+    big = make_waiter(s, "a-big", req_id="big", priority=10)
+    s.enqueue(big)
+    assert not admitted(big)
+    assert s.reserved_for_pool("A") is big  # reserved within pool A
+    assert s.reserved_for_pool("B") is None
+
+    # A cheap waiter in pool B is admitted into B's untouched budget.
+    bc = make_waiter(s, "b-cheap", req_id="bc", priority=1)
+    s.enqueue(bc)
+    assert admitted(bc)
+    assert s.used_in("B") == pytest.approx(0.25)
+
+
+async def test_exclusion_blocked_head_not_reserved_for():
+    # Spec case #8: in an exclusive pool with a resident member, a DIFFERENT
+    # member at the head is NOT reserved-for (reserving budget cannot evict the
+    # resident); meanwhile another stream of the resident member still packs into
+    # the remaining budget.
+    s = Scheduler(
+        budget=1.0,
+        caps={"resident": 2, "other": 2},
+        pool_of={"resident": "fat", "other": "fat"},
+        pool_exclusive={"fat"},
+    )
+    r1 = make_waiter(s, "resident", req_id="r1", priority=0)
+    s.enqueue(r1)
+    assert admitted(r1)  # resident member, used 0.5
+
+    # A different member at higher priority is the pool head but exclusion-blocked.
+    head_other = make_waiter(s, "other", req_id="other", priority=10)
+    s.enqueue(head_other)
+    assert not admitted(head_other)
+    assert s.reserved_for_pool("fat") is None  # exclusion-blocked head NOT reserved
+    assert head_other.wait_reason == "exclusive"
+
+    # A second resident stream still packs into the remaining 0.5 budget.
+    r2 = make_waiter(s, "resident", req_id="r2", priority=1)
+    s.enqueue(r2)
+    assert admitted(r2)
+    assert s.used_in("fat") == pytest.approx(1.0)
+    assert not admitted(head_other)
+
+
+async def test_aging_within_exclusive_pool_never_bypasses_exclusion():
+    # Spec case #9: aging changes ORDER (a long-waiting different-member waiter
+    # can out-rank fresher peers) but never bypasses the exclusion mutex — it
+    # still cannot be admitted while a different member is resident.
+    clock = Clock(0.0)
+    s = Scheduler(
+        budget=1.0,
+        caps={"resident": 1, "other": 1},
+        pool_of={"resident": "fat", "other": "fat"},
+        pool_exclusive={"fat"},
+        aging_rate=1.0,
+        now=clock,
+    )
+    r = make_waiter(s, "resident", req_id="r", priority=5, at=0.0)
+    s.enqueue(r)
+    assert admitted(r)
+
+    other = make_waiter(s, "other", req_id="other", priority=1, at=0.0)
+    s.enqueue(other)
+    assert not admitted(other)
+
+    # Age 'other' well past the resident's nominal priority.
+    clock.advance(100.0)
+    s.pump(clock())
+    assert s.effective_priority(other, clock()) > 5  # aged above resident's priority
+    assert not admitted(other)  # exclusion still blocks despite the higher rank
+    assert other.wait_reason == "exclusive"
+
+    # Only releasing the resident lets 'other' in (the mutex, not the order).
+    s.release("resident")
+    assert admitted(other)
+
+
+async def test_snapshot_back_compat_and_pools_map():
+    # Spec case #10: snapshot exposes a per-pool 'pools' map AND keeps the legacy
+    # top-level default-pool fields so the proxy's budget_pct computation and
+    # existing readers keep working.
+    s = Scheduler(
+        budget=1.0,
+        caps={"d": 4, "model-b": 1},
+        pool_of={"model-b": "fat-slot"},
+        pool_exclusive={"fat-slot"},
+    )
+    d = make_waiter(s, "d", req_id="d")  # default pool
+    b = make_waiter(s, "model-b", req_id="b")  # fat-slot pool
+    s.enqueue(d)
+    s.enqueue(b)
+    assert admitted(d) and admitted(b)
+
+    snap = s.snapshot()
+    # Legacy top-level fields reflect the default pool.
+    assert snap["budget"] == pytest.approx(1.0)
+    assert snap["used"] == pytest.approx(0.25)  # only 'd' is in default
+    assert snap["reserved_for"] is None
+    assert snap["in_flight"] == {"d": 1, "model-b": 1}
+    # The proxy's budget_pct computation off the top-level fields still works.
+    assert round(snap["used"] / snap["budget"] * 100, 1) == 25.0
+
+    # The pools map carries each pool's own state.
+    pools = snap["pools"]
+    assert pools["default"]["used"] == pytest.approx(0.25)
+    assert pools["default"]["exclusive"] is False
+    assert pools["fat-slot"]["used"] == pytest.approx(1.0)
+    assert pools["fat-slot"]["exclusive"] is True
+    assert pools["fat-slot"]["active_member"] == "model-b"
+    assert pools["fat-slot"]["in_flight"] == {"model-b": 1}
+    assert pools["fat-slot"]["budget_pct"] == 100.0
+
+
+async def test_event_wiring_column_counts_match():
+    # Spec case #11 (wiring): the event column tuple, the SQLite positional
+    # placeholders, and the Postgres named params must all agree in count, or a
+    # column-order drift silently corrupts SQLite rows.
+    from overlaat import queue_proxy as qp
+
+    n = len(qp._EVENT_COLS)
+    assert qp._INSERT_SQL_SQLITE.count("?") == n
+    # Each named param appears once as %(name)s in the PG statement.
+    for col in qp._EVENT_COLS:
+        assert f"%({col})s" in qp._INSERT_SQL_PG
+    assert qp._INSERT_SQL_PG.count("%(") == n
+    # 'pool' is the newly-added column, last in the tuple.
+    assert qp._EVENT_COLS[-1] == "pool"
 
 
 async def test_model_cap_binds_under_budget():
