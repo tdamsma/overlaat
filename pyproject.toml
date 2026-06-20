@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
@@ -51,7 +51,7 @@ Issues = "https://github.com/tdamsma/overlaat/issues"
 Changelog = "https://github.com/tdamsma/overlaat/blob/main/CHANGELOG.md"
 
 [tool.hatch.version]
-path = "overlaat/__init__.py"
+source = "vcs"
 
 [tool.hatch.build.targets.wheel]
 packages = ["overlaat"]
