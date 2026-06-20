@@ -13,7 +13,7 @@ build/
 CLAUDE.md
 PUBLISH.md
 # Diagram build inputs — we publish only the .excalidraw.svg (it embeds the
-# editable scene). The PNG screenshot and the .excalidraw source stay local.
+# editable scene). The architecture PNG render and the .excalidraw source stay
+# local. (docs/dashboard.png IS tracked — it is embedded in the README.)
 docs/overlaat-llm-stack.png
-docs/dashboard.png
 docs/*.excalidraw

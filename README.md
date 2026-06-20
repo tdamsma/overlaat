@@ -51,6 +51,11 @@ A sidecar in *front* of LiteLLM, plus a read-only dashboard:
 honest row per request, the optional host sampler writes host facts every few seconds, the
 dashboard is pure query — no second source of truth, no survivor bias.
 
+![Overlaat usage dashboard](docs/dashboard.png)
+
+*The read-only usage dashboard: offered/active/queued concurrency, budget utilisation, and
+per-consumer slot-holders.*
+
 ## Architecture
 
 ```mermaid
