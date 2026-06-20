@@ -8,6 +8,8 @@ versions without a compatibility guarantee.
 
 ## [Unreleased]
 
+## [0.0.3] — 2026-06-20
+
 ### Added
 - **Cost-weighted priority scheduler** (`overlaat/scheduler.py`), replacing the
   independent per-model semaphores with **one global priority queue + cost-weighted
@@ -129,6 +131,7 @@ version implements:
 - **Cost-weighted admission** is design-only (see `docs/COST-SCHEDULER.md`); the queue
   is plain per-model FIFO in this version.
 
-[Unreleased]: https://github.com/tdamsma/overlaat/compare/v0.0.2...HEAD
+[Unreleased]: https://github.com/tdamsma/overlaat/compare/v0.0.3...HEAD
+[0.0.3]: https://github.com/tdamsma/overlaat/releases/tag/v0.0.3
 [0.0.2]: https://github.com/tdamsma/overlaat/releases/tag/v0.0.2
 [0.0.1]: https://github.com/tdamsma/overlaat/releases/tag/v0.0.1
