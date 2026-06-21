@@ -31,6 +31,11 @@ Environment overrides:
   PSQL             path to the psql binary (default: "psql" on PATH).
   SLOT_RUNNING_URL optional URL of a model-swap server's /running endpoint, used
                    only for cold-load tracking (default off).
+  BACKEND_EXE_PREFIXES
+                   comma-separated executable-name prefixes whose RSS gets a
+                   port-suffixed name (default: python,ollama,model-server,mlx_lm).
+                   Set this to add your own inference binaries (e.g. ds4-server)
+                   without patching installed source.
 """
 
 from __future__ import annotations  # support older Python 3.9 (PEP 604 unions)
@@ -66,11 +71,26 @@ OVERLAAT_ENV = Path(os.environ.get("OVERLAAT_ENV", "./overlaat.env"))
 # Adapt this list to the backends you actually run (inference servers, runtimes,
 # the gateway, the database). It is only used to recognize port-suffixed names;
 # any process over RSS_MIN_GB is still recorded regardless.
-BACKEND_EXE_PREFIXES = (
+#
+# Override with BACKEND_EXE_PREFIXES (comma-separated) to add your own inference
+# binaries without patching installed source, e.g.
+#   BACKEND_EXE_PREFIXES=python,ollama,ds4-server
+# An unset/empty value keeps the defaults below.
+_DEFAULT_BACKEND_EXE_PREFIXES = (
     "python",  # e.g. an mlx/transformers server launched via python
     "ollama",  # a local model server + its runner subprocesses
     "model-server",  # a custom inference engine binary (rename to yours)
     "mlx_lm",  # an MLX language-model server
+)
+BACKEND_EXE_PREFIXES = (
+    tuple(
+        p.strip()
+        for p in os.environ.get(
+            "BACKEND_EXE_PREFIXES", ",".join(_DEFAULT_BACKEND_EXE_PREFIXES)
+        ).split(",")
+        if p.strip()
+    )
+    or _DEFAULT_BACKEND_EXE_PREFIXES
 )
 
 # Optional: a model-swap server's /running endpoint for cold-load tracking.

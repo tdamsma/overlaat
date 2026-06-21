@@ -8,6 +8,19 @@ versions without a compatibility guarantee.
 
 ## [Unreleased]
 
+## [0.0.5] — 2026-06-21
+
+### Changed
+- **`host_logger` backend prefixes are now env-configurable** (closes #14). The
+  `BACKEND_EXE_PREFIXES` list — executable-name prefixes that get a port-suffixed
+  name in the per-backend RSS breakdown — reads from the `BACKEND_EXE_PREFIXES`
+  environment variable (comma-separated), falling back to the previous hardcoded
+  default (`python,ollama,model-server,mlx_lm`). A deployment with a custom
+  inference binary (e.g. `ds4-server`) can now get its per-engine attribution
+  without patching installed package source. Matches the module's existing
+  env-config style (`TOTAL_MEM_GB`, `PSQL`, `SLOT_RUNNING_URL`); default behavior
+  is unchanged.
+
 ## [0.0.4] — 2026-06-20
 
 ### Added
@@ -176,7 +189,8 @@ version implements:
 - **Cost-weighted admission** is design-only (see `docs/COST-SCHEDULER.md`); the queue
   is plain per-model FIFO in this version.
 
-[Unreleased]: https://github.com/tdamsma/overlaat/compare/v0.0.4...HEAD
+[Unreleased]: https://github.com/tdamsma/overlaat/compare/v0.0.5...HEAD
+[0.0.5]: https://github.com/tdamsma/overlaat/releases/tag/v0.0.5
 [0.0.4]: https://github.com/tdamsma/overlaat/releases/tag/v0.0.4
 [0.0.3]: https://github.com/tdamsma/overlaat/releases/tag/v0.0.3
 [0.0.2]: https://github.com/tdamsma/overlaat/releases/tag/v0.0.2
