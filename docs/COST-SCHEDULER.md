@@ -132,6 +132,46 @@ is **no new env knob**. **The default is unchanged:** with every model in the
 single `default` pool, the per-pool arithmetic is identical to the previous single
 shared budget, so existing single-pool deployments behave exactly as before.
 
+### Prompt-size-weighted cost (closes #18)
+
+A flat `cost = 1/cap` charges a 50-token prompt and a 33k-token prompt the same,
+yet the huge prompt holds its slot far longer (and far more KV memory). Under FIFO
+a handful of heavy prompts then fill every slot for ~a minute and the small
+interactive calls behind them eat the queue wait. So the **cost is scaled by the
+prompt size**:
+
+```
+cost(req) = clamp_to_pool( cost(model) × weight(estimated_prompt_tokens) )
+```
+
+- **Estimate** is cheap and deliberately coarse — the request body's message /
+  prompt text length over ~4 chars-per-token (no tokenizer in the hot path). A body
+  with no measurable prompt (`/embeddings`, `/rerank`) gets `weight = 1×`.
+- **Weight** is a tier table, default `≤2k → 1×, 2k–8k → 2×, >8k → 4×`, overridable
+  with `OVERLAAT_PROMPT_WEIGHT_TIERS` (e.g. `2000:1,8000:2,inf:4`). Set every
+  multiplier to `1` to disable weighting — the exact pre-#18 behaviour.
+- **Clamp** is the load-bearing safety rail: a weighted cost above the pool budget
+  would make the request *un-admittable*, and as the eager-reserved head it would
+  then starve its whole pool forever. So the cost is hard-clamped per pool via
+  `heavy_max`:
+  - `leave_room` (**default**) caps at `B_pool − cost(model)`, so at least one more
+    base-cost run of that model always fits alongside even the heaviest prompt —
+    the interactive fast lane never fully closes.
+  - `full_pool` caps at `B_pool`, letting a giant prompt take the entire pool and
+    run strictly alone (the *batch-job* intent). Declared per pool:
+    ```yaml
+    overlaat:
+      pools:
+        default: { heavy_max: leave_room }   # default if omitted
+        batch:   { heavy_max: full_pool }
+    ```
+  The clamp never drops a cost below the model's base `cost(model)` (a cap-1 model,
+  whose base already is the whole budget, simply stays at `1.0`).
+
+The charged cost is logged as before in `request_events.cost`, so the weighting is
+auditable against the `prompt_tokens` the backend later reports. **The default is
+unchanged for small prompts** (≤2k tokens stay at `1×`); only heavy prompts move.
+
 ### No preemption — by physics, not by choice
 
 The scheduler **never preempts a running request.** Metal has no GPU preemption:

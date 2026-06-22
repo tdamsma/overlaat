@@ -70,6 +70,54 @@ async def test_default_cost_for_uncapped_model():
     assert s2.cost("nocap") == pytest.approx(0.5)
 
 
+# -- prompt-size-weighted cost (#18) ----------------------------------------
+
+
+async def test_weighted_cost_leave_room_default_clamps_below_pool():
+    # base 0.25 (cap 4), budget 1.0. leave_room (default) caps a weighted cost at
+    # budget - base = 0.75, so one more base-cost run always still fits.
+    s = Scheduler(budget=1.0, caps={"a": 4})
+    assert s.weighted_cost("a", 1.0) == pytest.approx(0.25)  # weight 1 -> no-op
+    assert s.weighted_cost("a", 2.0) == pytest.approx(0.5)  # 0.25*2, under cap
+    assert s.weighted_cost("a", 4.0) == pytest.approx(0.75)  # 0.25*4=1.0 -> clamp 0.75
+    assert s.weighted_cost("a", 99.0) == pytest.approx(0.75)  # never exceeds cap
+
+
+async def test_weighted_cost_full_pool_allows_whole_budget():
+    # full_pool lets a heavy prompt take the entire pool (serialize alone).
+    s = Scheduler(budget=1.0, caps={"a": 4}, pool_heavy_max={"default": "full_pool"})
+    assert s.weighted_cost("a", 4.0) == pytest.approx(1.0)
+    assert s.weighted_cost("a", 99.0) == pytest.approx(1.0)  # clamped to budget
+
+
+async def test_weighted_cost_never_below_base_for_tight_pool():
+    # cap 1 -> base 1.0 = whole budget; no room can be left, so the clamp must
+    # not drop below base (a 0-cost request would be nonsense).
+    s = Scheduler(budget=1.0, caps={"solo": 1})
+    assert s.weighted_cost("solo", 4.0) == pytest.approx(1.0)
+
+
+async def test_weighted_cost_leaves_room_for_one_light_call_end_to_end():
+    # The leave_room property under load: a heavy request (weight 4 -> cost 0.75)
+    # still admits one light base-cost call (0.25) alongside it (0.75+0.25=1.0),
+    # but a second heavy one does not fit (0.75+0.75 > 1.0).
+    s = Scheduler(budget=1.0, caps={"a": 4})
+    heavy1 = make_waiter(s, "a", req_id="heavy1")
+    heavy1.cost = s.weighted_cost("a", 4.0)  # 0.75
+    s.enqueue(heavy1)
+    assert admitted(heavy1)
+
+    light = make_waiter(s, "a", req_id="light")  # base cost 0.25
+    s.enqueue(light)
+    assert admitted(light)  # fits in the deliberately-left room
+    assert s.used == pytest.approx(1.0)
+
+    heavy2 = make_waiter(s, "a", req_id="heavy2")
+    heavy2.cost = s.weighted_cost("a", 4.0)  # 0.75
+    s.enqueue(heavy2)
+    assert not admitted(heavy2)  # 1.0 + 0.75 > budget -> waits
+
+
 async def test_admit_immediately_when_budget_free():
     s = Scheduler(budget=1.0, caps={"a": 4})
     w = make_waiter(s, "a")

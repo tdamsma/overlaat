@@ -8,6 +8,22 @@ versions without a compatibility guarantee.
 
 ## [Unreleased]
 
+### Added
+- **Prompt-size-weighted admission cost** (closes #18). Admission cost was a flat
+  `1/cap` per model, so a 50-token and a 33k-token prompt cost the same — and under
+  FIFO a few heavy prompts fill every slot and inflate queue wait for the small
+  interactive calls behind them. Cost is now `cost(model) × weight(prompt_tokens)`,
+  where the size is a cheap chars/≈4 estimate of the request body (no tokenizer in
+  the hot path; non-chat bodies like `/embeddings` get `1×`) and the weight is a
+  tier table (default `≤2k → 1×, 2k–8k → 2×, >8k → 4×`, override with
+  `OVERLAAT_PROMPT_WEIGHT_TIERS`). The weighted cost is **hard-clamped to the pool
+  budget** per a new per-pool `overlaat.pools.<pool>.heavy_max`: `leave_room`
+  (default — caps at `budget − base_cost` so one light call always fits alongside
+  the heaviest prompt) or `full_pool` (a giant prompt may take the whole pool and
+  run alone). The charged cost is logged in `request_events.cost` as before — no
+  schema change. **Default behaviour is unchanged for prompts ≤2k tokens** (`1×`);
+  set every multiplier to `1` to disable weighting entirely.
+
 ### Fixed
 - **`request_events.wait_reason` no longer mislabels cap/exclusion waits as
   `budget_full`** (closes #17). The reason was finalized at admission by

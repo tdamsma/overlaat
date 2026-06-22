@@ -134,6 +134,7 @@ class Scheduler:
         pool_of: dict[str, str] | None = None,
         pool_budget: dict[str, float] | None = None,
         pool_exclusive: set[str] | None = None,
+        pool_heavy_max: dict[str, str] | None = None,
         default_cost: float = DEFAULT_COST,
         default_priority: int = DEFAULT_PRIORITY,
         aging_rate: float = DEFAULT_AGING_RATE,
@@ -155,6 +156,12 @@ class Scheduler:
             mutex where at most one DISTINCT member id is active at a time. The
             resident member's own cap + the pool budget govern how many of its
             streams run concurrently.
+        :param pool_heavy_max: pool name -> how much of the pool budget a single
+            prompt-size-weighted request may consume: ``"full_pool"`` (up to the
+            whole budget, so a heavy prompt can serialize behind everything) or
+            ``"leave_room"`` (capped at ``budget - base_cost`` so at least one
+            more base-cost run of that model always fits). A pool absent here
+            defaults to ``"leave_room"``. Only consulted by :meth:`weighted_cost`.
         :param default_cost: cost for a model with no declared cap and no
             override (``OVERLAAT_DEFAULT_COST``); default 1.0.
         :param default_priority: priority used when neither the request nor the
@@ -173,6 +180,7 @@ class Scheduler:
         self._pool_of: dict[str, str] = dict(pool_of or {})
         self._pool_budget: dict[str, float] = {p: float(b) for p, b in (pool_budget or {}).items()}
         self._pool_exclusive: set[str] = set(pool_exclusive or set())
+        self._pool_heavy_max: dict[str, str] = dict(pool_heavy_max or {})
         self.default_cost = float(default_cost)
         self.default_priority = int(default_priority)
         self.aging_rate = float(aging_rate)
@@ -271,6 +279,35 @@ class Scheduler:
         if cap and cap > 0:
             return 1.0 / cap
         return self.default_cost
+
+    def weighted_cost(self, model: str, weight: float = 1.0) -> float:
+        """Prompt-size-weighted cost, hard-clamped to the model's pool budget.
+
+        Base cost (``cost(model)``) is multiplied by ``weight`` (>= 1.0; a
+        bigger prompt costs more, so heavy requests consume more of the pool and
+        fewer run concurrently — protecting the fast lane, #18). The result is
+        clamped so a single request can NEVER exceed what its pool can admit:
+        a cost above the pool budget would make the request un-admittable and,
+        as the eager-reserved head, would starve its whole pool. The clamp mode
+        is per-pool (``pool_heavy_max``):
+
+        - ``"leave_room"`` (default): cap at ``budget - base`` so at least one
+          more base-cost run of ``model`` always fits alongside the heavy one.
+        - ``"full_pool"``: cap at ``budget`` (minus an epsilon) so a heavy prompt
+          may take the entire pool and run strictly alone (batch-job intent).
+
+        Never returns below the base cost (``weight <= 1`` is a no-op), and never
+        below it even when ``budget - base`` would be smaller (e.g. a cap-1
+        model, where no room can be left regardless).
+        """
+        base = self.cost(model)
+        if weight <= 1.0:
+            return base
+        p = self.pool(model)
+        b = self.budget(p)
+        mode = self._pool_heavy_max.get(p, "leave_room")
+        ceiling = (b - EPS) if mode == "full_pool" else (b - base)
+        return max(base, min(base * weight, ceiling))
 
     # -- priority / aging --------------------------------------------------
 
