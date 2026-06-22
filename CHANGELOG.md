@@ -8,6 +8,8 @@ versions without a compatibility guarantee.
 
 ## [Unreleased]
 
+## [0.0.6] — 2026-06-22
+
 ### Added
 - **Per-request workload label for segmented observability** (closes #19). A single
   consumer key often serves workloads with opposite SLAs (e.g. low-priority
@@ -235,7 +237,8 @@ version implements:
 - **Cost-weighted admission** is design-only (see `docs/COST-SCHEDULER.md`); the queue
   is plain per-model FIFO in this version.
 
-[Unreleased]: https://github.com/tdamsma/overlaat/compare/v0.0.5...HEAD
+[Unreleased]: https://github.com/tdamsma/overlaat/compare/v0.0.6...HEAD
+[0.0.6]: https://github.com/tdamsma/overlaat/releases/tag/v0.0.6
 [0.0.5]: https://github.com/tdamsma/overlaat/releases/tag/v0.0.5
 [0.0.4]: https://github.com/tdamsma/overlaat/releases/tag/v0.0.4
 [0.0.3]: https://github.com/tdamsma/overlaat/releases/tag/v0.0.3
