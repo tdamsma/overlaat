@@ -8,6 +8,41 @@ versions without a compatibility guarantee.
 
 ## [Unreleased]
 
+## [0.0.8] — 2026-06-22
+
+Usage-dashboard redesign. Observability/UI only — no scheduler, proxy, or schema changes.
+
+### Added
+- **Recent-requests table** + `GET /requests` — a searchable / sortable / filterable
+  view of the last *N* finished requests (default 100, max 500), one row each with
+  consumer, model, workload, outcome, the queue-wait / ttft / service / total latency
+  split, prompt & completion tokens, and decode tok/s.
+- **Queued-now-by-user card** — live in-memory queue state grouped per consumer, showing
+  each waiting request's model, age, priority, and *why* it is parked
+  (`model_cap` / `budget_full` / `exclusive`). `/now` now surfaces the per-waiter
+  consumer attribution and `wait_reason` the scheduler already computed.
+- **Server-health verdict** — a synthesized OK / degraded / stalled read with the worst
+  contributing signal (GPU, slots-held-but-idle stall, queue backlog, per-model
+  decode-tok/s drift).
+- **Shared-axis time-chart stack** — the time-series charts share one x-axis with a hover
+  crosshair that reads every series at the same instant.
+
+### Changed
+- **Dashboard charts are now time-weighted and step-rendered.** Per-call quantities are
+  spread across the service window `[t_acquire, t_done]` and aggregated per bucket (the
+  same interval math as the concurrency curves) instead of being point-sampled at
+  `t_done` — fixing the sparse-dots throughput plot and the jerky long-window
+  aggregation. New charts: input-vs-output tok/s, output tok/s stacked by model, and
+  work (GPU-busy share) stacked by consumer.
+- **Three-column dashboard layout** — detail tables (left), stacked shared-axis time
+  charts (middle), at-a-glance health + attribution (right).
+- The solo decode-throughput health signal and median output-size moved from sparse trend
+  charts into per-model table columns.
+
+### Removed
+- `GET /perf` and the standalone decode-throughput / output-size trend charts (superseded
+  by the per-model table columns and the new throughput charts).
+
 ## [0.0.7] — 2026-06-22
 
 ### Added
@@ -292,7 +327,8 @@ version implements:
 - **Cost-weighted admission** is design-only (see `docs/COST-SCHEDULER.md`); the queue
   is plain per-model FIFO in this version.
 
-[Unreleased]: https://github.com/tdamsma/overlaat/compare/v0.0.7...HEAD
+[Unreleased]: https://github.com/tdamsma/overlaat/compare/v0.0.8...HEAD
+[0.0.8]: https://github.com/tdamsma/overlaat/releases/tag/v0.0.8
 [0.0.7]: https://github.com/tdamsma/overlaat/releases/tag/v0.0.7
 [0.0.6]: https://github.com/tdamsma/overlaat/releases/tag/v0.0.6
 [0.0.5]: https://github.com/tdamsma/overlaat/releases/tag/v0.0.5
