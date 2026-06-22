@@ -101,6 +101,14 @@ class Waiter:
     # arrival), so a subsequent work-conserving packing admission is not
     # mislabeled "reserved".
     _was_reserved: bool = False
+    # Live wait cause latched by ``_record_wait_reasons`` while this waiter is
+    # parked: one of "model_cap" / "exclusive" / "budget_full". Read back at
+    # admission instead of recomputing the blocker — by admission the cap slot is
+    # free and/or the exclusion mutex has handed off (that is *why* the waiter is
+    # being admitted), so a fresh ``_cap_full`` / ``_exclusion_blocks`` check
+    # there is always False and would misattribute every cap/exclusion wait to
+    # "budget_full" (#17). None until the waiter first waits.
+    _wait_cause: str | None = None
 
 
 def _new_future() -> asyncio.Future:
@@ -500,24 +508,29 @@ class Scheduler:
     # -- wait-reason bookkeeping ------------------------------------------
 
     def _reason_for(self, w: Waiter, now: float) -> str:
-        """Classify why ``w`` waited, evaluated at admission time.
+        """Classify why ``w`` waited, finalized at admission time.
 
         Attribution order: reserved > aged_in > model_cap > exclusive > budget_full.
+
+        ``reserved`` and ``aged_in`` are derived from state that survives to
+        admission (the ``_was_reserved`` latch and the priority/clock). The cap
+        and exclusion blockers do NOT survive — they have necessarily cleared by
+        the time ``w`` is admitted — so this returns the cause ``w`` was last
+        observed waiting on (latched in :meth:`_record_wait_reasons`) rather than
+        recomputing it post-clearance (#17).
         """
         if not w._waited:
             return "none"
         if w._was_reserved:
             return "reserved"
-        # It waited. Decide between aging, cap, exclusion, or budget.
+        # It waited. Aging is still observable at admission; cap/exclusion are
+        # not, so fall back to the latched live cause (defaulting to budget_full,
+        # which a waited waiter always has unless cap/exclusion latched first).
         clamped = min(float(w.base_priority), self._ceiling(w.key_fp))
         aged = self.effective_priority(w, now) - clamped
         if self.aging_rate > 0.0 and aged > 0.0:
             return "aged_in"
-        if self._cap_full(w):
-            return "model_cap"
-        if self._exclusion_blocks(w):
-            return "exclusive"
-        return "budget_full"
+        return w._wait_cause or "budget_full"
 
     def _record_wait_reasons(self, now: float) -> None:
         """Tag every still-waiting waiter as having waited, with a live reason.
@@ -525,6 +538,11 @@ class Scheduler:
         Attribution order mirrors :meth:`_reason_for`:
         reserved > model_cap > exclusive > budget_full (aging is reflected in the
         order, not labeled here — the admission classifier owns ``aged_in``).
+
+        The cap/exclusion/budget classification is also latched onto
+        ``w._wait_cause`` so :meth:`_reason_for` can recover it at admission,
+        after the blocker has cleared (#17). The ``reserved`` head is latched via
+        ``_was_reserved`` instead, so it is left out of ``_wait_cause`` here.
         """
         for w in self.waiters:
             w._waited = True
@@ -533,11 +551,11 @@ class Scheduler:
                 w.wait_reason = "reserved"
                 continue
             if self._cap_full(w):
-                w.wait_reason = "model_cap"
+                w.wait_reason = w._wait_cause = "model_cap"
             elif self._exclusion_blocks(w):
-                w.wait_reason = "exclusive"
+                w.wait_reason = w._wait_cause = "exclusive"
             else:
-                w.wait_reason = "budget_full"
+                w.wait_reason = w._wait_cause = "budget_full"
 
     # -- introspection (for /__queue/status and tests) --------------------
 
