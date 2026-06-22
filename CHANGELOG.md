@@ -9,6 +9,23 @@ versions without a compatibility guarantee.
 ## [Unreleased]
 
 ### Added
+- **Per-request workload label for segmented observability** (closes #19). A single
+  consumer key often serves workloads with opposite SLAs (e.g. low-priority
+  huge-doc summaries vs latency-critical small-prompt synthesis), but `key_fp` was
+  the finest granularity logged, so they could not be reported apart. A new nullable
+  `request_events.workload TEXT` column records a caller-supplied label, resolved per
+  request from the `X-Overlaat-Workload` header (wins) or the body's
+  `metadata.workload` field (fallback), sanitized to a non-empty string trimmed to
+  64 chars (anything else → `NULL`). Both inputs are stripped before forwarding (the
+  header is dropped hop-by-hop; only the `metadata.workload` sub-key is popped, the
+  rest of `metadata` is left intact) so this overlaat-private input never reaches the
+  backend. The usage-api gains a `GET /workloads` endpoint and a dashboard card with
+  a per-workload breakdown (requests, p50/p95 queue wait + total latency, completion
+  tokens, abandoned/error rate; untagged traffic groups under `(untagged)`). Existing
+  databases upgrade idempotently via `ALTER TABLE request_events ADD COLUMN IF NOT
+  EXISTS workload TEXT` (sqlite mirrors this by diffing `PRAGMA table_info`).
+  **Observability only — the label is logged and displayed but never read by the
+  scheduler; cost, priority, pool, and admission are unchanged.**
 - **Prompt-size-weighted admission cost** (closes #18). Admission cost was a flat
   `1/cap` per model, so a 50-token and a 33k-token prompt cost the same — and under
   FIFO a few heavy prompts fill every slot and inflate queue wait for the small

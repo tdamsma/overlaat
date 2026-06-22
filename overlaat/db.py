@@ -214,7 +214,8 @@ CREATE TABLE IF NOT EXISTS request_events (
   priority          INTEGER,
   cost              DOUBLE PRECISION,
   wait_reason       TEXT,
-  pool              TEXT
+  pool              TEXT,
+  workload          TEXT
 );
 CREATE INDEX IF NOT EXISTS ix_re_tenq    ON request_events (t_enqueue);
 CREATE INDEX IF NOT EXISTS ix_re_tdone   ON request_events (t_done);
@@ -258,6 +259,17 @@ def _schema_sql_path() -> Path:
     return Path("schema.sql")
 
 
+def _sqlite_add_missing_columns(conn: sqlite3.Connection) -> None:
+    """Idempotent column upgrades for an existing request_events table. SQLite's
+    ALTER TABLE has no `ADD COLUMN IF NOT EXISTS`, so we diff against
+    `PRAGMA table_info` and add only the columns that postdate the CREATE — the
+    sqlite mirror of schema.sql's guarded `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`."""
+    have = {row[1] for row in conn.execute("PRAGMA table_info(request_events)")}
+    for col, decl in (("workload", "TEXT"),):
+        if col not in have:
+            conn.execute(f"ALTER TABLE request_events ADD COLUMN {col} {decl}")
+
+
 def init_db(url: str) -> str:
     """Idempotently create the schema for whichever backend the URL names.
     Returns a one-line description of what was done."""
@@ -266,6 +278,7 @@ def init_db(url: str) -> str:
         conn = connect_sqlite_write(url)
         try:
             conn.executescript(_SQLITE_DDL)
+            _sqlite_add_missing_columns(conn)
             conn.commit()
         finally:
             conn.close()

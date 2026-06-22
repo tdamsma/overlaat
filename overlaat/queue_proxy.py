@@ -165,6 +165,7 @@ _EVENT_COLS = (
     "cost",
     "wait_reason",
     "pool",
+    "workload",
 )
 # Postgres uses psycopg named params (the writer feeds dict rows via executemany);
 # SQLite uses positional `?` params (rows projected to a tuple in _EVENT_COLS order).
@@ -172,18 +173,18 @@ _INSERT_SQL_PG = (
     "INSERT INTO request_events "
     "(t_enqueue, t_acquire, t_first_token, t_done, model_requested, key_fp, "
     " streamed, outcome, http_status, prompt_tokens, completion_tokens, overlaat_version, "
-    " priority, cost, wait_reason, pool) "
+    " priority, cost, wait_reason, pool, workload) "
     "VALUES (%(t_enqueue)s, %(t_acquire)s, %(t_first_token)s, %(t_done)s, "
     "%(model_requested)s, %(key_fp)s, %(streamed)s, %(outcome)s, "
     "%(http_status)s, %(prompt_tokens)s, %(completion_tokens)s, %(overlaat_version)s, "
-    "%(priority)s, %(cost)s, %(wait_reason)s, %(pool)s)"
+    "%(priority)s, %(cost)s, %(wait_reason)s, %(pool)s, %(workload)s)"
 )
 _INSERT_SQL_SQLITE = (
     "INSERT INTO request_events "
     "(t_enqueue, t_acquire, t_first_token, t_done, model_requested, key_fp, "
     " streamed, outcome, http_status, prompt_tokens, completion_tokens, overlaat_version, "
-    " priority, cost, wait_reason, pool) "
-    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    " priority, cost, wait_reason, pool, workload) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
 # Back-compat alias: the Postgres statement remains the module-level default.
 _INSERT_SQL = _INSERT_SQL_PG
@@ -544,6 +545,41 @@ def _key_fp(request: Request) -> str:
     return hashlib.sha256(tok.encode()).hexdigest()[:8]
 
 
+# Per-request workload label (#19): a caller-chosen tag (e.g. "scout" vs
+# "synthesis") that segments otherwise-identical key_fp traffic in the dashboard.
+# OBSERVABILITY ONLY — it is logged and displayed, never read by the scheduler.
+WORKLOAD_HEADER = "x-overlaat-workload"  # lowercased; also in the request-strip set
+_WORKLOAD_MAXLEN = 64  # bound the label cardinality (keys, indexes, dashboard rows)
+
+
+def sanitize_workload(value: object) -> str | None:
+    """Normalize a caller-supplied workload label: a non-empty string, stripped
+    and truncated to 64 chars. Anything else (missing, non-string, empty after
+    strip) → None. Pure — bounds cardinality before the value ever touches a row."""
+    if not isinstance(value, str):
+        return None
+    v = value.strip()
+    if not v:
+        return None
+    return v[:_WORKLOAD_MAXLEN]
+
+
+def resolve_workload(header_value: object, payload: dict) -> tuple[str | None, bool]:
+    """Resolve the request workload (header wins, body `metadata.workload` is the
+    fallback) and strip the body sub-key so it never reaches the backend. Mutates
+    `payload` in place, popping only `metadata.workload` (the rest of `metadata`
+    stays, an emptied `{}` stays `{}`). Returns ``(workload, body_changed)`` where
+    `body_changed` is True iff the sub-key was popped → the caller must re-serialize."""
+    workload = sanitize_workload(header_value)
+    md = payload.get("metadata")
+    if isinstance(md, dict) and "workload" in md:
+        body_workload = sanitize_workload(md.pop("workload"))
+        if workload is None:
+            workload = body_workload
+        return workload, True
+    return workload, False
+
+
 # ── event emission (non-blocking) ────────────────────────────────────────────
 
 
@@ -885,7 +921,7 @@ async def cancel_one(req_id: str):
     )
 
 
-_HOP_HEADERS_REQ = {"host", "content-length"}
+_HOP_HEADERS_REQ = {"host", "content-length", WORKLOAD_HEADER}
 _HOP_HEADERS_RESP = {"content-encoding", "transfer-encoding", "content-length", "connection"}
 
 
@@ -1012,6 +1048,11 @@ async def proxy(full_path: str, request: Request):
 
     requested_priority: int | None = None
     prompt_tokens_est = 0
+    # Workload label (#19): header wins over the body `metadata.workload` fallback,
+    # which is stripped before forwarding so this overlaat-private input never
+    # reaches the backend. The header is dropped upstream via _HOP_HEADERS_REQ.
+    # Observability only — never read by the scheduler.
+    workload = sanitize_workload(request.headers.get(WORKLOAD_HEADER))
     if is_llm and body:
         try:
             payload = json.loads(body)
@@ -1024,6 +1065,9 @@ async def proxy(full_path: str, request: Request):
             if isinstance(p, int) and not isinstance(p, bool):
                 requested_priority = p
             prompt_tokens_est = estimate_prompt_tokens(payload)
+            workload, body_changed = resolve_workload(request.headers.get(WORKLOAD_HEADER), payload)
+            if body_changed:
+                body = json.dumps(payload).encode()
             # Force include_usage so the usage chunk arrives in the stream → we
             # get reliable token counts without relying on the backend default.
             if streamed and path == "/v1/chat/completions":
@@ -1039,7 +1083,9 @@ async def proxy(full_path: str, request: Request):
 
     # Event skeleton (only for real LLM calls that carry a model). The scheduler
     # columns (priority/cost/wait_reason/pool) default to None — they stay NULL
-    # for the no-cap pass-through and for the entire scheduler-OFF path.
+    # for the no-cap pass-through and for the entire scheduler-OFF path. `workload`
+    # is resolved once here so it flows through every emit path (admit / off /
+    # cancelled) via this shared dict.
     ev: dict | None = None
     if is_llm and model is not None:
         ev = {
@@ -1054,6 +1100,7 @@ async def proxy(full_path: str, request: Request):
             "cost": None,
             "wait_reason": None,
             "pool": None,
+            "workload": workload,
         }
 
     if SCHEDULER_ON and model is not None and SCHED is not None:

@@ -28,8 +28,13 @@ CREATE TABLE IF NOT EXISTS request_events (
   priority          INTEGER,                      -- effective base priority used at admission (cost-scheduler); NULL = scheduler off / pre-upgrade
   cost              DOUBLE PRECISION,             -- pool-fraction cost charged for this run (1/cap by default); NULL = scheduler off / no cap
   wait_reason       TEXT,                         -- why the request waited: none|reserved|aged_in|budget_full|model_cap|exclusive; NULL = scheduler off
-  pool              TEXT                          -- resource pool the request was admitted against (default "default"); NULL = scheduler off / pre-upgrade
+  pool              TEXT,                         -- resource pool the request was admitted against (default "default"); NULL = scheduler off / pre-upgrade
+  workload          TEXT                          -- caller-supplied workload label (observability only; never affects scheduling); NULL = untagged / pre-upgrade
 );
+-- Idempotent upgrade for tables that predate a column. CREATE TABLE IF NOT EXISTS
+-- never alters an existing table, so a column added after the table first shipped
+-- needs its own guarded ALTER to reach already-deployed databases.
+ALTER TABLE request_events ADD COLUMN IF NOT EXISTS workload TEXT;
 CREATE INDEX IF NOT EXISTS ix_re_tenq    ON request_events (t_enqueue);
 CREATE INDEX IF NOT EXISTS ix_re_tdone   ON request_events (t_done);
 CREATE INDEX IF NOT EXISTS ix_re_model   ON request_events (model_requested, t_enqueue);

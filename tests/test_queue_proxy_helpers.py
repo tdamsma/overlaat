@@ -119,3 +119,50 @@ def test_load_pool_heavy_max(tmp_path):
     hm = qp.load_pool_heavy_max(cfg)
     assert hm == {"default": "leave_room", "batch": "full_pool"}
     assert qp.load_pool_heavy_max(tmp_path / "nope.yaml") == {}
+
+
+# -- per-request workload label (#19) ----------------------------------------
+
+
+def test_sanitize_workload():
+    assert qp.sanitize_workload("scout") == "scout"
+    assert qp.sanitize_workload("  synthesis  ") == "synthesis"  # trimmed
+    assert qp.sanitize_workload("x" * 100) == "x" * 64  # truncated to 64
+    # Non-string / empty / None → None (bounds cardinality).
+    assert qp.sanitize_workload("") is None
+    assert qp.sanitize_workload("   ") is None
+    assert qp.sanitize_workload(None) is None
+    assert qp.sanitize_workload(123) is None
+    assert qp.sanitize_workload({"workload": "x"}) is None
+
+
+def test_resolve_workload_header_wins():
+    payload = {"metadata": {"workload": "scout"}}
+    wl, changed = qp.resolve_workload("synthesis", payload)
+    assert wl == "synthesis"  # header wins over body
+    assert changed is True  # body sub-key still stripped
+    assert "workload" not in payload["metadata"]
+
+
+def test_resolve_workload_body_fallback():
+    payload = {"metadata": {"workload": "scout", "trace": "abc"}}
+    wl, changed = qp.resolve_workload(None, payload)
+    assert wl == "scout"  # body fallback when no header
+    assert changed is True
+    # Other metadata keys survive; an emptied metadata stays {}.
+    assert payload["metadata"] == {"trace": "abc"}
+
+
+def test_resolve_workload_strips_only_workload_subkey():
+    payload = {"metadata": {"workload": "scout"}, "model": "m"}
+    wl, changed = qp.resolve_workload(None, payload)
+    assert wl == "scout"
+    assert payload["metadata"] == {}  # emptied dict stays {}
+    assert payload["model"] == "m"  # rest of body untouched
+
+
+def test_resolve_workload_neither():
+    payload = {"messages": []}
+    wl, changed = qp.resolve_workload(None, payload)
+    assert wl is None
+    assert changed is False  # no body mutation → no re-serialize

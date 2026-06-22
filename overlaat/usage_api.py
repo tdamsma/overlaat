@@ -15,6 +15,7 @@ Endpoints, each defined by the question it answers:
   GET /models        capacity: outcome counts, latency split, throughput-by-concurrency
   GET /perf          decode-throughput trend per model (server-health monitoring)
   GET /consumers     per key_alias: requests, tokens, service-seconds, abandoned rate
+  GET /workloads     per workload label: requests, latency p50/p95, tokens, error rate
   GET /healthz
 
 Live in-flight comes from the queue's in-memory state (its /__queue/status
@@ -265,6 +266,14 @@ def consumers(last: str = Query("24h")):
     return {"_meta": _meta("consumers", 30), "window": {"last": last}, "consumers": rows}
 
 
+@app.get("/workloads")
+def workloads(last: str = Query("24h")):
+    win = parse_window(last)
+    now_ts = time.time()
+    rows = metrics_db.build_workloads(DB, now_ts - win, now_ts)
+    return {"_meta": _meta("workloads", 30), "window": {"last": last}, "workloads": rows}
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
     # Single-sourced from overlaat.__version__ (the running version), substituted
@@ -388,6 +397,14 @@ footer{color:var(--dim);font-size:11px;text-align:center;padding:14px}
       <th>key</th><th class="num">req</th><th class="num">ok</th><th class="num">aband</th>
       <th class="num">aband %</th><th class="num">err</th>
       <th class="num">prompt tok</th><th class="num">compl tok</th><th class="num">service s</th><th>models</th>
+    </tr></thead><tbody></tbody></table>
+  </div>
+  <div class="card span12">
+    <h2>workloads</h2>
+    <table id="workloads"><thead><tr>
+      <th>workload</th><th class="num">req</th><th class="num">ok</th><th class="num">aband %</th>
+      <th class="num">err %</th><th class="num">qwait p50</th><th class="num">qwait p95</th>
+      <th class="num">total p50</th><th class="num">total p95</th><th class="num">compl tok</th>
     </tr></thead><tbody></tbody></table>
   </div>
 </main>
@@ -560,12 +577,27 @@ function renderConsumers(d){
   }).join('')||'<tr><td colspan="10" class="dim">no calls</td></tr>';
 }
 
+function renderWorkloads(d){
+  const tb=$('#workloads tbody');
+  tb.innerHTML=(d.workloads||[]).map(w=>{
+    const l=w.latency_ms||{};
+    return `<tr>
+      <td>${w.workload}</td><td class="num">${w.requests}</td>
+      <td class="num ok">${w.completed}</td>
+      <td class="num ${w.abandoned_rate>0.1?'hot':'dim'}">${(w.abandoned_rate*100).toFixed(0)}%</td>
+      <td class="num ${w.error_rate>0?'warn':'dim'}">${(w.error_rate*100).toFixed(0)}%</td>
+      <td class="num">${ms(l.queue_wait_p50)}</td><td class="num">${ms(l.queue_wait_p95)}</td>
+      <td class="num">${ms(l.total_p50)}</td><td class="num">${ms(l.total_p95)}</td>
+      <td class="num">${fmt(w.completion_tokens)}</td></tr>`;
+  }).join('')||'<tr><td colspan="10" class="dim">no calls</td></tr>';
+}
+
 async function refresh(){
   const w=$('#window').value;
   try{
-    const [now,tl,mdl,cons,pf]=await Promise.all([
-      J('/now'),J('/timeline?last='+w),J('/models?last='+w),J('/consumers?last='+w),J('/perf?last='+w)]);
-    renderNow(now);renderHost(tl);renderConc(tl);renderModels(mdl);renderConsumers(cons);renderPerf(pf);renderTok(pf);
+    const [now,tl,mdl,cons,wl,pf]=await Promise.all([
+      J('/now'),J('/timeline?last='+w),J('/models?last='+w),J('/consumers?last='+w),J('/workloads?last='+w),J('/perf?last='+w)]);
+    renderNow(now);renderHost(tl);renderConc(tl);renderModels(mdl);renderConsumers(cons);renderWorkloads(wl);renderPerf(pf);renderTok(pf);
     $('#footer').textContent='updated '+new Date().toLocaleTimeString()+' · window '+w+' · bucket '+tl.window.bucket_s+'s';
   }catch(e){$('#footer').innerHTML='<span class="err">'+e+'</span>';}
 }
