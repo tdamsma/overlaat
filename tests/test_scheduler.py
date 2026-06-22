@@ -877,3 +877,43 @@ async def test_inert_config_starves_fast_lane_demonstrates_incident():
     # On the inert config, the only relief is a heavy finishing (no budget lever).
     s.release("m")
     assert admitted(light)
+
+
+async def test_release_refunds_exact_charged_cost_not_a_per_model_guess():
+    # Regression (#24 review): release() must refund the ACTUAL cost the completing
+    # run was charged, threaded by the caller — not a per-model guess (the original
+    # fix used a LIFO stack, which mis-refunds under heavy+light interleaving). A
+    # LIGHT run admitted BEFORE a HEAVY run, finishing FIRST, must refund only its
+    # own 0.25 — leaving the heavy's 0.75 committed — or a second heavy would
+    # wrongly co-admit (1.5 > budget), breaking the leave_room guarantee.
+    s = Scheduler(budget=1.0, caps={"m": 4})  # base 0.25
+
+    light = make_waiter(s, "m", req_id="light")  # cost 0.25
+    s.enqueue(light)
+    assert admitted(light)
+
+    heavy = make_waiter(s, "m", req_id="heavy")
+    heavy.cost = s.weighted_cost("m", 4.0)  # 0.75 (leave_room)
+    s.enqueue(heavy)
+    assert admitted(heavy)
+    assert s.used == pytest.approx(1.0)  # 0.25 + 0.75
+
+    # The light run finishes first. Refunding the wrong amount (e.g. the heavy's
+    # 0.75 a LIFO pop would take, or a base 0.25-for-heavy elsewhere) would corrupt
+    # `used`; the exact threaded refund leaves the heavy's 0.75 committed.
+    s.release("m", cost=light.cost)
+    assert s.used == pytest.approx(0.75)
+    assert s.in_flight["m"] == 1  # the heavy is still running
+
+    # A second heavy must NOT be admitted: 0.75 + 0.75 > 1.0. (With a wrong refund
+    # `used` would read 0.25 here and this would wrongly admit — two heavies in the
+    # pool at once, the exact thing leave_room forbids.)
+    heavy2 = make_waiter(s, "m", req_id="heavy2")
+    heavy2.cost = s.weighted_cost("m", 4.0)  # 0.75
+    s.enqueue(heavy2)
+    assert not admitted(heavy2)
+
+    # The heavy finishes; refund its exact 0.75; now heavy2 (the reserved head) fits.
+    s.release("m", cost=heavy.cost)
+    assert admitted(heavy2)
+    assert s.used == pytest.approx(0.75)

@@ -812,7 +812,7 @@ async def test_oversized_prompt_does_not_starve_fast_lane(monkeypatch, isolate_s
     assert [code for _, code in results] == [200, 200, 200]
     assert await _wait_for(lambda: qp.METRICS["m"]["queue_depth"] == 0)
     assert qp.METRICS["m"]["in_flight"] == 0
-    assert sched.used == 0.0
+    assert await _wait_for(lambda: abs(sched.used) < 1e-9)  # budget exactly refunded
     await qp.app.state.client.aclose()
 
 

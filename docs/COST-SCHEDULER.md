@@ -216,18 +216,26 @@ and a binding budget without weighting charges a 50-token and a 33k-token prompt
 the same. **Both** are required for self-protection, and both ship on by default —
 so a fresh deploy is protected without setting a single env var.
 
-**The startup warning (inert detection).** The dangerous misconfiguration is to
-turn the protection *off* without realizing it: flat tiers (every multiplier `1.0`)
-**and** a pool budget that can never bind given its caps (the incident config:
-`OVERLAAT_BUDGET=9999` + flat tiers). In that state only the raw per-model cap
-binds, so a handful of oversized prefills pin every slot and the fast lane starves.
-The proxy detects this at startup and writes a loud `stderr` warning naming the
-inert pool(s) and the consequence, with the remediation: set
+**The startup warning (inert detection).** Because Layers 1 and 2 are
+co-dependent, the protection is inert if **either** is missing — the condition is
+`flat OR unbounded`, not `flat AND unbounded`:
+
+- **Flat tiers** (every multiplier `1.0`): an oversized prompt costs the same as a
+  tiny one, so no fast-lane slot is reserved in *any* pool, whatever the budget.
+- **An effectively-unbounded pool budget**: so large, given the per-model caps, that
+  the admit test can never fail even at the heaviest weighting — only the raw
+  per-model cap binds. This is the *live* incident config (`OVERLAAT_BUDGET=9999`
+  with the **default non-flat tiers**): the non-flat default does **not** rescue it,
+  which is exactly why the check runs regardless of tier shape.
+
+In either state a handful of oversized prefills pin every slot and the fast lane
+starves. The proxy detects this at startup and writes a loud `stderr` warning naming
+the failing condition(s) and the inert pool(s), with the remediation: set
 `OVERLAAT_PROMPT_WEIGHT_TIERS` to a non-flat table (e.g. `2000:1,8000:2,inf:4`)
-and/or lower `OVERLAAT_BUDGET` so the pool budget binds. (A pool whose budget can
-actually bind — or that has an uncapped member, where unbounded in-flight can reach
-`B` — is **not** flagged, even with flat tiers; weighting is the only-thing-missing
-case, but the budget can still throttle by count.)
+and/or lower `OVERLAAT_BUDGET` so the pool budget binds. (A pool budget is judged
+"unbounded" only when every member has a finite cap and `sum(cap × cost × max_mult)
+≤ B`; an uncapped member keeps the budget bindable, so that pool is flagged only
+when the tiers are flat.)
 
 **The ENGINE CONTRACT (#1 — operator deployment, NOT Overlaat code).** Token-level
 prefill cost and true total wall-clock are only visible *inside* the inference

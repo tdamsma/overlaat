@@ -173,9 +173,44 @@ def test_resolve_workload_neither():
 
 def test_self_protection_inert_detector():
     flat = ((float("inf"), 1.0),)
+    nonflat = qp._DEFAULT_WEIGHT_TIERS  # (2000:1, 8000:2, inf:4)
 
-    # Flat tiers + an effectively-unbounded budget → the per-model cap is the only
-    # binder (the incident config): INERT.
+    # 1. Non-flat tiers + a BOUNDED budget that binds for heavy prompts (the
+    #    default deploy: one cap-4 model, budget 1.0; committed 4*0.25*4 = 4.0 > 1.0
+    #    so the budget throttles heavy prompts) → self-protection ACTIVE: NOT
+    #    flagged. (Guards the acceptance criterion: a default deploy is protected.)
+    assert (
+        qp.warn_if_self_protection_inert(
+            caps={"m": 4},
+            costs={},
+            pool_of={},
+            pool_budget={},
+            default_budget=1.0,
+            tiers=nonflat,
+            log=False,
+        )
+        == []
+    )
+
+    # 2. Non-flat tiers + an effectively-UNBOUNDED budget (the LIVE-BOX config:
+    #    OVERLAAT_BUDGET=9999 with the default non-flat tiers). 4*0.25*4 = 4.0 ≪
+    #    9999, so only the per-model cap binds — identical to the incident. The
+    #    non-flat default does NOT save it: INERT. (Regression for the dropped
+    #    `if not flat: return []` short-circuit that used to miss this.)
+    assert (
+        qp.warn_if_self_protection_inert(
+            caps={"m": 4},
+            costs={},
+            pool_of={},
+            pool_budget={},
+            default_budget=9999.0,
+            tiers=nonflat,
+            log=False,
+        )
+        == ["default"]
+    )
+
+    # 3. Flat tiers + an unbounded budget (the original incident config): INERT.
     assert (
         qp.warn_if_self_protection_inert(
             caps={"m": 4},
@@ -189,23 +224,9 @@ def test_self_protection_inert_detector():
         == ["default"]
     )
 
-    # Non-flat tiers price heavy prompts up → self-protection is ACTIVE even with
-    # the same unbounded budget.
-    assert (
-        qp.warn_if_self_protection_inert(
-            caps={"m": 4},
-            costs={},
-            pool_of={},
-            pool_budget={},
-            default_budget=9999.0,
-            tiers=qp._DEFAULT_WEIGHT_TIERS,
-            log=False,
-        )
-        == []
-    )
-
-    # Flat tiers but a budget that BINDS (committed 2.0 across two cap-4 models at
-    # cost 0.25 → max used 2.0 > budget 1.0) → the budget can throttle: NOT inert.
+    # 4. Flat tiers even with a BOUNDED budget that binds cross-model (two cap-4
+    #    models, budget 1.0): a giant prompt still costs the same as a tiny one, so
+    #    no fast-lane slot is reserved → INERT (inert ⟺ flat OR unbounded, not AND).
     assert (
         qp.warn_if_self_protection_inert(
             caps={"m": 4, "n": 4},
@@ -216,11 +237,11 @@ def test_self_protection_inert_detector():
             tiers=flat,
             log=False,
         )
-        == []
+        == ["default"]
     )
 
-    # Flat tiers + an UNCAPPED model → unbounded in_flight can always reach B, so
-    # the budget is bindable: NOT inert.
+    # 5. Non-flat tiers + an UNCAPPED model → unbounded in_flight can always reach
+    #    B, so the budget stays bindable: NOT flagged as unbounded.
     assert (
         qp.warn_if_self_protection_inert(
             caps={},
@@ -228,7 +249,7 @@ def test_self_protection_inert_detector():
             pool_of={},
             pool_budget={},
             default_budget=9999.0,
-            tiers=flat,
+            tiers=nonflat,
             log=False,
         )
         == []

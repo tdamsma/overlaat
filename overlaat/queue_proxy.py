@@ -460,28 +460,35 @@ def warn_if_self_protection_inert(
 ) -> list[str]:
     """Warn at startup when the cost-scheduler's self-protection is INERT (#24).
 
-    Self-protection against a single workload's oversized prompts needs BOTH a
-    non-flat prompt-weight tier table (so heavy prompts cost more) AND a pool
-    budget that can actually bind (so that higher cost translates to fewer
-    concurrent admits). It is inert when the tiers are flat (every multiplier
-    == 1.0) AND a pool's budget is effectively unbounded — large enough that, given
-    the per-model caps, the budget admit test can never fail and only the raw
-    per-model caps bind (the incident config: OVERLAAT_BUDGET=9999 + flat tiers).
+    Self-protection against a single workload's oversized prompts is active only
+    when BOTH hold: the prompt-weight tiers are non-flat (so a heavy prompt costs
+    more and ``leave_room`` reserves a fast-lane slot) AND each pool's budget can
+    actually bind (so the higher cost translates to fewer concurrent admits). It is
+    INERT when EITHER fails — so the condition is ``flat OR unbounded``, not
+    ``flat AND unbounded``:
+
+    - **Flat tiers** (every multiplier == 1.0): a giant prompt costs exactly the
+      same as a tiny one, so nothing is priced up and no fast-lane reservation is
+      made in ANY pool — regardless of budget.
+    - **Effectively-unbounded pool budget**: the budget is so large, given the
+      per-model caps, that the admit test ``used + cost <= B`` can never fail even
+      at the heaviest weighting — only the raw per-model cap binds, so a few giant
+      prefills pin every slot. This is the LIVE-incident config (OVERLAAT_BUDGET=
+      9999 with the default *non-flat* tiers): the non-flat default does NOT cure
+      it, which is exactly why the unbounded check must run regardless of flatness.
 
     A pool's budget is "effectively unbounded" iff every model in it has a finite
-    cap AND the maximum committable cost (sum of cap*cost over its members) is
-    <= the pool budget — then `used + cost <= B` always holds, so the budget is
-    never the binding constraint. An uncapped model makes the budget bindable
-    (unbounded in_flight can always reach B), so such a pool is NOT flagged.
+    cap AND the maximum committable cost — ``sum(cap * cost(model) * max_mult)``
+    over its members — is <= the pool budget. (Using the heaviest tier multiplier
+    is the tight bound: a real charged cost is clamped no higher than that, so if
+    even this sum fits, the budget never binds.) An uncapped model makes the budget
+    bindable (unbounded in_flight always reaches B), so it is not "unbounded".
 
-    Returns the list of inert pool names (also writes a warning to stderr when
-    `log` and the list is non-empty). Returns [] when self-protection is active.
+    Returns the sorted list of inert pool names (and writes one stderr warning when
+    ``log`` and the list is non-empty). Returns [] when self-protection is active.
     """
     max_mult = max((m for _, m in tiers), default=1.0)
     flat = max_mult <= 1.0
-    if not flat:
-        # Non-flat tiers price heavy prompts up → self-protection is active.
-        return []
 
     # Group every known model into its resolved pool (a model with no explicit
     # assignment is in "default"); only pools with >= 1 member are considered.
@@ -489,41 +496,54 @@ def warn_if_self_protection_inert(
     for m in set(caps) | set(costs) | set(pool_of):
         members_by_pool[pool_of.get(m, "default")].append(m)
 
-    inert: list[str] = []
+    # Pools whose budget can never bind given the caps (the heaviest weighting
+    # still fits). Computed regardless of flatness — an unbounded budget neuters
+    # cost-weighting whether or not the tiers are flat.
+    unbounded: list[str] = []
     for pool, members in members_by_pool.items():
         b = pool_budget.get(pool, default_budget)
         committed = 0.0
         bindable = False
         for m in members:
             cap = caps.get(m)
-            if cap is None:
+            if cap is None or cap <= 0:
                 # An uncapped model can always drive in_flight up to the budget,
-                # so the budget binds — this pool is not inert.
+                # so the budget binds — this pool is not unbounded.
                 bindable = True
                 break
-            cost = costs[m] if m in costs else 1.0 / cap
-            committed += cap * cost
-        if bindable:
-            continue
-        # Inert iff the budget sits at or above the maximum achievable `used`, so
-        # the admit test (used + cost <= B) can never fail and only caps bind.
-        if b >= committed - 1e-9:
-            inert.append(pool)
+            base = costs[m] if m in costs else 1.0 / cap
+            committed += cap * base * max_mult
+        if not bindable and b >= committed - 1e-9:
+            unbounded.append(pool)
+
+    # Inert ⟺ flat (every pool — no weighting anywhere) OR the pool is unbounded.
+    inert = sorted(members_by_pool) if flat else sorted(unbounded)
 
     if log and inert:
-        pool_list = ", ".join(
-            f"'{p}' (budget {pool_budget.get(p, default_budget):g})" for p in inert
-        )
+        reasons: list[str] = []
+        if flat:
+            reasons.append(
+                "prompt-weight tiers are flat (all multipliers 1.0) — an oversized "
+                "prompt costs the same as a tiny one, so no fast-lane slot is "
+                "reserved in any pool"
+            )
+        if unbounded:
+            pool_list = ", ".join(
+                f"'{p}' (budget {pool_budget.get(p, default_budget):g})"
+                for p in sorted(unbounded)
+            )
+            reasons.append(
+                "these pools have a budget that can never bind given their caps, so "
+                f"only the raw per-model cap binds: {pool_list}"
+            )
         sys.stderr.write(
             "queue-proxy: WARNING cost-scheduler self-protection is INERT — "
-            "prompt-weight tiers are flat (all multipliers 1.0) AND these pools "
-            f"have a budget that can never bind given their caps: {pool_list}. "
-            "A single workload's oversized prompts can monopolize the backend and "
-            "starve the latency-sensitive fast lane (only the raw per-model cap "
-            "binds, so a few giant prefills pin every slot). Remediation: set "
-            "OVERLAAT_PROMPT_WEIGHT_TIERS to a non-flat table (e.g. "
-            "'2000:1,8000:2,inf:4') and/or lower OVERLAAT_BUDGET so the pool budget "
-            "binds. See docs/COST-SCHEDULER.md.\n"
+            + "; and ".join(reasons)
+            + ". A single workload's oversized prompts can then monopolize the "
+            "backend and starve the latency-sensitive fast lane (a few giant "
+            "prefills pin every slot). Remediation: set OVERLAAT_PROMPT_WEIGHT_TIERS "
+            "to a non-flat table (e.g. '2000:1,8000:2,inf:4') and/or lower "
+            "OVERLAAT_BUDGET so the pool budget binds. See docs/COST-SCHEDULER.md.\n"
         )
         sys.stderr.flush()
 
@@ -1045,15 +1065,18 @@ async def _forward(
     ev: dict | None,
     *,
     use_scheduler: bool = False,
+    charged_cost: float | None = None,
 ):
     """Forward to upstream with slot-release discipline + event emission.
 
     Release rule: exactly once per acquired slot. With the cost scheduler ON the
     slot is a budget reservation (``sem is None`` and ``use_scheduler`` is True),
-    released via ``SCHED.release(model)``; with the scheduler OFF it is the
-    per-model semaphore (``sem.release()``). Either way the release is guarded by
-    ``released`` so a double release never corrupts the budget ledger or the
-    in-flight counters. The event is emitted exactly once (in
+    released via ``SCHED.release(model, cost=charged_cost)`` where ``charged_cost``
+    is the prompt-size-weighted cost the run was admitted at — refunding the exact
+    charged amount keeps the budget ledger honest (#24). With the scheduler OFF it
+    is the per-model semaphore (``sem.release()``). Either way the release is
+    guarded by ``released`` so a double release never corrupts the budget ledger or
+    the in-flight counters. The event is emitted exactly once (in
     stream_body.finally, or on a send error here)."""
     client: httpx.AsyncClient = request.app.state.client
     headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_HEADERS_REQ}
@@ -1075,7 +1098,7 @@ async def _forward(
         released["done"] = True
         if use_scheduler:
             if SCHED is not None:
-                SCHED.release(model)
+                SCHED.release(model, cost=charged_cost)
         else:
             sem.release()
         m = METRICS[model]
@@ -1367,8 +1390,9 @@ async def _admit_scheduler(
     if cancel_fut.done():
         # Admitted and cancelled at the same instant: the admission already
         # charged the budget, so give it back via release (not withdraw, which is
-        # a no-op for an admitted waiter) to keep the ledger correct.
-        sched.release(model)
+        # a no-op for an admitted waiter) to keep the ledger correct. Refund the
+        # exact weighted cost it was charged (#24).
+        sched.release(model, cost=cost)
         _emit_cancelled()
         return _cancelled_response(req_id, model)
 
@@ -1382,4 +1406,6 @@ async def _admit_scheduler(
         ev["wait_reason"] = waiter.wait_reason
         ev["pool"] = pool
 
-    return await _forward(request, path, body, model, None, ev, use_scheduler=True)
+    return await _forward(
+        request, path, body, model, None, ev, use_scheduler=True, charged_cost=cost
+    )

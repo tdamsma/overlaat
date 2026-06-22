@@ -427,9 +427,14 @@ runs out of a checkout without site-specific paths.
 **Deadline ownership.** The authoritative *total* per-request deadline is the
 inference **engine's own `--timeout`** (operator deployment), which can evict a
 stalled or runaway generation GPU-side. The proxy read-timeout is **inter-byte and
-subordinate**: it should sit just *above* the engine deadline so the engine's clean
+subordinate**: it should sit *above* the engine deadline so the engine's clean
 cancel wins and the proxy only cuts a connection the engine has left fully wedged.
-Layer it `engine --timeout < LiteLLM timeout ≲ proxy read backstop`.
+Keep the **engine `--timeout` the smallest** so it fires first; the LiteLLM
+**total** `timeout` and the proxy **inter-byte** read backstop each sit comfortably
+*above* it. Those two measure different things — a total-request deadline vs a
+between-bytes gap — so they need *no* ordering relative to each other (only relative
+to the engine deadline). Example that satisfies this: engine `--timeout ≈ 240s`,
+LiteLLM `timeout: 1200`, proxy read `300s`.
 
 Per-model `model_info.overlaat_cost` (explicit cost override) and
 `model_info.overlaat_slot` (swap-slot group → cost forced to `1.0`) live in the LiteLLM

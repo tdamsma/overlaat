@@ -19,16 +19,20 @@ versions without a compatibility guarantee.
   *total* per-request deadline is the inference **engine's own `--timeout`**
   (operator deployment); the proxy read-timeout should sit just above it so the
   engine's clean cancel wins.
-- **Startup warning when the cost-scheduler's self-protection is inert** (#24). An
-  operator can configure away the protection against a single workload's oversized
-  prompts by combining **flat** prompt-weight tiers (every multiplier `1.0`) with an
-  **effectively-unbounded** pool budget (the incident config: `OVERLAAT_BUDGET=9999`
-  + flat tiers) — leaving only the raw per-model cap to bind, so a few giant
-  prefills can pin every slot and starve the fast lane. The proxy now detects this
-  at startup and writes a loud `stderr` warning naming the inert pool(s) and the
+- **Startup warning when the cost-scheduler's self-protection is inert** (#24). The
+  protection against a single workload's oversized prompts needs *both* non-flat
+  prompt-weight tiers *and* a pool budget that can bind, so it is inert if **either**
+  is missing (`flat OR unbounded`): **flat** tiers (every multiplier `1.0`) price a
+  giant prompt the same as a tiny one, and an **effectively-unbounded** pool budget
+  leaves only the raw per-model cap to bind — so a few giant prefills pin every slot
+  and starve the fast lane. Critically, the unbounded-budget case is flagged *even
+  with the default non-flat tiers* — the live incident config (`OVERLAAT_BUDGET=9999`
+  with default tiers) is unprotected, and an earlier short-circuit that exempted
+  non-flat configs would have missed it. The proxy detects this at startup and writes
+  a loud `stderr` warning naming the failing condition(s), the inert pool(s), and the
   remediation (set `OVERLAAT_PROMPT_WEIGHT_TIERS` to a non-flat table and/or lower
-  `OVERLAAT_BUDGET`). This confirms the **non-flat default tiers ship enabled**, so
-  a fresh deploy is protected without setting any env var.
+  `OVERLAAT_BUDGET`). This also confirms the **non-flat default tiers ship enabled**,
+  so a fresh deploy (bounded `OVERLAAT_BUDGET=1.0`) is protected without any env var.
 - **Regression reproducer for the oversized-prompt vector** (#24). New
   scheduler-unit contrast tests (protective default config vs the inert incident
   config) plus an end-to-end load harness proving a single workload's oversized
@@ -40,9 +44,14 @@ versions without a compatibility guarantee.
   releases** (#24, builds on #18). A prompt-size-weighted request was *charged* its
   weighted cost on admission but *refunded* only the base `1/cap` on release, so the
   committed budget never returned to zero after a heavy request finished and would
-  drift ever more restrictive. `release()` now refunds the actual cost the run was
-  charged at admission (tracked per in-flight run). Found by the new #24 end-to-end
-  regression harness; observability/cost columns are unchanged.
+  drift ever more restrictive. `Scheduler.release()` now takes the exact cost the run
+  was charged (`release(model, cost=…)`), threaded through from the admitting waiter,
+  and refunds precisely that. Refunding the exact charged amount — rather than a
+  per-model guess — is also required for correctness under heavy+light interleaving:
+  a light request finishing while a later heavy is still in flight must refund only
+  its own small cost, or a second heavy would over-admit and break the `leave_room`
+  fast-lane guarantee. Found by the new #24 regression tests; observability/cost
+  columns are unchanged.
 
 ### Notes
 - **Per-consumer (throughput) fairness remains out of scope** and is tracked
