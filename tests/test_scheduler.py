@@ -782,3 +782,138 @@ async def test_withdraw_clears_reservation_and_repumps():
     s.withdraw(big)  # big cancelled-while-queued; reservation must clear
     assert s.reserved_for is None
     assert admitted(cheap2)  # now packs into freed budget
+
+
+# -- self-protection: oversized-prompt vector (#24) -------------------------
+
+
+async def test_fast_lane_survives_under_protective_config():
+    """The FIX (now the default): non-flat tiers + a bounded budget + leave_room
+    keep a single workload's oversized prompts budget-throttled, so they cannot
+    pin every cap slot and the latency-sensitive fast lane keeps flowing.
+
+    base cost = 1/cap = 0.25 (cap 4, budget 1.0). A heavy prompt (weight 4×) is
+    clamped to leave_room = budget - base = 0.75, so two heavies (0.75+0.75 > 1.0)
+    never co-reside even though the cap has free slots — and exactly one base-cost
+    fast-lane call (0.25) always fits alongside the resident heavy (0.75+0.25=1.0).
+
+    DEVIATION FROM SPEC (#24): the spec enqueued the second heavy *before* the
+    light call and expected the light call to still admit. But a budget-blocked
+    head is EAGERLY RESERVED (the anti-starvation guard, §3c), so a reserved
+    second heavy would hold the leave_room budget away from a later light arrival
+    — the fast lane survives only for a light call that is already resident or
+    arrives while no heavy is reserved ahead of it. So the light call is enqueued
+    first (the proven leave_room ordering, matching
+    test_weighted_cost_leaves_room_for_one_light_call_end_to_end), then the second
+    heavy is shown to wait. This is the faithful encoding of the invariant given
+    the scheduler's real reservation semantics.
+    """
+    s = Scheduler(budget=1.0, caps={"m": 4})  # base cost 0.25; default heavy_max
+
+    heavy_cost = s.weighted_cost("m", 4.0)
+    assert heavy_cost == pytest.approx(0.75)  # leave_room clamp: budget - base
+
+    heavy1 = make_waiter(s, "m", req_id="heavy1")
+    heavy1.cost = heavy_cost
+    s.enqueue(heavy1)
+    assert admitted(heavy1)  # the resident heavy prompt holds 0.75
+    assert s.used == pytest.approx(0.75)
+
+    light = make_waiter(s, "m", req_id="light")  # base cost 0.25
+    s.enqueue(light)
+    # The fast lane survives: the light call admits on its first pump into the
+    # deliberately-left room (0.75 + 0.25 == 1.0), alongside the resident heavy.
+    assert admitted(light)
+    assert light.wait_reason == "none"
+    assert s.used == pytest.approx(1.0)
+
+    heavy2 = make_waiter(s, "m", req_id="heavy2")
+    heavy2.cost = heavy_cost
+    s.enqueue(heavy2)
+    # The second heavy does NOT fit: 1.0 + 0.75 > 1.0 — budget-throttled, NOT
+    # cap-throttled (the cap of 4 still has 2 free slots). A single workload's
+    # heavy prompts are serialized by the budget. As the sole budget-blocked pool
+    # head it is eagerly reserved ("reserved" = the budget-blocked-head refinement
+    # of "budget_full"), and crucially NOT "model_cap" (the inert-config symptom;
+    # see the next test).
+    assert not admitted(heavy2)
+    assert heavy2.wait_reason == "reserved"
+    assert heavy2.wait_reason != "model_cap"  # the contrast that matters
+
+    # A single heavy can never take the whole pool, however large the prompt.
+    assert s.weighted_cost("m", 99.0) == pytest.approx(0.75)
+
+
+async def test_inert_config_starves_fast_lane_demonstrates_incident():
+    """The incident reproducer (documents WHY the protective defaults matter).
+
+    Flat tiers + an unbounded budget ⇒ the per-model cap is the ONLY binder ⇒ a
+    handful of giant prefills pin every slot ⇒ the latency-sensitive fast lane
+    starves. This is the inert config from #24 (OVERLAAT_BUDGET=9999 + flat
+    tiers), encoded as an asserted-bad-outcome: with a huge budget the leave_room
+    clamp never bites and weighting is flat, so we model it by charging every
+    request its BASE cost (weight 1×) regardless of prompt size. The protective
+    defaults (non-flat tiers + bounded budget + leave_room) prevent this — see
+    test_fast_lane_survives_under_protective_config above.
+    """
+    s = Scheduler(budget=9999.0, caps={"m": 4})  # base cost 0.25
+    # Flat-equivalent: a heavy prompt is charged the base cost, not weighted up.
+    assert s.cost("m") == pytest.approx(0.25)
+
+    heavies = [make_waiter(s, "m", req_id=f"heavy{i}") for i in range(4)]
+    for w in heavies:
+        w.cost = s.cost("m")  # flat: every request costs the base 0.25
+        s.enqueue(w)
+    assert all(admitted(w) for w in heavies)  # cap=4 full; budget 9999 never binds
+    assert s.in_flight["m"] == 4
+
+    light = make_waiter(s, "m", req_id="light")
+    s.enqueue(light)
+    # The collapse: the light call is cap-blocked behind 4 heavy prefills, even
+    # though the (unbounded) budget has acres of room. The budget cannot protect it.
+    assert not admitted(light)
+    assert light.wait_reason == "model_cap"
+
+    # On the inert config, the only relief is a heavy finishing (no budget lever).
+    s.release("m")
+    assert admitted(light)
+
+
+async def test_release_refunds_exact_charged_cost_not_a_per_model_guess():
+    # Regression (#24 review): release() must refund the ACTUAL cost the completing
+    # run was charged, threaded by the caller — not a per-model guess (the original
+    # fix used a LIFO stack, which mis-refunds under heavy+light interleaving). A
+    # LIGHT run admitted BEFORE a HEAVY run, finishing FIRST, must refund only its
+    # own 0.25 — leaving the heavy's 0.75 committed — or a second heavy would
+    # wrongly co-admit (1.5 > budget), breaking the leave_room guarantee.
+    s = Scheduler(budget=1.0, caps={"m": 4})  # base 0.25
+
+    light = make_waiter(s, "m", req_id="light")  # cost 0.25
+    s.enqueue(light)
+    assert admitted(light)
+
+    heavy = make_waiter(s, "m", req_id="heavy")
+    heavy.cost = s.weighted_cost("m", 4.0)  # 0.75 (leave_room)
+    s.enqueue(heavy)
+    assert admitted(heavy)
+    assert s.used == pytest.approx(1.0)  # 0.25 + 0.75
+
+    # The light run finishes first. Refunding the wrong amount (e.g. the heavy's
+    # 0.75 a LIFO pop would take, or a base 0.25-for-heavy elsewhere) would corrupt
+    # `used`; the exact threaded refund leaves the heavy's 0.75 committed.
+    s.release("m", cost=light.cost)
+    assert s.used == pytest.approx(0.75)
+    assert s.in_flight["m"] == 1  # the heavy is still running
+
+    # A second heavy must NOT be admitted: 0.75 + 0.75 > 1.0. (With a wrong refund
+    # `used` would read 0.25 here and this would wrongly admit — two heavies in the
+    # pool at once, the exact thing leave_room forbids.)
+    heavy2 = make_waiter(s, "m", req_id="heavy2")
+    heavy2.cost = s.weighted_cost("m", 4.0)  # 0.75
+    s.enqueue(heavy2)
+    assert not admitted(heavy2)
+
+    # The heavy finishes; refund its exact 0.75; now heavy2 (the reserved head) fits.
+    s.release("m", cost=heavy.cost)
+    assert admitted(heavy2)
+    assert s.used == pytest.approx(0.75)

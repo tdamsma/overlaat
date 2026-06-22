@@ -366,7 +366,7 @@ class Scheduler:
             self._reserved[p] = None
         self.pump(self._now())
 
-    def release(self, model: str) -> None:
+    def release(self, model: str, cost: float | None = None) -> None:
         """Account the completion of one in-flight run of ``model`` and re-pump.
 
         This is the only path that frees budget; it is called on every request
@@ -374,9 +374,21 @@ class Scheduler:
         last stream of the resident member of an exclusive pool drains, the pool
         becomes idle and the next pump lets a *different* member become resident
         (the mutex hand-off).
-        """
+
+        ``cost`` must be the ACTUAL cost the completing run was charged at
+        admission (``waiter.cost`` — the prompt-size-weighted cost of #18, which
+        may exceed the base ``cost(model)``). The caller threads it through so the
+        refund is EXACT: refunding the base ``1/cap`` would leak the weight surplus
+        of every heavy request and the budget would never return to zero (#24), and
+        guessing per model (e.g. LIFO) mis-refunds under heavy+light interleaving —
+        a light finishing while a later heavy is still in flight would understate
+        ``used`` and over-admit a second heavy, breaking the ``leave_room``
+        guarantee. ``cost=None`` falls back to ``cost(model)`` for callers that
+        only ever admit at base cost (the unit tests; the scheduler-OFF path does
+        not use this method)."""
         p = self.pool(model)
-        self._used[p] = max(0.0, self._used.get(p, 0.0) - self.cost(model))
+        charged = self.cost(model) if cost is None else float(cost)
+        self._used[p] = max(0.0, self._used.get(p, 0.0) - charged)
         self.in_flight[model] = max(0, self.in_flight.get(model, 0) - 1)
         self.pump(self._now())
 

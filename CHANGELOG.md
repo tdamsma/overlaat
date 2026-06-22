@@ -8,6 +8,59 @@ versions without a compatibility guarantee.
 
 ## [Unreleased]
 
+### Added
+- **Configurable upstream HTTP timeouts** (#24, builds on #18). The proxy's httpx
+  timeout to LiteLLM was hardcoded (`connect 5 / read 1200 / write 60 / pool 5`);
+  all four are now env-overridable via `OVERLAAT_UPSTREAM_{CONNECT,READ,WRITE,POOL}_TIMEOUT`
+  (defaults `5 / 300 / 60 / 5`). The read default is lowered `1200 → 300` so a
+  wedged stream frees its budget slot promptly. Note that httpx `read` is the
+  **inter-byte** timeout, not a total-request deadline — a slow trickle of tokens
+  never trips it — so it is only a wedged-connection backstop. The authoritative
+  *total* per-request deadline is the inference **engine's own `--timeout`**
+  (operator deployment); the proxy read-timeout should sit just above it so the
+  engine's clean cancel wins.
+- **Startup warning when the cost-scheduler's self-protection is inert** (#24). The
+  protection against a single workload's oversized prompts needs *both* non-flat
+  prompt-weight tiers *and* a pool budget that can bind, so it is inert if **either**
+  is missing (`flat OR unbounded`): **flat** tiers (every multiplier `1.0`) price a
+  giant prompt the same as a tiny one, and an **effectively-unbounded** pool budget
+  leaves only the raw per-model cap to bind — so a few giant prefills pin every slot
+  and starve the fast lane. Critically, the unbounded-budget case is flagged *even
+  with the default non-flat tiers* — the live incident config (`OVERLAAT_BUDGET=9999`
+  with default tiers) is unprotected, and an earlier short-circuit that exempted
+  non-flat configs would have missed it. The proxy detects this at startup and writes
+  a loud `stderr` warning naming the failing condition(s), the inert pool(s), and the
+  remediation (set `OVERLAAT_PROMPT_WEIGHT_TIERS` to a non-flat table and/or lower
+  `OVERLAAT_BUDGET`). This also confirms the **non-flat default tiers ship enabled**,
+  so a fresh deploy (bounded `OVERLAAT_BUDGET=1.0`) is protected without any env var.
+- **Regression reproducer for the oversized-prompt vector** (#24). New
+  scheduler-unit contrast tests (protective default config vs the inert incident
+  config) plus an end-to-end load harness proving a single workload's oversized
+  prompts are budget-throttled one-at-a-time and the latency-sensitive fast lane is
+  never starved, alongside a unit test for the inert-config detector.
+
+### Fixed
+- **Cost-scheduler budget no longer leaks the prompt-weight surplus on heavy
+  releases** (#24, builds on #18). A prompt-size-weighted request was *charged* its
+  weighted cost on admission but *refunded* only the base `1/cap` on release, so the
+  committed budget never returned to zero after a heavy request finished and would
+  drift ever more restrictive. `Scheduler.release()` now takes the exact cost the run
+  was charged (`release(model, cost=…)`), threaded through from the admitting waiter,
+  and refunds precisely that. Refunding the exact charged amount — rather than a
+  per-model guess — is also required for correctness under heavy+light interleaving:
+  a light request finishing while a later heavy is still in flight must refund only
+  its own small cost, or a second heavy would over-admit and break the `leave_room`
+  fast-lane guarantee. Found by the new #24 regression tests; observability/cost
+  columns are unchanged.
+
+### Notes
+- **Per-consumer (throughput) fairness remains out of scope** and is tracked
+  separately — this work covers the self-protection defaults, configurable timeouts,
+  and the regression gate only. The operator-side engine config (chunked prefill, an
+  authoritative engine `--timeout`, `--max-tokens`) lives in the engine deployment,
+  not in Overlaat, and is captured here only as a documented contract
+  (see `docs/COST-SCHEDULER.md`).
+
 ## [0.0.6] — 2026-06-22
 
 ### Added

@@ -186,6 +186,79 @@ the proxy docstring.)
 
 ---
 
+## Self-protection invariant (the oversized-prompt vector) (#24)
+
+**The guarantee.** A single workload — even one API key — sending oversized
+prompts at the model's concurrency cap **cannot collapse the shared backend or
+starve the latency-sensitive fast lane.** A burst of giant prefills can occupy
+*some* of the pool, but never *all* of it: there is always room for one
+base-cost interactive call to keep flowing.
+
+**How it is enforced — three layers in the Overlaat layer, all shipped enabled
+by default:**
+
+1. **Non-flat prompt-weight tiers price heavy prompts up.** The default tier table
+   (`2000:1, 8000:2, inf:4`) makes a >8k-token prompt cost `4×` its base cost, so a
+   heavy request consumes more of the pool and fewer of them run at once
+   (`OVERLAAT_PROMPT_WEIGHT_TIERS`, see the #18 section above).
+2. **A bounded pool budget makes the higher cost bind.** `OVERLAAT_BUDGET=1.0`
+   (per pool) means the summed admission cost cannot exceed one GPU's worth, so a
+   higher per-request cost directly translates to fewer concurrent admits — the
+   budget is the lever that turns "costs more" into "runs fewer".
+3. **`leave_room` heavy_max caps a single heavy prompt below the whole pool.** The
+   default per-pool `heavy_max: leave_room` clamps a weighted cost at
+   `B_pool − base_cost`, so even the heaviest prompt leaves room for at least one
+   more base-cost run of that model. One fast-lane call *always* fits.
+
+Layers 1 and 2 are co-dependent: weighting without a binding budget cannot
+throttle anything (a higher cost against an unbounded budget still always admits),
+and a binding budget without weighting charges a 50-token and a 33k-token prompt
+the same. **Both** are required for self-protection, and both ship on by default —
+so a fresh deploy is protected without setting a single env var.
+
+**The startup warning (inert detection).** Because Layers 1 and 2 are
+co-dependent, the protection is inert if **either** is missing — the condition is
+`flat OR unbounded`, not `flat AND unbounded`:
+
+- **Flat tiers** (every multiplier `1.0`): an oversized prompt costs the same as a
+  tiny one, so no fast-lane slot is reserved in *any* pool, whatever the budget.
+- **An effectively-unbounded pool budget**: so large, given the per-model caps, that
+  the admit test can never fail even at the heaviest weighting — only the raw
+  per-model cap binds. This is the *live* incident config (`OVERLAAT_BUDGET=9999`
+  with the **default non-flat tiers**): the non-flat default does **not** rescue it,
+  which is exactly why the check runs regardless of tier shape.
+
+In either state a handful of oversized prefills pin every slot and the fast lane
+starves. The proxy detects this at startup and writes a loud `stderr` warning naming
+the failing condition(s) and the inert pool(s), with the remediation: set
+`OVERLAAT_PROMPT_WEIGHT_TIERS` to a non-flat table (e.g. `2000:1,8000:2,inf:4`)
+and/or lower `OVERLAAT_BUDGET` so the pool budget binds. (A pool budget is judged
+"unbounded" only when every member has a finite cap and `sum(cap × cost × max_mult)
+≤ B`; an uncapped member keeps the budget bindable, so that pool is flagged only
+when the tiers are flat.)
+
+**The ENGINE CONTRACT (#1 — operator deployment, NOT Overlaat code).** Token-level
+prefill cost and true total wall-clock are only visible *inside* the inference
+engine. The invariant therefore assumes the operator's engine run-script — which
+Overlaat does not control and **cannot enforce** — satisfies:
+
+- **Chunked prefill ON**, so a big prefill is interleaved with decode steps and
+  does not starve the in-flight short requests at the engine level.
+- **An authoritative total per-request deadline via the engine `--timeout`**, sized
+  to the workload (e.g. ~240s), so a stalled or runaway generation is evicted
+  GPU-side — this is the *real* total deadline, not anything Overlaat owns.
+- **A sane `--max-tokens`**, so one request cannot decode unboundedly.
+
+Overlaat cannot enforce any of these — they live in the engine. The proxy's
+read-timeout (`OVERLAAT_UPSTREAM_READ_TIMEOUT`, default 300s) is the **inter-byte**
+timeout (a slow token trickle never trips it), so it is only a *wedged-connection
+backstop*, not a total deadline. It should sit just **above** the engine deadline
+so the engine's own clean cancel wins and the proxy only cuts a connection the
+engine has left fully wedged. See §10 of `docs/ARCHITECTURE.md` for the timeout
+knobs and the deadline-ownership rule.
+
+---
+
 ## 3. The key policy decision: work-conserving packing + an anti-starvation guard
 
 Given a budget with room and a priority-ordered queue, *which* request do we

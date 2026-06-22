@@ -179,7 +179,15 @@ overlaat:
 # deployments (same model, multiple keys/regions), which is not this setup.
 router_settings:
   num_retries: 1
-  timeout: 1200   # Large-context synthesis (long prefill) under contention can run past 600s; 1200s gives headroom but stays bounded. Must be ≥ the queue-proxy's read-timeout.
+  # TIMEOUT LAYERING (#24): the AUTHORITATIVE total per-request deadline is the
+  # inference ENGINE's own `--timeout` (operator deployment) — it is the only layer
+  # that can evict a stalled/runaway generation GPU-side. Keep the engine --timeout
+  # the SMALLEST so it fires first; this LiteLLM *total* timeout and the queue-proxy's
+  # INTER-BYTE read-timeout (OVERLAAT_UPSTREAM_READ_TIMEOUT, default 300s) both sit
+  # ABOVE the engine deadline. Those two measure different things (a total deadline
+  # vs a between-bytes gap), so they need no ordering with EACH OTHER — e.g. engine
+  # ~240s, this 1200s total, proxy read 300s inter-byte are all mutually consistent.
+  timeout: 1200   # Large-context synthesis (long prefill) under contention can run past 600s; 1200s gives headroom but stays bounded.
 
 # ─── General ──────────────────────────────────────────────────────────────────
 general_settings:
@@ -199,4 +207,4 @@ litellm_settings:
   callbacks: ["prometheus"]
   require_auth_for_metrics_endpoint: false   # loopback-only; network ACL is the auth layer
   set_verbose: false
-  request_timeout: 1200   # keep in sync with router_settings.timeout
+  request_timeout: 1200   # keep in sync with router_settings.timeout (still above the engine --timeout; see the layering note there)

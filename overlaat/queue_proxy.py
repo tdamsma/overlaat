@@ -97,6 +97,29 @@ DEFAULT_PRIORITY = _env_int("OVERLAAT_DEFAULT_PRIORITY", 0)
 # future refinement and is parsed here so the env surface is stable.
 RESERVATION_GRACE = _env_float("OVERLAAT_RESERVATION_GRACE", 0.0)
 
+# Upstream (LiteLLM) HTTP client timeouts (#24). httpx `read` is the INTER-BYTE
+# timeout, NOT a total-request deadline — a slow trickle of tokens never trips it.
+# The authoritative total per-request deadline is the inference ENGINE's own
+# `--timeout` (operator deployment); the proxy read-timeout is subordinate and
+# should sit just ABOVE that engine deadline so the engine's clean cancel wins
+# and the proxy only cuts a connection the engine left fully wedged. Lowered from
+# the previous hardcoded 1200s read so a wedged stream frees its slot promptly.
+UPSTREAM_CONNECT_TIMEOUT = _env_float("OVERLAAT_UPSTREAM_CONNECT_TIMEOUT", 5.0)
+UPSTREAM_READ_TIMEOUT = _env_float("OVERLAAT_UPSTREAM_READ_TIMEOUT", 300.0)
+UPSTREAM_WRITE_TIMEOUT = _env_float("OVERLAAT_UPSTREAM_WRITE_TIMEOUT", 60.0)
+UPSTREAM_POOL_TIMEOUT = _env_float("OVERLAAT_UPSTREAM_POOL_TIMEOUT", 5.0)
+
+
+def _upstream_timeout() -> httpx.Timeout:
+    """The upstream httpx timeout, built from the OVERLAAT_UPSTREAM_*_TIMEOUT
+    knobs. Reads the module-level constants so tests can monkeypatch them."""
+    return httpx.Timeout(
+        connect=UPSTREAM_CONNECT_TIMEOUT,
+        read=UPSTREAM_READ_TIMEOUT,
+        write=UPSTREAM_WRITE_TIMEOUT,
+        pool=UPSTREAM_POOL_TIMEOUT,
+    )
+
 
 def _parse_weight_tiers(spec: str) -> tuple[tuple[float, float], ...]:
     """Parse ``OVERLAAT_PROMPT_WEIGHT_TIERS`` into sorted ``(upper, multiplier)``
@@ -425,6 +448,108 @@ def resolve_pool_config(
     return pool_budget, pool_exclusive
 
 
+def warn_if_self_protection_inert(
+    caps: dict[str, int],
+    costs: dict[str, float],
+    pool_of: dict[str, str],
+    pool_budget: dict[str, float],
+    default_budget: float,
+    tiers: tuple[tuple[float, float], ...],
+    *,
+    log: bool = True,
+) -> list[str]:
+    """Warn at startup when the cost-scheduler's self-protection is INERT (#24).
+
+    Self-protection against a single workload's oversized prompts is active only
+    when BOTH hold: the prompt-weight tiers are non-flat (so a heavy prompt costs
+    more and ``leave_room`` reserves a fast-lane slot) AND each pool's budget can
+    actually bind (so the higher cost translates to fewer concurrent admits). It is
+    INERT when EITHER fails — so the condition is ``flat OR unbounded``, not
+    ``flat AND unbounded``:
+
+    - **Flat tiers** (every multiplier == 1.0): a giant prompt costs exactly the
+      same as a tiny one, so nothing is priced up and no fast-lane reservation is
+      made in ANY pool — regardless of budget.
+    - **Effectively-unbounded pool budget**: the budget is so large, given the
+      per-model caps, that the admit test ``used + cost <= B`` can never fail even
+      at the heaviest weighting — only the raw per-model cap binds, so a few giant
+      prefills pin every slot. This is the LIVE-incident config (OVERLAAT_BUDGET=
+      9999 with the default *non-flat* tiers): the non-flat default does NOT cure
+      it, which is exactly why the unbounded check must run regardless of flatness.
+
+    A pool's budget is "effectively unbounded" iff every model in it has a finite
+    cap AND the maximum committable cost — ``sum(cap * cost(model) * max_mult)``
+    over its members — is <= the pool budget. (Using the heaviest tier multiplier
+    is the tight bound: a real charged cost is clamped no higher than that, so if
+    even this sum fits, the budget never binds.) An uncapped model makes the budget
+    bindable (unbounded in_flight always reaches B), so it is not "unbounded".
+
+    Returns the sorted list of inert pool names (and writes one stderr warning when
+    ``log`` and the list is non-empty). Returns [] when self-protection is active.
+    """
+    max_mult = max((m for _, m in tiers), default=1.0)
+    flat = max_mult <= 1.0
+
+    # Group every known model into its resolved pool (a model with no explicit
+    # assignment is in "default"); only pools with >= 1 member are considered.
+    members_by_pool: dict[str, list[str]] = defaultdict(list)
+    for m in set(caps) | set(costs) | set(pool_of):
+        members_by_pool[pool_of.get(m, "default")].append(m)
+
+    # Pools whose budget can never bind given the caps (the heaviest weighting
+    # still fits). Computed regardless of flatness — an unbounded budget neuters
+    # cost-weighting whether or not the tiers are flat.
+    unbounded: list[str] = []
+    for pool, members in members_by_pool.items():
+        b = pool_budget.get(pool, default_budget)
+        committed = 0.0
+        bindable = False
+        for m in members:
+            cap = caps.get(m)
+            if cap is None or cap <= 0:
+                # An uncapped model can always drive in_flight up to the budget,
+                # so the budget binds — this pool is not unbounded.
+                bindable = True
+                break
+            base = costs[m] if m in costs else 1.0 / cap
+            committed += cap * base * max_mult
+        if not bindable and b >= committed - 1e-9:
+            unbounded.append(pool)
+
+    # Inert ⟺ flat (every pool — no weighting anywhere) OR the pool is unbounded.
+    inert = sorted(members_by_pool) if flat else sorted(unbounded)
+
+    if log and inert:
+        reasons: list[str] = []
+        if flat:
+            reasons.append(
+                "prompt-weight tiers are flat (all multipliers 1.0) — an oversized "
+                "prompt costs the same as a tiny one, so no fast-lane slot is "
+                "reserved in any pool"
+            )
+        if unbounded:
+            pool_list = ", ".join(
+                f"'{p}' (budget {pool_budget.get(p, default_budget):g})"
+                for p in sorted(unbounded)
+            )
+            reasons.append(
+                "these pools have a budget that can never bind given their caps, so "
+                f"only the raw per-model cap binds: {pool_list}"
+            )
+        sys.stderr.write(
+            "queue-proxy: WARNING cost-scheduler self-protection is INERT — "
+            + "; and ".join(reasons)
+            + ". A single workload's oversized prompts can then monopolize the "
+            "backend and starve the latency-sensitive fast lane (a few giant "
+            "prefills pin every slot). Remediation: set OVERLAAT_PROMPT_WEIGHT_TIERS "
+            "to a non-flat table (e.g. '2000:1,8000:2,inf:4') and/or lower "
+            "OVERLAAT_BUDGET so the pool budget binds. See docs/COST-SCHEDULER.md.\n"
+        )
+        sys.stderr.flush()
+
+    return inert
+
+
 CAPS: dict[str, int] = load_caps(LITELLM_CONFIG)
 COSTS, POOL_OF, _EXCLUSIVE_SEED = load_model_info(LITELLM_CONFIG)
 _DECLARED_BUDGETS, _DECLARED_EXCLUSIVE = load_pools(LITELLM_CONFIG)
@@ -438,6 +563,12 @@ POOL_BUDGET, POOL_EXCLUSIVE = resolve_pool_config(
     BUDGET,
 )
 POOL_HEAVY_MAX: dict[str, str] = load_pool_heavy_max(LITELLM_CONFIG)
+
+# Emit the self-protection inert warning alongside the other startup-time pool
+# logging (kept silent on the kill-switch path). See warn_if_self_protection_inert.
+if SCHEDULER_ON:
+    warn_if_self_protection_inert(CAPS, COSTS, POOL_OF, POOL_BUDGET, BUDGET, PROMPT_WEIGHT_TIERS)
+
 SEMAPHORES: dict[str, asyncio.Semaphore] = {}
 
 # The single global scheduler instance (set in lifespan when SCHEDULER_ON). One
@@ -734,7 +865,7 @@ async def lifespan(app: FastAPI):
     global EVENT_Q, SCHED
     app.state.client = httpx.AsyncClient(
         base_url=UPSTREAM,
-        timeout=httpx.Timeout(connect=5.0, read=1200.0, write=60.0, pool=5.0),
+        timeout=_upstream_timeout(),
         limits=httpx.Limits(max_keepalive_connections=64, max_connections=128),
     )
     EVENT_Q = asyncio.Queue(maxsize=EVENT_QUEUE_MAX)
@@ -934,15 +1065,18 @@ async def _forward(
     ev: dict | None,
     *,
     use_scheduler: bool = False,
+    charged_cost: float | None = None,
 ):
     """Forward to upstream with slot-release discipline + event emission.
 
     Release rule: exactly once per acquired slot. With the cost scheduler ON the
     slot is a budget reservation (``sem is None`` and ``use_scheduler`` is True),
-    released via ``SCHED.release(model)``; with the scheduler OFF it is the
-    per-model semaphore (``sem.release()``). Either way the release is guarded by
-    ``released`` so a double release never corrupts the budget ledger or the
-    in-flight counters. The event is emitted exactly once (in
+    released via ``SCHED.release(model, cost=charged_cost)`` where ``charged_cost``
+    is the prompt-size-weighted cost the run was admitted at — refunding the exact
+    charged amount keeps the budget ledger honest (#24). With the scheduler OFF it
+    is the per-model semaphore (``sem.release()``). Either way the release is
+    guarded by ``released`` so a double release never corrupts the budget ledger or
+    the in-flight counters. The event is emitted exactly once (in
     stream_body.finally, or on a send error here)."""
     client: httpx.AsyncClient = request.app.state.client
     headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_HEADERS_REQ}
@@ -964,7 +1098,7 @@ async def _forward(
         released["done"] = True
         if use_scheduler:
             if SCHED is not None:
-                SCHED.release(model)
+                SCHED.release(model, cost=charged_cost)
         else:
             sem.release()
         m = METRICS[model]
@@ -1256,8 +1390,9 @@ async def _admit_scheduler(
     if cancel_fut.done():
         # Admitted and cancelled at the same instant: the admission already
         # charged the budget, so give it back via release (not withdraw, which is
-        # a no-op for an admitted waiter) to keep the ledger correct.
-        sched.release(model)
+        # a no-op for an admitted waiter) to keep the ledger correct. Refund the
+        # exact weighted cost it was charged (#24).
+        sched.release(model, cost=cost)
         _emit_cancelled()
         return _cancelled_response(req_id, model)
 
@@ -1271,4 +1406,6 @@ async def _admit_scheduler(
         ev["wait_reason"] = waiter.wait_reason
         ev["pool"] = pool
 
-    return await _forward(request, path, body, model, None, ev, use_scheduler=True)
+    return await _forward(
+        request, path, body, model, None, ev, use_scheduler=True, charged_cost=cost
+    )
