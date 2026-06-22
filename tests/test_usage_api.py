@@ -83,6 +83,97 @@ async def test_now(monkeypatch):
     assert "verdict" in r.json()
 
 
+async def test_now_enriches_queued_waiters_per_consumer(monkeypatch):
+    # alias_map resolves the waiter's key_fp -> a consumer alias.
+    monkeypatch.setattr(ua, "alias_map", lambda: {"fp-team-alpha": "team-alpha"})
+    # A scheduler-on /__queue/status: one queued waiter carrying the scheduler
+    # fields (priority/effective_priority/pool/wait_reason) as _queued_view emits.
+    monkeypatch.setattr(
+        ua,
+        "scrape_queue_status",
+        lambda: {
+            "available": True,
+            "scheduler": True,
+            "by_model": [
+                {
+                    "model": "chat-large",
+                    "cap": 2,
+                    "in_flight": 2,
+                    "queue_depth": 1,
+                    "queued": [
+                        {
+                            "id": "req-1",
+                            "key_fp": "fp-team-alpha",
+                            "age_s": 4.2,
+                            "priority": 5,
+                            "cost": 1.0,
+                            "pool": "default",
+                            "effective_priority": 5.8,
+                            "wait_reason": "model_cap",
+                        }
+                    ],
+                }
+            ],
+            "total_in_flight": 2,
+            "total_queue_depth": 1,
+        },
+    )
+    monkeypatch.setattr(mdb, "latest_host", lambda db: None)
+    monkeypatch.setattr(mdb, "fetch_events", lambda *a, **k: [])
+    async with asgi() as c:
+        r = await c.get("/now")
+    assert r.status_code == 200
+    body = r.json()
+    # Per-model queued item is enriched, with the alias resolved.
+    item = body["models"][0]["queued"][0]
+    assert item["key"] == "team-alpha"
+    assert item["model"] == "chat-large"
+    assert item["id"] == "req-1"
+    assert item["age_s"] == 4.2
+    assert item["priority"] == 5
+    assert item["effective_priority"] == 5.8
+    assert item["pool"] == "default"
+    assert item["wait_reason"] == "model_cap"
+    # Flat top-level `queued` carries the same enriched waiters.
+    assert body["queued"] == [item]
+
+
+async def test_now_queued_waiters_null_safe_scheduler_off(monkeypatch):
+    # Scheduler kill-switch: _queued_view omits the scheduler fields entirely.
+    monkeypatch.setattr(ua, "alias_map", lambda: {})
+    monkeypatch.setattr(
+        ua,
+        "scrape_queue_status",
+        lambda: {
+            "available": True,
+            "scheduler": False,
+            "by_model": [
+                {
+                    "model": "chat-small",
+                    "cap": 4,
+                    "in_flight": 4,
+                    "queue_depth": 1,
+                    "queued": [{"id": "req-9", "key_fp": "fp-x", "age_s": 1.1}],
+                }
+            ],
+            "total_in_flight": 4,
+            "total_queue_depth": 1,
+        },
+    )
+    monkeypatch.setattr(mdb, "latest_host", lambda db: None)
+    monkeypatch.setattr(mdb, "fetch_events", lambda *a, **k: [])
+    async with asgi() as c:
+        r = await c.get("/now")
+    item = r.json()["queued"][0]
+    assert item["key"] == "fp-x"  # unresolved key_fp falls through
+    assert item["model"] == "chat-small"
+    assert item["age_s"] == 1.1
+    assert item["priority"] is None
+    assert item["effective_priority"] is None
+    assert item["pool"] is None
+    assert item["wait_reason"] is None
+
+
 async def test_timeline(monkeypatch):
     monkeypatch.setattr(ua, "alias_map", lambda: {})
     monkeypatch.setattr(mdb, "build_timeline", lambda *a, **k: {"models": {}, "buckets": []})

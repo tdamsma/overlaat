@@ -118,20 +118,41 @@ def healthz():
 @app.get("/now")
 def now():
     """Live snapshot. In-flight/queued from the queue; host from the latest
-    sample; recent 5-min completed events per key for context."""
+    sample; recent 5-min completed events per key for context.
+
+    Live proxy state — *not* DB events. The `queued` list (per model row, plus a
+    flat top-level `queued` across all models) is the proxy's in-memory
+    wait-queue: each waiter is a request *parked right now*, with its consumer
+    alias resolved and (when the scheduler is on) `priority`,
+    `effective_priority`, `pool`, and `wait_reason` (`model_cap` / `budget_full`
+    / `exclusive`, or null on the scheduler kill-switch). Distinct from the
+    recent-requests / event tables, which only hold *finished* requests."""
     aliases = alias_map()
     qs = scrape_queue_status()
     host = metrics_db.latest_host(DB)
 
     models = []
     busy = []
+    all_queued = []
     for m in qs.get("by_model", []):
         if not (m.get("in_flight") or m.get("queue_depth") or m.get("cap")):
             continue
-        queued = [
-            {"key": aliases.get(q["key_fp"], q["key_fp"]), "age_s": q["age_s"]}
-            for q in m.get("queued", [])
-        ]
+        queued = []
+        for q in m.get("queued", []):
+            # Enrich each waiter, null-safe: _queued_view omits the scheduler
+            # fields when the scheduler kill-switch is on, so .get() them.
+            item = {
+                "key": aliases.get(q["key_fp"], q["key_fp"]),
+                "model": m["model"],
+                "id": q.get("id"),
+                "age_s": q.get("age_s"),
+                "priority": q.get("priority"),
+                "effective_priority": q.get("effective_priority"),
+                "pool": q.get("pool"),
+                "wait_reason": q.get("wait_reason"),
+            }
+            queued.append(item)
+            all_queued.append(item)
         row = {
             "model": m["model"],
             "cap": m.get("cap"),
@@ -184,6 +205,10 @@ def now():
         "scheduler": qs.get("scheduler"),
         "budget": qs.get("budget"),
         "models": models,
+        # Flat list of every queued waiter across all models (same dicts as the
+        # per-model `queued`). Live in-memory proxy state — used by the
+        # "queued now — by user" card; null-safe scheduler fields.
+        "queued": all_queued,
         "totals": {
             "in_flight": qs.get("total_in_flight", 0),
             "queue_depth": qs.get("total_queue_depth", 0),
@@ -311,6 +336,12 @@ svg.chart{width:100%;height:150px;display:block}
 .pill{display:inline-block;padding:1px 6px;border-radius:10px;font-size:10px;margin-left:4px}
 .pill.ab{background:rgba(248,81,73,.15);color:var(--hot)}.pill.er{background:rgba(210,153,34,.15);color:var(--warn)}
 .err{color:var(--hot);font-family:var(--mono);font-size:12px}
+.quser{font-family:var(--mono);font-size:12px;margin-bottom:8px}
+.quser .qhead{display:flex;justify-content:space-between;gap:8px}
+.quser .qhead b{font-weight:600}
+.quser ul{list-style:none;margin:3px 0 0;padding:0 0 0 10px;border-left:1px solid var(--line)}
+.quser li{padding:1px 0;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.quser li .qm{color:var(--text)}
 footer{color:var(--dim);font-size:11px;text-align:center;padding:14px}
 .controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
 .controls input{background:#0d1117;color:var(--text);border:1px solid var(--line);padding:6px 10px;border-radius:6px;font:inherit;font-size:12px;min-width:200px}
@@ -372,7 +403,13 @@ table.sortable th .ind{color:var(--accent);margin-left:3px}
     <div class="note" id="now-note"></div>
   </div>
 
-  <div class="card span8">
+  <div class="card span4">
+    <h2>queued now — by user</h2>
+    <div id="queued-users"></div>
+    <div class="note">Live in-memory queue state from the proxy — requests waiting <em>right now</em>, grouped by consumer. Distinct from the recent-requests table below, which is finished requests.</div>
+  </div>
+
+  <div class="card span4">
     <h2>memory holders <span class="dim">(RSS — what fills RAM)</span></h2>
     <table id="rss"><thead><tr><th>process</th><th class="num">RSS GB</th><th>share</th></tr></thead><tbody></tbody></table>
   </div>
@@ -595,6 +632,36 @@ function renderNow(now){
   const rt=$('#rss tbody'),bs=now.host.backends||[];
   const max=bs.length?bs[0].rss_gb:1;
   rt.innerHTML=bs.map(b=>`<tr><td>${b.name}</td><td class="num">${b.rss_gb.toFixed(1)}</td><td><div class="bar"><i style="width:${(b.rss_gb/max*100).toFixed(0)}%"></i></div></td></tr>`).join('')||'<tr><td colspan="3" class="dim">—</td></tr>';
+  renderQueuedByUser(now);
+}
+
+// Live in-memory queue (waiting requests), grouped by consumer. Reads the flat
+// `now.queued` list (falls back to flattening per-model `queued`). Scheduler
+// fields are null-safe — absent on the kill-switch path.
+const WAIT_REASON={model_cap:'backend full',budget_full:'budget',exclusive:'exclusive'};
+function renderQueuedByUser(now){
+  const el=$('#queued-users');if(!el)return;
+  let q=now.queued;
+  if(!q){q=[];(now.models||[]).forEach(m=>(m.queued||[]).forEach(w=>q.push(Object.assign({model:m.model},w))));}
+  if(!q.length){el.innerHTML='<div class="dim">queue empty</div>';return;}
+  const groups=new Map();
+  q.forEach(w=>{const k=w.key||'—';if(!groups.has(k))groups.set(k,[]);groups.get(k).push(w);});
+  const blocks=[...groups.entries()].map(([key,ws])=>{
+    ws.sort((a,b)=>(b.age_s||0)-(a.age_s||0));
+    const oldest=Math.max(...ws.map(w=>w.age_s||0));
+    return {key,ws,n:ws.length,oldest};
+  }).sort((a,b)=>b.n-a.n||b.oldest-a.oldest);
+  el.innerHTML=blocks.map(g=>{
+    const items=g.ws.map(w=>{
+      const prio=w.effective_priority!=null?w.effective_priority:w.priority;
+      const why=WAIT_REASON[w.wait_reason]||'';
+      const bits=[`<span class="qm">${w.model||'—'}</span>`,`${fmt(Math.round(w.age_s||0))}s`];
+      if(prio!=null)bits.push(`p${prio}`);
+      if(why)bits.push(why);
+      return `<li>${bits.join(' · ')}</li>`;
+    }).join('');
+    return `<div class="quser"><div class="qhead"><b>${g.key}</b><span class="warn">${g.n} queued · oldest ${fmt(Math.round(g.oldest))}s</span></div><ul>${items}</ul></div>`;
+  }).join('');
 }
 
 function renderModels(d){

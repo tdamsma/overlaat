@@ -199,6 +199,14 @@ aging), `cost`, `pool`, and the live `wait_reason`, so a deep queue can be read 
 `OVERLAAT_SCHEDULER=off`, the `budget` object is `null` and these per-entry fields
 are absent.
 
+The usage-api's [`GET /now`](#endpoints) re-exposes those same queued
+waiters with the consumer's `key_fp` resolved to its alias — a flat top-level
+`queued` list (and the per-model `queued`) carrying `key`, `model`, `age_s`,
+`priority`, `effective_priority`, `pool`, and `wait_reason` per waiter — so a
+dashboard can show *who* is parked and *why*. This is **live in-memory proxy
+state** (requests waiting *right now*), not `request_events`, which is written
+only on completion and so never holds a still-queued request.
+
 ## Throughput vs concurrency — done honestly
 
 A naive "tokens/sec at N concurrent requests" chart lies, because a single call
@@ -273,7 +281,7 @@ gate.
 | route | answers |
 |---|---|
 | `GET /` | dashboard (HTML) |
-| `GET /now` | live: per-model in-flight / queued (scraped from the queue-proxy's `:4000/__queue/status`), host GPU% / wired RAM + backend RSS (latest sample), recent-5m completed per key. Live in-flight comes from the proxy because `request_events` rows are written on completion — the proxy is the only thing that knows what is in flight *right now*. |
+| `GET /now` | live: per-model in-flight / queued (scraped from the queue-proxy's `:4000/__queue/status`), host GPU% / wired RAM + backend RSS (latest sample), recent-5m completed per key. Also surfaces the **queued waiters per consumer** — a flat `queued` list (and the per-model `queued`) where each parked request carries `key` (alias), `model`, `age_s`, `priority`, `effective_priority`, `pool`, and `wait_reason`. All of this is **live in-memory proxy state**, not DB events: live in-flight/queued come from the proxy because `request_events` rows are written on completion — the proxy is the only thing that knows what is in flight or waiting *right now*. |
 | `GET /timeline?last=` | time-series for **all** charts: host GPU% / wired RAM + backend RSS; per-model offered / active concurrency; per-consumer active concurrency (the *work-by-customer* headline); aggregate input vs output **tok/s** (`totals.in_tok_s` / `totals.out_tok_s`); and completion **tok/s per model** (`by_model_out_tok_s`, stacked, top-N + `<other>`). Bucket width is auto-picked from the window (30m→5s, 1h→15s, 6h→60s, 24h→5m, 7d→1h). |
 | `GET /models?last=` | capacity view: per-model outcome counts, latency split (`queue_wait` / `ttft` / `service` / `total`, p50 + p95), throughput-by-measured-concurrency (min-sample guarded), **`decode_solo_tok_s`** (median decode tok/s over near-solo streamed calls — the backend-health number) and **`out_tok_p50`** (median completion tokens per completed call — the output-size/behaviour number). |
 | `GET /consumers?last=` | per key alias: requests by outcome, tokens, service-seconds, abandoned-rate, models used. |
