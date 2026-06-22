@@ -150,3 +150,103 @@ def test_bucket_weighted():
         0.0,
         0.0,
     ]
+
+
+def rev(
+    model="m1",
+    key="k1",
+    enq=100.0,
+    acq=101.0,
+    ft=102.0,
+    done=105.0,
+    outcome="completed",
+    pt=10,
+    ct=20,
+    streamed=True,
+    http=200,
+    workload="scout",
+    wait_reason="none",
+):
+    """A request_events row as fetch_recent_events returns it (the workload +
+    wait_reason columns build_recent_requests reads are present)."""
+    return {
+        **ev(
+            model=model,
+            key=key,
+            enq=enq,
+            acq=acq,
+            ft=ft,
+            done=done,
+            outcome=outcome,
+            pt=pt,
+            ct=ct,
+            streamed=streamed,
+            http=http,
+        ),
+        "workload": workload,
+        "wait_reason": wait_reason,
+    }
+
+
+def test_build_recent_requests(monkeypatch):
+    # fetch_recent_events returns newest-first; build_recent_requests preserves it.
+    rows_in = [
+        rev(enq=300.0, acq=301.0, ft=302.0, done=305.0, ct=40, model="m2", key="k2"),
+        rev(enq=200.0, acq=201.0, ft=202.0, done=205.0),
+        # in-flight row: no slot/first-token/done yet → latencies must be null.
+        rev(
+            enq=100.0,
+            acq=None,
+            ft=None,
+            done=None,
+            outcome="cancelled_queued",
+            ct=None,
+            http=None,
+            wait_reason="budget_full",
+        ),
+    ]
+    captured = {}
+
+    def fake_fetch(db_url, limit):
+        captured["limit"] = limit
+        return rows_in
+
+    monkeypatch.setattr(m, "fetch_recent_events", fake_fetch)
+    out = m.build_recent_requests("db", 50, {"k2": "bob"})
+
+    # the requested limit is passed straight through to the fetcher.
+    assert captured["limit"] == 50
+    # ordering preserved: newest (t_enqueue=300) first.
+    assert [r["t_enqueue"] for r in out] == [300.0, 200.0, 100.0]
+    # alias resolution and field mapping.
+    assert out[0]["consumer"] == "bob"
+    assert out[0]["model"] == "m2"
+    assert out[1]["consumer"] == "k1"  # unknown fp falls back to the fingerprint
+    # latencies in ms for a completed row (enq=200,acq=201,ft=202,done=205).
+    r1 = out[1]
+    assert r1["queue_wait"] == 1000  # (201-200)*1000
+    assert r1["ttft"] == 1000  # (202-201)*1000
+    assert r1["service"] == 4000  # (205-201)*1000
+    assert r1["total"] == 5000  # (205-200)*1000
+    assert r1["decode_tok_s"] == round(20 / (205 - 202), 1)  # ct / decode window
+    assert r1["workload"] == "scout"
+    # in-flight row is still RETURNED but every derived latency is null.
+    inflight = out[2]
+    assert inflight["outcome"] == "cancelled_queued"
+    for f in ("queue_wait", "ttft", "service", "total", "decode_tok_s"):
+        assert inflight[f] is None
+    assert inflight["wait_reason"] == "budget_full"
+
+
+def test_build_recent_requests_forwards_limit(monkeypatch):
+    # The hard cap lives in the API layer; the builder just forwards its limit
+    # straight to fetch_recent_events (which applies it as SQL LIMIT).
+    seen = {}
+
+    def fake(db_url, limit):
+        seen["limit"] = limit
+        return []
+
+    monkeypatch.setattr(m, "fetch_recent_events", fake)
+    assert m.build_recent_requests("db", 500, {}) == []
+    assert seen["limit"] == 500

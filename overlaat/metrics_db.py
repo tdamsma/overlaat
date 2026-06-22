@@ -245,6 +245,22 @@ def fetch_events(db_url: str, since: float, until: float | None = None) -> list[
     return out
 
 
+def fetch_recent_events(db_url: str, limit: int) -> list[dict]:
+    """The most recent `limit` request events, newest first (ORDER BY t_enqueue
+    DESC). Unlike fetch_events this applies NO `t_done >= since` filter, so rows
+    still in flight or queued (NULL t_acquire / t_first_token / t_done) are
+    included — the recent-requests table wants to show them too."""
+    ph = db.placeholder(db_url)
+    sql = _EVENT_SELECT + f" ORDER BY t_enqueue DESC LIMIT {ph}"
+    with _connect(db_url) as c, c.cursor() as cur:
+        cur.execute(sql, (limit,))
+        rows = cur.fetchall()
+    out = [dict(zip(_EVENT_FIELDS, r, strict=False)) for r in rows]
+    for e in out:
+        e["streamed"] = db.normalize_streamed(e["streamed"])
+    return out
+
+
 def fetch_host_samples(db_url: str, since: float) -> list[dict]:
     sql = (
         "SELECT ts, gpu_pct, gpu_freq_mhz, ram_wired_gb, ram_active_gb, "
@@ -650,4 +666,55 @@ def build_workloads(db_url: str, since: float, now: float) -> list[dict]:
         d["error_rate"] = round(d["errored"] / d["requests"], 3) if d["requests"] else 0
         out.append(d)
     out.sort(key=lambda d: d["requests"], reverse=True)
+    return out
+
+
+def _ms(a: float | None, b: float | None) -> int | None:
+    """Latency b - a in milliseconds, rounded, or None if either end is missing.
+    Same epoch-seconds → ms convention the rest of the module uses."""
+    if a is None or b is None:
+        return None
+    return round((b - a) * 1000)
+
+
+def build_recent_requests(db_url: str, limit: int, aliases: dict[str, str]) -> list[dict]:
+    """The most recent `limit` requests, newest first, as flat per-row records for
+    the dashboard's searchable requests table. One row per request_events row,
+    including in-flight / queued / abandoned rows whose timestamps are still NULL
+    (their un-computable latencies come back as None, never zero-filled).
+
+    Per row: t_enqueue (epoch seconds), model, consumer (aliased key_fp),
+    workload, outcome, http_status, streamed; the four derived latencies in ms
+    (queue_wait / ttft / service / total — each defined exactly as elsewhere in
+    this module); prompt/completion tokens; decode_tok_s (completion_tokens over
+    the decode window, dropped above the hardware ceiling as a near-zero-window
+    artifact); and wait_reason."""
+    events = fetch_recent_events(db_url, limit)
+    out = []
+    for e in events:
+        ft, dn, ct = e["t_first_token"], e["t_done"], e["completion_tokens"]
+        decode_tok_s = None
+        if ct and ft is not None and dn is not None and dn > ft:
+            rate = ct / (dn - ft)
+            if rate <= MAX_PLAUSIBLE_DECODE:
+                decode_tok_s = round(rate, 1)
+        out.append(
+            {
+                "t_enqueue": e["t_enqueue"],
+                "model": e["model_requested"],
+                "consumer": aliases.get(e["key_fp"], e["key_fp"]),
+                "workload": e.get("workload"),
+                "outcome": e["outcome"],
+                "http_status": e["http_status"],
+                "streamed": e["streamed"],
+                "queue_wait": _ms(e["t_enqueue"], e["t_acquire"]),
+                "ttft": _ms(e["t_acquire"], e["t_first_token"]),
+                "service": _ms(e["t_acquire"], dn),
+                "total": _ms(e["t_enqueue"], dn),
+                "prompt_tokens": e["prompt_tokens"],
+                "completion_tokens": ct,
+                "decode_tok_s": decode_tok_s,
+                "wait_reason": e["wait_reason"],
+            }
+        )
     return out

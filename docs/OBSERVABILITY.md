@@ -20,7 +20,7 @@ plus a host sampler.
                                                                           ▲
   host sampler (5s) ── host GPU%/RAM + per-backend RSS ────────────────────┘ host_samples (PG)
 
-  usage-api reads both tables ──▶ /now /timeline /models /consumers /workloads + dashboard
+  usage-api reads both tables ──▶ /now /timeline /models /consumers /workloads /requests + dashboard
 ```
 
 The queue-proxy is the only component that sees **every** request's full
@@ -278,9 +278,11 @@ gate.
 | `GET /models?last=` | capacity view: per-model outcome counts, latency split (`queue_wait` / `ttft` / `service` / `total`, p50 + p95), throughput-by-measured-concurrency (min-sample guarded), **`decode_solo_tok_s`** (median decode tok/s over near-solo streamed calls — the backend-health number) and **`out_tok_p50`** (median completion tokens per completed call — the output-size/behaviour number). |
 | `GET /consumers?last=` | per key alias: requests by outcome, tokens, service-seconds, abandoned-rate, models used. |
 | `GET /workloads?last=` | per workload label: requests by outcome, p50/p95 queue wait + total latency, completion tokens, abandoned/error rate (untagged traffic under `(untagged)`). |
+| `GET /requests?limit=` | the most recent `limit` requests (newest first, `limit` clamped to `[1, 500]`, default 100) as flat per-row records — `t_enqueue`, model, consumer (aliased `key_fp`), workload, outcome, `http_status`, streamed, the four derived latencies (`queue_wait`/`ttft`/`service`/`total`, ms), prompt/completion tokens, `decode_tok_s`, `wait_reason`. Includes in-flight / queued / abandoned rows (their un-computable latencies come back `null`, never zero-filled). Backs the dashboard's searchable / sortable / filterable *recent requests* table; no `last=` window — it is the latest N rows regardless of age. |
 | `GET /healthz` | liveness + DB check. |
 
-`window` (`last=`) accepts `30m | 1h | 6h | 24h | 7d`.
+`window` (`last=`) accepts `30m | 1h | 6h | 24h | 7d` (all routes except `/requests`,
+which takes `limit=` instead of a window).
 
 ## The only remaining caveats — each stated once
 

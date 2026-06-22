@@ -116,6 +116,37 @@ async def test_workloads(monkeypatch):
     assert r.json()["workloads"] == [row]
 
 
+async def test_requests(monkeypatch):
+    monkeypatch.setattr(ua, "alias_map", lambda: {})
+    row = {"t_enqueue": 100.0, "model": "m1", "consumer": "k1", "outcome": "completed"}
+    monkeypatch.setattr(mdb, "build_recent_requests", lambda *a, **k: [row])
+    async with asgi() as c:
+        r = await c.get("/requests?limit=100")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["_meta"]["kind"] == "requests"
+    assert body["limit"] == 100
+    assert body["requests"] == [row]
+
+
+async def test_requests_limit_clamped(monkeypatch):
+    monkeypatch.setattr(ua, "alias_map", lambda: {})
+    seen = {}
+
+    def fake(db, limit, aliases):
+        seen["limit"] = limit
+        return []
+
+    monkeypatch.setattr(mdb, "build_recent_requests", fake)
+    async with asgi() as c:
+        hi = await c.get("/requests?limit=99999")
+        lo = await c.get("/requests?limit=0")
+    # hard cap 500, floor 1.
+    assert hi.json()["limit"] == 500
+    assert lo.json()["limit"] == 1
+    assert seen["limit"] == 1
+
+
 async def test_dashboard_shows_version():
     async with asgi() as c:
         r = await c.get("/")

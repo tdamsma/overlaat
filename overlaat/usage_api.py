@@ -17,6 +17,7 @@ Endpoints, each defined by the question it answers:
                      solo decode tok/s + p50 output tokens (backend-health + behaviour)
   GET /consumers     per key_alias: requests, tokens, service-seconds, abandoned rate
   GET /workloads     per workload label: requests, latency p50/p95, tokens, error rate
+  GET /requests      most recent N requests (flat rows) for the searchable table
   GET /healthz
 
 Live in-flight comes from the queue's in-memory state (its /__queue/status
@@ -254,6 +255,16 @@ def workloads(last: str = Query("24h")):
     return {"_meta": _meta("workloads", 30), "window": {"last": last}, "workloads": rows}
 
 
+@app.get("/requests")
+def requests(limit: int = Query(100)):
+    """The most recent `limit` requests (newest first) as flat rows for the
+    dashboard's searchable / sortable / filterable table. `limit` is clamped to
+    [1, 500] — the table is client-side, so a few hundred rows is plenty."""
+    n = max(1, min(limit, 500))
+    rows = metrics_db.build_recent_requests(DB, n, alias_map())
+    return {"_meta": _meta("requests", 5), "limit": n, "requests": rows}
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard():
     # Single-sourced from overlaat.__version__ (the running version), substituted
@@ -301,6 +312,12 @@ svg.chart{width:100%;height:150px;display:block}
 .pill.ab{background:rgba(248,81,73,.15);color:var(--hot)}.pill.er{background:rgba(210,153,34,.15);color:var(--warn)}
 .err{color:var(--hot);font-family:var(--mono);font-size:12px}
 footer{color:var(--dim);font-size:11px;text-align:center;padding:14px}
+.controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+.controls input{background:#0d1117;color:var(--text);border:1px solid var(--line);padding:6px 10px;border-radius:6px;font:inherit;font-size:12px;min-width:200px}
+.controls .count{color:var(--dim);font-size:11px;margin-left:auto}
+table.sortable th{cursor:pointer;user-select:none;white-space:nowrap}
+table.sortable th:hover{color:var(--text)}
+table.sortable th .ind{color:var(--accent);margin-left:3px}
 </style></head><body>
 <header>
   <h1>Overlaat metrics</h1>
@@ -387,6 +404,19 @@ footer{color:var(--dim);font-size:11px;text-align:center;padding:14px}
       <th class="num">err %</th><th class="num">qwait p50</th><th class="num">qwait p95</th>
       <th class="num">total p50</th><th class="num">total p95</th><th class="num">compl tok</th>
     </tr></thead><tbody></tbody></table>
+  </div>
+
+  <div class="card span12">
+    <h2>recent requests <span class="dim">(latest 100 — search, filter, sort)</span></h2>
+    <div class="controls">
+      <input id="req-search" type="search" placeholder="search any column…" autocomplete="off">
+      <select id="req-model"><option value="">all models</option></select>
+      <select id="req-consumer"><option value="">all consumers</option></select>
+      <select id="req-outcome"><option value="">all outcomes</option></select>
+      <span class="count" id="req-count"></span>
+    </div>
+    <table id="requests" class="sortable"><thead><tr></tr></thead><tbody></tbody></table>
+    <div class="note">One row per request lifecycle (newest first) — includes queued / abandoned rows whose latencies are not yet computable (shown as —). No prompt or response text is stored; only counts, timings, model, consumer and workload.</div>
   </div>
 </main>
 <footer id="footer"></footer>
@@ -621,12 +651,102 @@ function renderWorkloads(d){
   }).join('')||'<tr><td colspan="10" class="dim">no calls</td></tr>';
 }
 
+// ── recent requests: searchable / sortable / filterable client-side table ────
+// Columns: {key, label, num?} — `num` columns sort numerically and right-align.
+// `time` keeps the raw epoch for sorting but renders as local HH:MM:SS.
+const REQ_COLS=[
+  {key:'t_enqueue',label:'time',num:true,time:true},
+  {key:'model',label:'model'},
+  {key:'consumer',label:'consumer'},
+  {key:'workload',label:'workload'},
+  {key:'outcome',label:'outcome'},
+  {key:'queue_wait',label:'qwait',num:true,ms:true},
+  {key:'ttft',label:'ttft',num:true,ms:true},
+  {key:'service',label:'service',num:true,ms:true},
+  {key:'total',label:'total',num:true,ms:true},
+  {key:'prompt_tokens',label:'prompt tok',num:true,tok:true},
+  {key:'completion_tokens',label:'compl tok',num:true,tok:true},
+  {key:'decode_tok_s',label:'decode tok/s',num:true},
+];
+let REQ_ROWS=[];                       // cached fetched rows (never refetched on UI change)
+let REQ_SORT={key:'t_enqueue',asc:false};  // default: time descending (newest first)
+const hhmmss=e=>e==null?'—':new Date(e*1000).toLocaleTimeString([],{hour12:false});
+function reqOutcomeCell(r){
+  // completed=ok, errored=warn, abandoned/cancelled=hot/dim; http status appended.
+  const cls={completed:'ok',upstream_error:'warn',client_abandoned:'hot',cancelled_queued:'dim'}[r.outcome]||'dim';
+  const st=r.http_status!=null?` <span class="dim">${r.http_status}</span>`:'';
+  return `<span class="${cls}">${r.outcome||'—'}</span>${st}`;
+}
+function reqCell(r,c){
+  if(c.time)return hhmmss(r[c.key]);
+  if(c.ms)return ms(r[c.key]);
+  if(c.tok)return fmt(r[c.key]);
+  if(c.key==='decode_tok_s')return r[c.key]==null?'—':r[c.key];
+  const v=r[c.key];return v==null||v===''?'—':v;
+}
+function reqMatchesText(r,q){
+  if(!q)return true;
+  // case-insensitive match across every VISIBLE cell's rendered text.
+  return REQ_COLS.some(c=>{
+    const t=(c.key==='outcome'?r.outcome:reqCell(r,c));
+    return String(t==null?'':t).toLowerCase().includes(q);
+  });
+}
+function renderRequests(){
+  const thead=$('#requests thead tr'),tb=$('#requests tbody');
+  thead.innerHTML=REQ_COLS.map(c=>{
+    const ind=REQ_SORT.key===c.key?`<span class="ind">${REQ_SORT.asc?'▲':'▼'}</span>`:'';
+    return `<th data-k="${c.key}" class="${c.num?'num':''}">${c.label}${ind}</th>`;
+  }).join('');
+  const q=($('#req-search').value||'').trim().toLowerCase();
+  const fm=$('#req-model').value,fc=$('#req-consumer').value,fo=$('#req-outcome').value;
+  let rows=REQ_ROWS.filter(r=>
+    (!fm||r.model===fm)&&(!fc||r.consumer===fc)&&(!fo||r.outcome===fo)&&reqMatchesText(r,q));
+  const col=REQ_COLS.find(c=>c.key===REQ_SORT.key)||REQ_COLS[0],dir=REQ_SORT.asc?1:-1;
+  rows=rows.slice().sort((a,b)=>{
+    let x=a[col.key],y=b[col.key];
+    if(col.num){ // nulls always sort last regardless of direction
+      if(x==null&&y==null)return 0;if(x==null)return 1;if(y==null)return -1;
+      return (x-y)*dir;
+    }
+    x=String(x==null?'':x).toLowerCase();y=String(y==null?'':y).toLowerCase();
+    return x<y?-1*dir:x>y?1*dir:0;
+  });
+  tb.innerHTML=rows.map(r=>'<tr>'+REQ_COLS.map(c=>{
+    const cell=c.key==='outcome'?reqOutcomeCell(r):reqCell(r,c);
+    return `<td class="${c.num?'num':''}">${cell}</td>`;
+  }).join('')+'</tr>').join('')||`<tr><td colspan="${REQ_COLS.length}" class="dim">no matching requests</td></tr>`;
+  $('#req-count').textContent=`${rows.length} / ${REQ_ROWS.length} rows`;
+}
+function fillReqFilter(sel,vals){
+  const cur=sel.value,opts=['<option value="">all '+sel.dataset.all+'</option>']
+    .concat([...new Set(vals)].filter(v=>v!=null&&v!=='').sort().map(v=>`<option>${v}</option>`));
+  sel.innerHTML=opts.join('');
+  if([...sel.options].some(o=>o.value===cur))sel.value=cur;
+}
+function setRequests(d){
+  REQ_ROWS=(d&&d.requests)||[];
+  fillReqFilter($('#req-model'),REQ_ROWS.map(r=>r.model));
+  fillReqFilter($('#req-consumer'),REQ_ROWS.map(r=>r.consumer));
+  fillReqFilter($('#req-outcome'),REQ_ROWS.map(r=>r.outcome));
+  renderRequests();
+}
+$('#req-model').dataset.all='models';$('#req-consumer').dataset.all='consumers';$('#req-outcome').dataset.all='outcomes';
+['#req-search','#req-model','#req-consumer','#req-outcome'].forEach(s=>{
+  $(s).addEventListener('input',renderRequests);$(s).addEventListener('change',renderRequests);});
+$('#requests thead').addEventListener('click',ev=>{
+  const th=ev.target.closest('th');if(!th)return;const k=th.dataset.k;if(!k)return;
+  if(REQ_SORT.key===k)REQ_SORT.asc=!REQ_SORT.asc;
+  else REQ_SORT={key:k,asc:false}; // new column starts descending
+  renderRequests();
+});
+
 async function refresh(){
   const w=$('#window').value;
   try{
-    const [now,tl,mdl,cons,wl]=await Promise.all([
-      J('/now'),J('/timeline?last='+w),J('/models?last='+w),J('/consumers?last='+w),J('/workloads?last='+w)]);
-    renderNow(now);renderConc(tl);renderHost(tl);renderIO(tl);renderOut(tl);renderModels(mdl);renderConsumers(cons);renderWorkloads(wl);
+    const [now,tl,mdl,cons,wl,req]=await Promise.all([
+      J('/now'),J('/timeline?last='+w),J('/models?last='+w),J('/consumers?last='+w),J('/workloads?last='+w),J('/requests?limit=100')]);
+    renderNow(now);renderConc(tl);renderHost(tl);renderIO(tl);renderOut(tl);renderModels(mdl);renderConsumers(cons);renderWorkloads(wl);setRequests(req);
     $('#footer').textContent='updated '+new Date().toLocaleTimeString()+' · window '+w+' · bucket '+tl.window.bucket_s+'s';
   }catch(e){$('#footer').innerHTML='<span class="err">'+e+'</span>';}
 }
