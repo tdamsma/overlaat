@@ -8,6 +8,19 @@ versions without a compatibility guarantee.
 
 ## [Unreleased]
 
+### Fixed
+- **`request_events.wait_reason` no longer mislabels cap/exclusion waits as
+  `budget_full`** (closes #17). The reason was finalized at admission by
+  recomputing `_cap_full` / `_exclusion_blocks` — but those blockers have
+  necessarily cleared by the moment a waiter is admitted (that is *why* it is
+  admitted), so every cap- or exclusion-bound wait fell through to the
+  `budget_full` catch-all (observed: 816/858 waits on a live deployment with a
+  non-binding budget and a binding per-model cap). The live cause is now latched
+  onto the waiter while it is parked (`_record_wait_reasons`) and read back at
+  admission; `reserved` / `aged_in` still derive from state that survives to
+  admission. Observability-only — admission, caps, pool budgets, exclusivity and
+  throughput were always correct.
+
 ## [0.0.5] — 2026-06-21
 
 ### Changed

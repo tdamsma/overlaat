@@ -279,6 +279,56 @@ async def test_displaced_reserved_head_not_mislabeled_reserved():
     assert medium.wait_reason == "budget_full"
 
 
+async def test_admitted_after_cap_wait_reports_model_cap_not_budget_full():
+    # Regression (#17): a request that waited because its per-model backend cap
+    # was full, then was admitted once a slot freed, must PERSIST wait_reason
+    # "model_cap" — not "budget_full". The bug: _reason_for recomputed _cap_full
+    # at admission, after the cap had necessarily cleared (that is why the waiter
+    # is being admitted), so every cap wait fell through to the budget_full
+    # catch-all. Budget here is deliberately non-binding (the live-deployment
+    # repro: OVERLAAT_BUDGET=9999 with a binding cap), so budget is never the
+    # constraint.
+    s = Scheduler(budget=9999.0, caps={"qwen": 1}, costs={"qwen": 0.25})
+    running = make_waiter(s, "qwen", req_id="running")
+    s.enqueue(running)
+    assert admitted(running)
+
+    waiter = make_waiter(s, "qwen", req_id="waiter")
+    s.enqueue(waiter)
+    assert not admitted(waiter)  # cap=1 full; budget has ample room
+    assert waiter.wait_reason == "model_cap"  # live (parked) classification
+    assert s.reserved_for is None  # a cap block is not reserved-for
+
+    s.release("qwen")  # the slot frees; the waiter is admitted this pump
+    assert admitted(waiter)
+    assert waiter.wait_reason == "model_cap"  # latched through admission
+
+
+async def test_admitted_after_exclusion_wait_reports_exclusive_not_budget_full():
+    # Regression (#17): a request that waited because a DIFFERENT member held the
+    # exclusive pool mutex, then was admitted on the mutex hand-off, must persist
+    # "exclusive" — not "budget_full". Budget is non-binding so the only blocker
+    # is the exclusion mutex, which has cleared by the admitting pass.
+    s = Scheduler(
+        budget=9999.0,
+        caps={"a": 2, "b": 2},
+        pool_of={"a": "fat", "b": "fat"},
+        pool_exclusive={"fat"},
+    )
+    a = make_waiter(s, "a", req_id="a")
+    s.enqueue(a)
+    assert admitted(a)  # resident member of the exclusive pool
+
+    b = make_waiter(s, "b", req_id="b")
+    s.enqueue(b)
+    assert not admitted(b)  # different member: exclusion-blocked, budget has room
+    assert b.wait_reason == "exclusive"  # live (parked) classification
+
+    s.release("a")  # pool drains; the mutex hands off to b
+    assert admitted(b)
+    assert b.wait_reason == "exclusive"  # latched through admission
+
+
 async def test_aging_prevents_starvation():
     clock = Clock(0.0)
     # A moderate job that is not the head can be leapfrogged by fresher,
