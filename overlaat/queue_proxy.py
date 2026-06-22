@@ -96,6 +96,42 @@ DEFAULT_PRIORITY = _env_int("OVERLAAT_DEFAULT_PRIORITY", 0)
 # core scheduler reserves eagerly today; a non-zero grace is reserved for a
 # future refinement and is parsed here so the env surface is stable.
 RESERVATION_GRACE = _env_float("OVERLAAT_RESERVATION_GRACE", 0.0)
+
+
+def _parse_weight_tiers(spec: str) -> tuple[tuple[float, float], ...]:
+    """Parse ``OVERLAAT_PROMPT_WEIGHT_TIERS`` into sorted ``(upper, multiplier)``
+    pairs. Format: ``"<tok>:<mult>,<tok>:<mult>,inf:<mult>"`` — each pair is an
+    inclusive upper bound on estimated prompt tokens and the cost multiplier
+    applied at or below it. Falls back to the module default on any parse error
+    (never raises — a bad knob must not take the proxy down)."""
+    try:
+        tiers: list[tuple[float, float]] = []
+        for part in spec.split(","):
+            tok_s, mult_s = part.split(":")
+            tok_s = tok_s.strip().lower()
+            upper = float("inf") if tok_s in ("inf", "*") else float(tok_s)
+            tiers.append((upper, float(mult_s)))
+        tiers.sort(key=lambda t: t[0])
+        if tiers and all(m >= 1.0 for _, m in tiers):
+            return tuple(tiers)
+    except Exception:
+        pass
+    return _DEFAULT_WEIGHT_TIERS
+
+
+# Prompt-size-weighted admission cost (#18). A request's cost is its model's base
+# cost times the tier multiplier for its estimated prompt size; the scheduler
+# then hard-clamps that to the pool budget (per-pool ``heavy_max``). Default tiers
+# leave small prompts at 1x and price heavy prompts up so they consume more of the
+# pool and fewer run at once. Override with OVERLAAT_PROMPT_WEIGHT_TIERS; set every
+# multiplier to 1 (or "inf:1") to disable weighting entirely.
+_DEFAULT_WEIGHT_TIERS: tuple[tuple[float, float], ...] = (
+    (2000.0, 1.0),  # <= ~2k tokens: interactive, full speed
+    (8000.0, 2.0),  # ~2k-8k tokens: medium, 2x
+    (float("inf"), 4.0),  # > ~8k tokens: heavy, 4x
+)
+PROMPT_WEIGHT_TIERS = _parse_weight_tiers(os.environ.get("OVERLAAT_PROMPT_WEIGHT_TIERS", ""))
+CHARS_PER_TOKEN = 4  # crude bytes->tokens estimate; coarse on purpose (#18)
 # How often the per-key priority-ceiling cache is refreshed from the LiteLLM
 # verification-token table (mirrors the usage-api alias refresh cadence).
 KEY_CEILING_REFRESH_S = 60.0
@@ -259,6 +295,74 @@ def load_pools(path: Path) -> tuple[dict[str, float], set[str]]:
     return budgets, exclusive
 
 
+def load_pool_heavy_max(path: Path) -> dict[str, str]:
+    """Read the optional per-pool ``heavy_max`` from ``overlaat.pools`` (#18):
+    how much of a pool's budget a single prompt-size-weighted request may take.
+
+    Returns ``{pool: "full_pool" | "leave_room"}`` for pools that declare it; a
+    pool absent here defaults to ``"leave_room"`` in the scheduler. An invalid
+    value is ignored (logged), so a typo never silently flips the clamp."""
+    if not path.exists():
+        return {}
+    try:
+        cfg = yaml.safe_load(path.read_text()) or {}
+    except Exception:
+        return {}
+    section = (cfg.get("overlaat") or {}).get("pools") or {}
+    out: dict[str, str] = {}
+    if isinstance(section, dict):
+        for pool, spec in section.items():
+            if not isinstance(pool, str) or not isinstance(spec, dict):
+                continue
+            hm = spec.get("heavy_max")
+            if hm in ("full_pool", "leave_room"):
+                out[pool] = hm
+            elif hm is not None:
+                sys.stderr.write(
+                    f"queue-proxy: ignoring invalid heavy_max '{hm}' for pool "
+                    f"'{pool}' (expected 'full_pool' or 'leave_room')\n"
+                )
+    return out
+
+
+def estimate_prompt_tokens(payload: dict) -> int:
+    """Cheap prompt-size estimate (chars / CHARS_PER_TOKEN) from a request body.
+
+    Sums the text content of a chat ``messages`` array (handling both the string
+    and the multimodal list-of-parts content shapes) or a completions ``prompt``.
+    Returns 0 for any body with no measurable prompt (e.g. /embeddings, /rerank),
+    which the caller maps to weight 1x. Intentionally coarse — admission cost is a
+    blunt knob and a real tokenizer is not worth the proxy hot-path cost (#18)."""
+    chars = 0
+    msgs = payload.get("messages")
+    if isinstance(msgs, list):
+        for m in msgs:
+            content = m.get("content") if isinstance(m, dict) else None
+            if isinstance(content, str):
+                chars += len(content)
+            elif isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        chars += len(part["text"])
+    else:
+        prompt = payload.get("prompt")
+        if isinstance(prompt, str):
+            chars += len(prompt)
+        elif isinstance(prompt, list):
+            chars += sum(len(p) for p in prompt if isinstance(p, str))
+    return chars // CHARS_PER_TOKEN
+
+
+def prompt_weight(est_tokens: int, tiers: tuple[tuple[float, float], ...]) -> float:
+    """Cost multiplier for an estimated prompt size, from the tier table. Returns
+    the multiplier of the first tier whose inclusive upper bound is >= the
+    estimate (tiers are sorted ascending); the last tier's bound is +inf."""
+    for upper, mult in tiers:
+        if est_tokens <= upper:
+            return mult
+    return tiers[-1][1] if tiers else 1.0
+
+
 def resolve_pool_config(
     caps: dict[str, int],
     costs: dict[str, float],
@@ -332,6 +436,7 @@ POOL_BUDGET, POOL_EXCLUSIVE = resolve_pool_config(
     _DECLARED_EXCLUSIVE,
     BUDGET,
 )
+POOL_HEAVY_MAX: dict[str, str] = load_pool_heavy_max(LITELLM_CONFIG)
 SEMAPHORES: dict[str, asyncio.Semaphore] = {}
 
 # The single global scheduler instance (set in lifespan when SCHEDULER_ON). One
@@ -608,6 +713,7 @@ async def lifespan(app: FastAPI):
             pool_of=POOL_OF,
             pool_budget=POOL_BUDGET,
             pool_exclusive=POOL_EXCLUSIVE,
+            pool_heavy_max=POOL_HEAVY_MAX,
             default_cost=DEFAULT_COST,
             default_priority=DEFAULT_PRIORITY,
             aging_rate=AGING_RATE,
@@ -905,6 +1011,7 @@ async def proxy(full_path: str, request: Request):
     is_llm = path in PROXIED_PATHS
 
     requested_priority: int | None = None
+    prompt_tokens_est = 0
     if is_llm and body:
         try:
             payload = json.loads(body)
@@ -916,6 +1023,7 @@ async def proxy(full_path: str, request: Request):
             p = payload.get("priority")
             if isinstance(p, int) and not isinstance(p, bool):
                 requested_priority = p
+            prompt_tokens_est = estimate_prompt_tokens(payload)
             # Force include_usage so the usage chunk arrives in the stream → we
             # get reliable token counts without relying on the backend default.
             if streamed and path == "/v1/chat/completions":
@@ -949,7 +1057,9 @@ async def proxy(full_path: str, request: Request):
         }
 
     if SCHEDULER_ON and model is not None and SCHED is not None:
-        return await _admit_scheduler(request, path, body, model, ev, requested_priority)
+        return await _admit_scheduler(
+            request, path, body, model, ev, requested_priority, prompt_tokens_est
+        )
 
     # ── scheduler OFF (kill-switch): the original per-model semaphore path ──────
     if sem is None:
@@ -1020,6 +1130,7 @@ async def _admit_scheduler(
     model: str,
     ev: dict | None,
     requested_priority: int | None,
+    prompt_tokens_est: int = 0,
 ):
     """Cost-weighted global admission (scheduler ON).
 
@@ -1038,7 +1149,11 @@ async def _admit_scheduler(
     assert sched is not None
     key_fp = _key_fp(request)
     base_priority = DEFAULT_PRIORITY if requested_priority is None else requested_priority
-    cost = sched.cost(model)
+    # Prompt-size-weighted cost (#18): heavier prompts cost more of the pool, so
+    # fewer run at once and the interactive fast lane keeps flowing. The scheduler
+    # hard-clamps the weighted cost to the pool budget (per-pool heavy_max).
+    weight = prompt_weight(prompt_tokens_est, PROMPT_WEIGHT_TIERS)
+    cost = sched.weighted_cost(model, weight)
     pool = sched.pool(model)
 
     metrics = METRICS[model]

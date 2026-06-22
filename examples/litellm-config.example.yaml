@@ -150,15 +150,25 @@ model_list:
 # govern how many of its streams run. This REPLACES the old forced-1.0 fat-slot
 # cost hack with honest 1/cap costs (#12). `overlaat_slot: NAME` on a model is the
 # deprecated alias that auto-creates `NAME` as an exclusive pool.
+#
+# `heavy_max` controls how much of the pool a single prompt-size-weighted request
+# may consume (#18): `leave_room` (default) caps a heavy prompt's cost at
+# `budget - base_cost` so one more light call always fits; `full_pool` lets a giant
+# prompt take the whole pool and run alone (batch-job intent). Prompt-size weighting
+# itself is configured globally via OVERLAAT_PROMPT_WEIGHT_TIERS.
 overlaat:
   pools:
     default:            # implicit; declare only to override its budget
       budget: 1.0       # default = OVERLAAT_BUDGET
+      heavy_max: leave_room   # default; protects the interactive fast lane (#18)
     fat-slot:
       budget: 1.0
       exclusive: true   # hard mutex: only ONE distinct member active at a time
     embeddings:
       budget: 1.0       # its own budget → isolated from the swap engine (#11)
+    batch:
+      budget: 1.0
+      heavy_max: full_pool    # a huge prompt may consume the whole pool, alone (#18)
 
 # ─── Routing ──────────────────────────────────────────────────────────────────
 # NO cross-model fallbacks (deliberate). Silent degradation to a different or
