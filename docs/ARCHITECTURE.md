@@ -419,6 +419,17 @@ runs out of a checkout without site-specific paths.
 | `OVERLAAT_DEFAULT_PRIORITY` | `0` | priority when neither the request nor the key supplies one; also the fallback per-key ceiling |
 | `OVERLAAT_AGING_RATE` | `0.0` | linear priority gain per second waited (`0.0` = aging off → pure FIFO at equal priority) |
 | `OVERLAAT_RESERVATION_GRACE` | `0.0` | reservation is eager at `0.0`; a non-zero grace is parsed but reserved for a future refinement |
+| `OVERLAAT_UPSTREAM_CONNECT_TIMEOUT` | `5.0` | upstream httpx connect timeout (s) |
+| `OVERLAAT_UPSTREAM_READ_TIMEOUT` | `300.0` | upstream httpx **inter-byte** read timeout (s) — a wedged-connection backstop, NOT a total-request deadline (a slow token trickle never trips it) |
+| `OVERLAAT_UPSTREAM_WRITE_TIMEOUT` | `60.0` | upstream httpx write timeout (s) |
+| `OVERLAAT_UPSTREAM_POOL_TIMEOUT` | `5.0` | upstream httpx connection-pool acquire timeout (s) |
+
+**Deadline ownership.** The authoritative *total* per-request deadline is the
+inference **engine's own `--timeout`** (operator deployment), which can evict a
+stalled or runaway generation GPU-side. The proxy read-timeout is **inter-byte and
+subordinate**: it should sit just *above* the engine deadline so the engine's clean
+cancel wins and the proxy only cuts a connection the engine has left fully wedged.
+Layer it `engine --timeout < LiteLLM timeout ≲ proxy read backstop`.
 
 Per-model `model_info.overlaat_cost` (explicit cost override) and
 `model_info.overlaat_slot` (swap-slot group → cost forced to `1.0`) live in the LiteLLM

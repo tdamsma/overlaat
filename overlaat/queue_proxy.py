@@ -97,6 +97,29 @@ DEFAULT_PRIORITY = _env_int("OVERLAAT_DEFAULT_PRIORITY", 0)
 # future refinement and is parsed here so the env surface is stable.
 RESERVATION_GRACE = _env_float("OVERLAAT_RESERVATION_GRACE", 0.0)
 
+# Upstream (LiteLLM) HTTP client timeouts (#24). httpx `read` is the INTER-BYTE
+# timeout, NOT a total-request deadline — a slow trickle of tokens never trips it.
+# The authoritative total per-request deadline is the inference ENGINE's own
+# `--timeout` (operator deployment); the proxy read-timeout is subordinate and
+# should sit just ABOVE that engine deadline so the engine's clean cancel wins
+# and the proxy only cuts a connection the engine left fully wedged. Lowered from
+# the previous hardcoded 1200s read so a wedged stream frees its slot promptly.
+UPSTREAM_CONNECT_TIMEOUT = _env_float("OVERLAAT_UPSTREAM_CONNECT_TIMEOUT", 5.0)
+UPSTREAM_READ_TIMEOUT = _env_float("OVERLAAT_UPSTREAM_READ_TIMEOUT", 300.0)
+UPSTREAM_WRITE_TIMEOUT = _env_float("OVERLAAT_UPSTREAM_WRITE_TIMEOUT", 60.0)
+UPSTREAM_POOL_TIMEOUT = _env_float("OVERLAAT_UPSTREAM_POOL_TIMEOUT", 5.0)
+
+
+def _upstream_timeout() -> httpx.Timeout:
+    """The upstream httpx timeout, built from the OVERLAAT_UPSTREAM_*_TIMEOUT
+    knobs. Reads the module-level constants so tests can monkeypatch them."""
+    return httpx.Timeout(
+        connect=UPSTREAM_CONNECT_TIMEOUT,
+        read=UPSTREAM_READ_TIMEOUT,
+        write=UPSTREAM_WRITE_TIMEOUT,
+        pool=UPSTREAM_POOL_TIMEOUT,
+    )
+
 
 def _parse_weight_tiers(spec: str) -> tuple[tuple[float, float], ...]:
     """Parse ``OVERLAAT_PROMPT_WEIGHT_TIERS`` into sorted ``(upper, multiplier)``
@@ -425,6 +448,88 @@ def resolve_pool_config(
     return pool_budget, pool_exclusive
 
 
+def warn_if_self_protection_inert(
+    caps: dict[str, int],
+    costs: dict[str, float],
+    pool_of: dict[str, str],
+    pool_budget: dict[str, float],
+    default_budget: float,
+    tiers: tuple[tuple[float, float], ...],
+    *,
+    log: bool = True,
+) -> list[str]:
+    """Warn at startup when the cost-scheduler's self-protection is INERT (#24).
+
+    Self-protection against a single workload's oversized prompts needs BOTH a
+    non-flat prompt-weight tier table (so heavy prompts cost more) AND a pool
+    budget that can actually bind (so that higher cost translates to fewer
+    concurrent admits). It is inert when the tiers are flat (every multiplier
+    == 1.0) AND a pool's budget is effectively unbounded — large enough that, given
+    the per-model caps, the budget admit test can never fail and only the raw
+    per-model caps bind (the incident config: OVERLAAT_BUDGET=9999 + flat tiers).
+
+    A pool's budget is "effectively unbounded" iff every model in it has a finite
+    cap AND the maximum committable cost (sum of cap*cost over its members) is
+    <= the pool budget — then `used + cost <= B` always holds, so the budget is
+    never the binding constraint. An uncapped model makes the budget bindable
+    (unbounded in_flight can always reach B), so such a pool is NOT flagged.
+
+    Returns the list of inert pool names (also writes a warning to stderr when
+    `log` and the list is non-empty). Returns [] when self-protection is active.
+    """
+    max_mult = max((m for _, m in tiers), default=1.0)
+    flat = max_mult <= 1.0
+    if not flat:
+        # Non-flat tiers price heavy prompts up → self-protection is active.
+        return []
+
+    # Group every known model into its resolved pool (a model with no explicit
+    # assignment is in "default"); only pools with >= 1 member are considered.
+    members_by_pool: dict[str, list[str]] = defaultdict(list)
+    for m in set(caps) | set(costs) | set(pool_of):
+        members_by_pool[pool_of.get(m, "default")].append(m)
+
+    inert: list[str] = []
+    for pool, members in members_by_pool.items():
+        b = pool_budget.get(pool, default_budget)
+        committed = 0.0
+        bindable = False
+        for m in members:
+            cap = caps.get(m)
+            if cap is None:
+                # An uncapped model can always drive in_flight up to the budget,
+                # so the budget binds — this pool is not inert.
+                bindable = True
+                break
+            cost = costs[m] if m in costs else 1.0 / cap
+            committed += cap * cost
+        if bindable:
+            continue
+        # Inert iff the budget sits at or above the maximum achievable `used`, so
+        # the admit test (used + cost <= B) can never fail and only caps bind.
+        if b >= committed - 1e-9:
+            inert.append(pool)
+
+    if log and inert:
+        pool_list = ", ".join(
+            f"'{p}' (budget {pool_budget.get(p, default_budget):g})" for p in inert
+        )
+        sys.stderr.write(
+            "queue-proxy: WARNING cost-scheduler self-protection is INERT — "
+            "prompt-weight tiers are flat (all multipliers 1.0) AND these pools "
+            f"have a budget that can never bind given their caps: {pool_list}. "
+            "A single workload's oversized prompts can monopolize the backend and "
+            "starve the latency-sensitive fast lane (only the raw per-model cap "
+            "binds, so a few giant prefills pin every slot). Remediation: set "
+            "OVERLAAT_PROMPT_WEIGHT_TIERS to a non-flat table (e.g. "
+            "'2000:1,8000:2,inf:4') and/or lower OVERLAAT_BUDGET so the pool budget "
+            "binds. See docs/COST-SCHEDULER.md.\n"
+        )
+        sys.stderr.flush()
+
+    return inert
+
+
 CAPS: dict[str, int] = load_caps(LITELLM_CONFIG)
 COSTS, POOL_OF, _EXCLUSIVE_SEED = load_model_info(LITELLM_CONFIG)
 _DECLARED_BUDGETS, _DECLARED_EXCLUSIVE = load_pools(LITELLM_CONFIG)
@@ -438,6 +543,12 @@ POOL_BUDGET, POOL_EXCLUSIVE = resolve_pool_config(
     BUDGET,
 )
 POOL_HEAVY_MAX: dict[str, str] = load_pool_heavy_max(LITELLM_CONFIG)
+
+# Emit the self-protection inert warning alongside the other startup-time pool
+# logging (kept silent on the kill-switch path). See warn_if_self_protection_inert.
+if SCHEDULER_ON:
+    warn_if_self_protection_inert(CAPS, COSTS, POOL_OF, POOL_BUDGET, BUDGET, PROMPT_WEIGHT_TIERS)
+
 SEMAPHORES: dict[str, asyncio.Semaphore] = {}
 
 # The single global scheduler instance (set in lifespan when SCHEDULER_ON). One
@@ -734,7 +845,7 @@ async def lifespan(app: FastAPI):
     global EVENT_Q, SCHED
     app.state.client = httpx.AsyncClient(
         base_url=UPSTREAM,
-        timeout=httpx.Timeout(connect=5.0, read=1200.0, write=60.0, pool=5.0),
+        timeout=_upstream_timeout(),
         limits=httpx.Limits(max_keepalive_connections=64, max_connections=128),
     )
     EVENT_Q = asyncio.Queue(maxsize=EVENT_QUEUE_MAX)

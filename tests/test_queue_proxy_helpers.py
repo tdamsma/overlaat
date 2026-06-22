@@ -166,3 +166,70 @@ def test_resolve_workload_neither():
     wl, changed = qp.resolve_workload(None, payload)
     assert wl is None
     assert changed is False  # no body mutation → no re-serialize
+
+
+# -- self-protection inert detector (#24) ------------------------------------
+
+
+def test_self_protection_inert_detector():
+    flat = ((float("inf"), 1.0),)
+
+    # Flat tiers + an effectively-unbounded budget → the per-model cap is the only
+    # binder (the incident config): INERT.
+    assert (
+        qp.warn_if_self_protection_inert(
+            caps={"m": 4},
+            costs={},
+            pool_of={},
+            pool_budget={},
+            default_budget=9999.0,
+            tiers=flat,
+            log=False,
+        )
+        == ["default"]
+    )
+
+    # Non-flat tiers price heavy prompts up → self-protection is ACTIVE even with
+    # the same unbounded budget.
+    assert (
+        qp.warn_if_self_protection_inert(
+            caps={"m": 4},
+            costs={},
+            pool_of={},
+            pool_budget={},
+            default_budget=9999.0,
+            tiers=qp._DEFAULT_WEIGHT_TIERS,
+            log=False,
+        )
+        == []
+    )
+
+    # Flat tiers but a budget that BINDS (committed 2.0 across two cap-4 models at
+    # cost 0.25 → max used 2.0 > budget 1.0) → the budget can throttle: NOT inert.
+    assert (
+        qp.warn_if_self_protection_inert(
+            caps={"m": 4, "n": 4},
+            costs={},
+            pool_of={},
+            pool_budget={},
+            default_budget=1.0,
+            tiers=flat,
+            log=False,
+        )
+        == []
+    )
+
+    # Flat tiers + an UNCAPPED model → unbounded in_flight can always reach B, so
+    # the budget is bindable: NOT inert.
+    assert (
+        qp.warn_if_self_protection_inert(
+            caps={},
+            costs={"u": 1.0},
+            pool_of={},
+            pool_budget={},
+            default_budget=9999.0,
+            tiers=flat,
+            log=False,
+        )
+        == []
+    )
