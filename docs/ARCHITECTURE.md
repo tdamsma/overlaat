@@ -217,7 +217,7 @@ domain in front of live traffic.
   swap-slot model loads   ── cold-load start/ready             ──▶ model_loads   (Postgres)
 
   usage-api (:4100) reads request_events + host_samples + model_loads
-                    ──▶ /now /timeline /models /perf /consumers + dashboard
+                    ──▶ /now /timeline /models /consumers /workloads /requests + dashboard
 ```
 
 The relationship is deliberate:
@@ -324,10 +324,11 @@ sample count are returned `sufficient:false` and never shown as a trend.
 |---|---|
 | `GET /` | HTML dashboard |
 | `GET /now` | live: per-model in_flight/queued (scraped from the proxy's `/__queue/status`, because events are written on completion), latest host GPU%/RAM + backend RSS, recent completed per key |
-| `GET /timeline?last=` | time-series: host GPU%/RAM + backend RSS, per-model offered/active, per-key active concurrency. Bucket size auto-picked from the window. |
-| `GET /models?last=` | capacity: per model outcome counts, latency split (queue_wait / ttft / service / total p50/p95), throughput-by-measured-concurrency (min-sample guarded) |
-| `GET /perf?last=` | backend-health: per-model decode tok/s over time, with an all-calls median and a **solo** median (calls that ran near-alone) that isolates engine health from load — a sustained drop in the solo line means the backend is degrading, independent of how busy it is |
+| `GET /timeline?last=` | time-series for all charts: host GPU%/RAM + backend RSS, per-model offered/active, per-consumer active concurrency (work-by-customer), aggregate input/output tok/s, completion tok/s per model. All series time-weighted; bucket size auto-picked from the window. |
+| `GET /models?last=` | capacity: per model outcome counts, latency split (queue_wait / ttft / service / total p50/p95), throughput-by-measured-concurrency (min-sample guarded), `decode_solo_tok_s` (backend-health: median decode tok/s over near-solo streamed calls — a sustained drop = degradation) and `out_tok_p50` (output-size/behaviour) |
 | `GET /consumers?last=` | per key alias: requests by outcome, tokens, service-seconds, abandoned-rate, models used |
+| `GET /workloads?last=` | per workload label: requests by outcome, p50/p95 queue wait + total latency, completion tokens, error/abandoned rate |
+| `GET /requests?limit=` | the most recent `limit` requests (newest first, clamped to `[1, 500]`, default 100) as flat per-row records — time, model, consumer, workload, outcome + http status, the four derived latencies (ms), prompt/completion tokens, decode tok/s, wait_reason. Includes in-flight / queued / abandoned rows (NULL latencies as `null`). Backs the dashboard's searchable / sortable / filterable *recent requests* table; uses `limit=` rather than a `last=` window. |
 | `GET /healthz` | liveness + DB check |
 
 Live in-flight necessarily comes from the proxy's in-memory status endpoint, not from

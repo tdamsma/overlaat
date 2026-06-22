@@ -11,11 +11,13 @@ Endpoints, each defined by the question it answers:
 
   GET /              dashboard (HTML)
   GET /now           live: per-model in_flight/queued, host GPU%/wired + backend RSS
-  GET /timeline      time-series: host + offered/active concurrency per model & key
-  GET /models        capacity: outcome counts, latency split, throughput-by-concurrency
-  GET /perf          decode-throughput trend per model (server-health monitoring)
+  GET /timeline      time-series: host + offered/active concurrency, by-consumer load,
+                     input/output tok/s, completion tok/s per model
+  GET /models        capacity: outcome counts, latency split, throughput-by-concurrency,
+                     solo decode tok/s + p50 output tokens (backend-health + behaviour)
   GET /consumers     per key_alias: requests, tokens, service-seconds, abandoned rate
   GET /workloads     per workload label: requests, latency p50/p95, tokens, error rate
+  GET /requests      most recent N requests (flat rows) for the searchable table
   GET /healthz
 
 Live in-flight comes from the queue's in-memory state (its /__queue/status
@@ -116,20 +118,41 @@ def healthz():
 @app.get("/now")
 def now():
     """Live snapshot. In-flight/queued from the queue; host from the latest
-    sample; recent 5-min completed events per key for context."""
+    sample; recent 5-min completed events per key for context.
+
+    Live proxy state — *not* DB events. The `queued` list (per model row, plus a
+    flat top-level `queued` across all models) is the proxy's in-memory
+    wait-queue: each waiter is a request *parked right now*, with its consumer
+    alias resolved and (when the scheduler is on) `priority`,
+    `effective_priority`, `pool`, and `wait_reason` (`model_cap` / `budget_full`
+    / `exclusive`, or null on the scheduler kill-switch). Distinct from the
+    recent-requests / event tables, which only hold *finished* requests."""
     aliases = alias_map()
     qs = scrape_queue_status()
     host = metrics_db.latest_host(DB)
 
     models = []
     busy = []
+    all_queued = []
     for m in qs.get("by_model", []):
         if not (m.get("in_flight") or m.get("queue_depth") or m.get("cap")):
             continue
-        queued = [
-            {"key": aliases.get(q["key_fp"], q["key_fp"]), "age_s": q["age_s"]}
-            for q in m.get("queued", [])
-        ]
+        queued = []
+        for q in m.get("queued", []):
+            # Enrich each waiter, null-safe: _queued_view omits the scheduler
+            # fields when the scheduler kill-switch is on, so .get() them.
+            item = {
+                "key": aliases.get(q["key_fp"], q["key_fp"]),
+                "model": m["model"],
+                "id": q.get("id"),
+                "age_s": q.get("age_s"),
+                "priority": q.get("priority"),
+                "effective_priority": q.get("effective_priority"),
+                "pool": q.get("pool"),
+                "wait_reason": q.get("wait_reason"),
+            }
+            queued.append(item)
+            all_queued.append(item)
         row = {
             "model": m["model"],
             "cap": m.get("cap"),
@@ -182,6 +205,10 @@ def now():
         "scheduler": qs.get("scheduler"),
         "budget": qs.get("budget"),
         "models": models,
+        # Flat list of every queued waiter across all models (same dicts as the
+        # per-model `queued`). Live in-memory proxy state — used by the
+        # "queued now — by user" card; null-safe scheduler fields.
+        "queued": all_queued,
         "totals": {
             "in_flight": qs.get("total_in_flight", 0),
             "queue_depth": qs.get("total_queue_depth", 0),
@@ -228,32 +255,11 @@ def models(last: str = Query("24h")):
             "aggregate_tok_s = Σ completion_tokens / Σ service_s within the cell; "
             f"shown only when calls >= {metrics_db.MIN_SAMPLES} (else 'sufficient'=false).",
             "latency: queue_wait/ttft/service/total split, completed calls only.",
-        ],
-    }
-
-
-@app.get("/perf")
-def perf(last: str = Query("24h")):
-    """Decode-throughput trend per model over time — server-health monitoring
-    (catches backend degradation from real traffic, no synthetic load)."""
-    win = parse_window(last)
-    bucket = pick_bucket(win)
-    now_ts = time.time()
-    series = metrics_db.build_perf_trend(DB, now_ts - win, now_ts, bucket, alias_map())
-    return {
-        "_meta": _meta("perf", 30),
-        "window": {"last": last, "bucket_s": bucket},
-        **series,
-        "notes": [
-            "decode_tok_s = completion_tokens / (t_done - t_first_token), "
-            "streamed completed calls only.",
-            "decode_solo_p50 = median for calls at mean concurrency < 1.5 "
-            "(isolates server health from load); a sustained drop = degradation.",
-            "thinking-mode models (first token = reasoning_content) have no "
-            "decode window and don't appear here.",
-            "comp_tok_p50 = median completion tokens per completed call "
-            "(streamed + non-streamed) — output-size/behaviour trend; a step "
-            "change = thinking-mode toggle or prompt change, not load.",
+            "solo decode tok/s = median completion_tokens / (t_done - t_first_token) "
+            "over near-solo (mean concurrency < 1.5) streamed completed calls — the "
+            "backend-health number; a sustained drop with no load = degradation.",
+            "p50 out tok = median completion tokens per completed call (behaviour/"
+            "output-size; a step change = thinking-mode toggle or prompt change).",
         ],
     }
 
@@ -272,6 +278,16 @@ def workloads(last: str = Query("24h")):
     now_ts = time.time()
     rows = metrics_db.build_workloads(DB, now_ts - win, now_ts)
     return {"_meta": _meta("workloads", 30), "window": {"last": last}, "workloads": rows}
+
+
+@app.get("/requests")
+def requests(limit: int = Query(100)):
+    """The most recent `limit` requests (newest first) as flat rows for the
+    dashboard's searchable / sortable / filterable table. `limit` is clamped to
+    [1, 500] — the table is client-side, so a few hundred rows is plenty."""
+    n = max(1, min(limit, 500))
+    rows = metrics_db.build_recent_requests(DB, n, alias_map())
+    return {"_meta": _meta("requests", 5), "limit": n, "requests": rows}
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -296,10 +312,16 @@ header h1{margin:0;font-size:16px;font-weight:600}
 header .verdict{color:var(--accent);font-family:var(--mono);font-size:13px}
 header .spacer{flex:1}
 select,button{background:var(--panel);color:var(--text);border:1px solid var(--line);padding:6px 10px;border-radius:6px;font:inherit;font-size:12px;cursor:pointer}
-main{padding:16px 20px;display:grid;gap:16px;grid-template-columns:repeat(12,1fr)}
+main{padding:16px 20px}
+/* Three columns: detail tables (~5) · charts-in-time (~4) · at-a-glance summary (~3).
+   Collapses to a single stacked column on narrow viewports. */
+.cols{display:grid;gap:16px;grid-template-columns:5fr 4fr 3fr;align-items:start}
+.col{display:flex;flex-direction:column;gap:16px;min-width:0}
+@media(max-width:1100px){.cols{grid-template-columns:1fr}}
 .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}
 .card h2{margin:0 0 10px;font-size:12px;font-weight:600;text-transform:uppercase;color:var(--dim);letter-spacing:.5px}
-.span12{grid-column:span 12}.span6{grid-column:span 6}.span4{grid-column:span 4}.span8{grid-column:span 8}
+/* recent-requests is 13 wide — let it scroll inside its card, not blow out the column */
+.scrollx{overflow-x:auto}
 .kpis{display:flex;gap:24px;flex-wrap:wrap}
 .kpi .v{font-family:var(--mono);font-size:24px}.kpi .l{color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:.5px}
 .kpi .v.hot{color:var(--hot)}.kpi .v.warn{color:var(--warn)}.kpi .v.ok{color:var(--ok)}
@@ -315,12 +337,43 @@ svg.chart{width:100%;height:150px;display:block}
 .axis{fill:var(--dim);font-size:10px;font-family:var(--mono)}
 .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11px;color:var(--dim);margin-top:6px}
 .legend span span{display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:middle;margin-right:4px}
+/* shared-axis chart stack: four charts in one column, one x-axis, one hover crosshair */
+.chartstack{position:relative}
+.chartstack .chart{height:130px}
+.chartstack .chart.short{height:96px}
+.cline{stroke:var(--accent);stroke-width:1;stroke-dasharray:3 3;pointer-events:none;opacity:0}
+.cstack-overlay{position:absolute;inset:0;cursor:crosshair}
+.creadout{position:absolute;top:2px;font-family:var(--mono);font-size:11px;color:var(--text);background:rgba(13,17,23,.85);border:1px solid var(--line);border-radius:4px;padding:1px 6px;pointer-events:none;opacity:0;white-space:nowrap;transform:translateX(-50%);z-index:2}
+.chartstack h2{margin-bottom:4px}
+/* compact at-a-glance mini-bars (right column) */
+.mbar{display:flex;align-items:center;gap:8px;font-family:var(--mono);font-size:11px;margin:4px 0}
+.mbar .lbl{flex:0 0 38%;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mbar .track{flex:1;height:8px;background:#21262d;border-radius:4px;overflow:hidden}
+.mbar .track>i{display:block;height:100%;border-radius:4px}
+.mbar .val{flex:0 0 auto;color:var(--dim);min-width:46px;text-align:right}
+/* server-health verdict card */
+.health{font-family:var(--mono)}
+.health .state{font-size:18px;font-weight:600}
+.health .state.ok{color:var(--ok)}.health .state.warn{color:var(--warn)}.health .state.hot{color:var(--hot)}
+.health .reason{font-size:12px;color:var(--dim);margin-top:4px}
 .note{font-size:11px;color:var(--dim);margin-top:6px}
 .bar{height:6px;background:#21262d;border-radius:3px;overflow:hidden}.bar>i{display:block;height:100%;background:var(--accent)}
 .pill{display:inline-block;padding:1px 6px;border-radius:10px;font-size:10px;margin-left:4px}
 .pill.ab{background:rgba(248,81,73,.15);color:var(--hot)}.pill.er{background:rgba(210,153,34,.15);color:var(--warn)}
 .err{color:var(--hot);font-family:var(--mono);font-size:12px}
+.quser{font-family:var(--mono);font-size:12px;margin-bottom:8px}
+.quser .qhead{display:flex;justify-content:space-between;gap:8px}
+.quser .qhead b{font-weight:600}
+.quser ul{list-style:none;margin:3px 0 0;padding:0 0 0 10px;border-left:1px solid var(--line)}
+.quser li{padding:1px 0;color:var(--dim);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.quser li .qm{color:var(--text)}
 footer{color:var(--dim);font-size:11px;text-align:center;padding:14px}
+.controls{display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-bottom:10px}
+.controls input{background:#0d1117;color:var(--text);border:1px solid var(--line);padding:6px 10px;border-radius:6px;font:inherit;font-size:12px;min-width:200px}
+.controls .count{color:var(--dim);font-size:11px;margin-left:auto}
+table.sortable th{cursor:pointer;user-select:none;white-space:nowrap}
+table.sortable th:hover{color:var(--text)}
+table.sortable th .ind{color:var(--accent);margin-left:3px}
 </style></head><body>
 <header>
   <h1>Overlaat metrics</h1>
@@ -337,76 +390,129 @@ footer{color:var(--dim);font-size:11px;text-align:center;padding:14px}
   <button id="refresh">refresh</button>
 </header>
 <main>
-  <div class="card span12"><div class="kpis" id="kpis"></div></div>
+ <div class="cols">
 
-  <div class="card span6">
-    <h2>host — GPU% &amp; wired RAM</h2>
-    <svg id="hostchart" class="chart" preserveAspectRatio="none"></svg>
-    <div class="legend">
-      <span><span style="background:#f85149"></span>GPU %</span>
-      <span><span style="background:#58a6ff"></span>wired GB / total</span>
+  <!-- ── LEFT: detail tables ─────────────────────────────────────────── -->
+  <div class="col" id="col-left">
+    <div class="card">
+      <h2>live now</h2>
+      <table id="now-models"><thead><tr><th>model</th><th class="num">in&nbsp;flight</th><th class="num">queued</th></tr></thead><tbody></tbody></table>
+      <div class="note" id="now-note"></div>
+    </div>
+
+    <div class="card">
+      <h2>queued now — by user</h2>
+      <div id="queued-users"></div>
+      <div class="note">Live in-memory queue state from the proxy — requests waiting <em>right now</em>, grouped by consumer. Distinct from the recent-requests table below, which is finished requests.</div>
+    </div>
+
+    <div class="card">
+      <h2>models — outcomes, latency &amp; throughput vs measured concurrency</h2>
+      <div class="scrollx">
+      <table id="models"><thead><tr>
+        <th>model</th><th class="num">req</th><th class="num">ok</th><th class="num">aband</th>
+        <th class="num">err</th><th class="num">canc</th>
+        <th class="num">qwait p50</th><th class="num">ttft p50</th><th class="num">service p50/p95</th>
+        <th class="num">solo decode tok/s</th><th class="num">p50 out tok</th>
+        <th>throughput @ concurrency (tok/s)</th>
+      </tr></thead><tbody></tbody></table>
+      </div>
+      <div class="note" id="models-note"></div>
+    </div>
+
+    <div class="card">
+      <h2>consumers</h2>
+      <div class="scrollx">
+      <table id="consumers"><thead><tr>
+        <th>key</th><th class="num">req</th><th class="num">ok</th><th class="num">aband</th>
+        <th class="num">aband %</th><th class="num">err</th>
+        <th class="num">prompt tok</th><th class="num">compl tok</th><th class="num">service s</th><th>models</th>
+      </tr></thead><tbody></tbody></table>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>workloads</h2>
+      <div class="scrollx">
+      <table id="workloads"><thead><tr>
+        <th>workload</th><th class="num">req</th><th class="num">ok</th><th class="num">aband %</th>
+        <th class="num">err %</th><th class="num">qwait p50</th><th class="num">qwait p95</th>
+        <th class="num">total p50</th><th class="num">total p95</th><th class="num">compl tok</th>
+      </tr></thead><tbody></tbody></table>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>recent requests <span class="dim">(latest 100 — search, filter, sort)</span></h2>
+      <div class="controls">
+        <input id="req-search" type="search" placeholder="search any column…" autocomplete="off">
+        <select id="req-model"><option value="">all models</option></select>
+        <select id="req-consumer"><option value="">all consumers</option></select>
+        <select id="req-outcome"><option value="">all outcomes</option></select>
+        <span class="count" id="req-count"></span>
+      </div>
+      <div class="scrollx">
+        <table id="requests" class="sortable"><thead><tr></tr></thead><tbody></tbody></table>
+      </div>
+      <div class="note">One row per request lifecycle (newest first) — includes queued / abandoned rows whose latencies are not yet computable (shown as —). No prompt or response text is stored; only counts, timings, model, consumer and workload.</div>
     </div>
   </div>
 
-  <div class="card span6">
-    <h2>active concurrency by consumer <span class="dim">(slot-holders)</span></h2>
-    <svg id="concchart" class="chart" preserveAspectRatio="none"></svg>
-    <div class="legend" id="conc-legend"></div>
-    <div class="note">y = mean simultaneous slot-holders per key (capped per model by definition). Includes abandoned calls until the slot was released.</div>
+  <!-- ── MIDDLE: charts in time, one shared x-axis + hover crosshair ──── -->
+  <div class="col" id="col-mid">
+    <div class="card chartstack" id="chartstack">
+      <h2>host — GPU% &amp; wired RAM</h2>
+      <svg id="hostchart" class="chart short" preserveAspectRatio="none"></svg>
+      <div class="legend">
+        <span><span style="background:#f85149"></span>GPU %</span>
+        <span><span style="background:#58a6ff"></span>wired GB / total</span>
+      </div>
+
+      <h2>work by customer <span class="dim">(GPU-busy share by consumer)</span></h2>
+      <svg id="concchart" class="chart short" preserveAspectRatio="none"></svg>
+      <div class="legend" id="conc-legend"></div>
+
+      <h2>throughput — input vs output <span class="dim">(tok/s, all models)</span></h2>
+      <svg id="iochart" class="chart short" preserveAspectRatio="none"></svg>
+      <div class="legend" id="io-legend"></div>
+
+      <h2>output throughput by model <span class="dim">(completion tok/s, stacked)</span></h2>
+      <svg id="outchart" class="chart" preserveAspectRatio="none"></svg>
+      <div class="legend" id="out-legend"></div>
+
+      <div class="note">All four charts share one time window, bucket and horizontal plot rectangle — their vertical gridlines line up; only the bottom chart labels the x-axis. Hover anywhere to drop a shared time crosshair. Step segments = one flat value per bucket; no smoothing.</div>
+      <!-- transparent overlay spanning the stack: maps mouse-x → bucket → crosshair -->
+      <div class="cstack-overlay" id="cstack-overlay"></div>
+      <div class="creadout" id="creadout"></div>
+    </div>
   </div>
 
-  <div class="card span12">
-    <h2>decode throughput trend <span class="dim">(tok/s — server-health monitor)</span></h2>
-    <svg id="perfchart" class="chart" preserveAspectRatio="none"></svg>
-    <div class="legend" id="perf-legend"></div>
-    <div class="note">solo decode tok/s (calls at mean concurrency &lt; 1.5) per model — isolates backend health from load. A sustained drop with no load = backend degradation (e.g. some engines slow down over long uptime → restart the backend service to recover). Thinking-mode models excluded (no first-token marker).</div>
+  <!-- ── RIGHT: at-a-glance summary / attribution ────────────────────── -->
+  <div class="col" id="col-right">
+    <div class="card">
+      <h2>server health</h2>
+      <div class="health" id="health"><div class="state">…</div><div class="reason"></div></div>
+    </div>
+
+    <div class="card"><div class="kpis" id="kpis"></div></div>
+
+    <div class="card">
+      <h2>top consumers <span class="dim">(load-share — service-seconds)</span></h2>
+      <div id="top-consumers"></div>
+    </div>
+
+    <div class="card">
+      <h2>top models <span class="dim">(load — completed req)</span></h2>
+      <div id="top-models"></div>
+    </div>
+
+    <div class="card">
+      <h2>memory holders <span class="dim">(RSS — what fills RAM)</span></h2>
+      <table id="rss"><thead><tr><th>process</th><th class="num">RSS GB</th><th>share</th></tr></thead><tbody></tbody></table>
+    </div>
   </div>
 
-  <div class="card span12">
-    <h2>output size trend <span class="dim">(p50 completion tokens/call — behaviour monitor)</span></h2>
-    <svg id="tokchart" class="chart" preserveAspectRatio="none"></svg>
-    <div class="legend" id="tok-legend"></div>
-    <div class="note">median completion tokens per completed call, per model (streamed + non-streamed). A step change = a behavioural shift, not a load change: thinking mode toggled, a prompt edit, or a different caller — e.g. disabling thinking shows as a 2-3&times; drop while decode tok/s stays flat.</div>
-  </div>
-
-  <div class="card span4">
-    <h2>live now</h2>
-    <table id="now-models"><thead><tr><th>model</th><th class="num">in&nbsp;flight</th><th class="num">queued</th></tr></thead><tbody></tbody></table>
-    <div class="note" id="now-note"></div>
-  </div>
-
-  <div class="card span8">
-    <h2>memory holders <span class="dim">(RSS — what fills RAM)</span></h2>
-    <table id="rss"><thead><tr><th>process</th><th class="num">RSS GB</th><th>share</th></tr></thead><tbody></tbody></table>
-  </div>
-
-  <div class="card span12">
-    <h2>models — outcomes, latency &amp; throughput vs measured concurrency</h2>
-    <table id="models"><thead><tr>
-      <th>model</th><th class="num">req</th><th class="num">ok</th><th class="num">aband</th>
-      <th class="num">err</th><th class="num">canc</th>
-      <th class="num">qwait p50</th><th class="num">ttft p50</th><th class="num">service p50/p95</th>
-      <th>throughput @ concurrency (tok/s)</th>
-    </tr></thead><tbody></tbody></table>
-    <div class="note" id="models-note"></div>
-  </div>
-
-  <div class="card span12">
-    <h2>consumers</h2>
-    <table id="consumers"><thead><tr>
-      <th>key</th><th class="num">req</th><th class="num">ok</th><th class="num">aband</th>
-      <th class="num">aband %</th><th class="num">err</th>
-      <th class="num">prompt tok</th><th class="num">compl tok</th><th class="num">service s</th><th>models</th>
-    </tr></thead><tbody></tbody></table>
-  </div>
-  <div class="card span12">
-    <h2>workloads</h2>
-    <table id="workloads"><thead><tr>
-      <th>workload</th><th class="num">req</th><th class="num">ok</th><th class="num">aband %</th>
-      <th class="num">err %</th><th class="num">qwait p50</th><th class="num">qwait p95</th>
-      <th class="num">total p50</th><th class="num">total p95</th><th class="num">compl tok</th>
-    </tr></thead><tbody></tbody></table>
-  </div>
+ </div>
 </main>
 <footer id="footer"></footer>
 <script>
@@ -418,99 +524,239 @@ async function J(u){const r=await fetch(u);if(!r.ok)throw new Error(u+' '+r.stat
 
 function svgW(el){return Math.max(Math.round(el.clientWidth)||600,200);}
 
-function renderHost(tl){
-  const el=$('#hostchart'),H=150,padL=30,padR=8,padT=8,padB=16;
-  const W=svgW(el);el.setAttribute('viewBox',`0 0 ${W} ${H}`);
-  const b=tl.buckets||[],n=b.length;
+// ── shared plot geometry (the four stacked charts must line up) ──────────────
+// Every chart in the middle column uses the SAME horizontal plot rectangle —
+// identical padL/padR and identical pixel↔time mapping — so their vertical
+// gridlines align perfectly when stacked. padL is a fixed constant for all four
+// (not per-chart) so the left edges coincide to the pixel. Only the bottom chart
+// renders x-axis time labels; the others draw the vertical gridlines and omit
+// the labels, so the stack reads as one shared axis.
+const PLOT={padL:40,padR:8,padT:8,padB:14};   // shared; padB leaves room for bottom labels only
+// Fixed viewBox heights (px) per chart row — deterministic (not layout-derived),
+// so geometry is identical headless or in-browser. Upper three are "short".
+const CH_H={hostchart:96,concchart:96,iochart:96,outchart:130};
+let GEO=null;     // last shared geometry — drives the crosshair
+let LAST_TL=null; // last /timeline payload — read by the crosshair readout
+function plotGeom(el,b){
+  const n=(b||[]).length,W=svgW(el),H=CH_H[el.id]||130;
+  const cw=W-PLOT.padL-PLOT.padR,sx=cw/Math.max(n,1),xAt=i=>PLOT.padL+i*sx;
+  return {W,H,n,cw,ch:H-PLOT.padT-PLOT.padB,sx,xAt,padL:PLOT.padL,padR:PLOT.padR,padT:PLOT.padT,padB:PLOT.padB};
+}
+// Horizontal gridlines (4) + vertical gridlines at start/mid/end; bottom-axis
+// time labels only when opts.axis. Returns an SVG fragment string.
+function gridlines(g,b,opts){
+  const o=opts||{},{padL,padR,padT,ch,W,cw}=g,n=g.n;let h='';
+  for(let i=0;i<=4;i++){const y=padT+ch/4*i;h+=`<line class="tick" x1="${padL}" y1="${y}" x2="${W-padR}" y2="${y}"/>`;}
+  // vertical gridlines at the three label anchors so every chart's verticals match
+  if(n>=2){const ys=padT,ye=padT+ch;[0,Math.floor(n/2),n-1].forEach(i=>{const x=padL+cw*(i/(n-1));
+    h+=`<line class="tick" x1="${x.toFixed(1)}" y1="${ys}" x2="${x.toFixed(1)}" y2="${ye}"/>`;});}
+  if(o.axis&&n>=2){const lbl=i=>{const d=new Date(b[i]*1000);return d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});};
+    const y=g.H-3;
+    h+=`<text x="${padL}" y="${y}" class="axis">${lbl(0)}</text>`+
+      `<text x="${padL+cw/2}" y="${y}" text-anchor="middle" class="axis">${lbl(Math.floor(n/2))}</text>`+
+      `<text x="${W-padR}" y="${y}" text-anchor="end" class="axis">${lbl(n-1)}</text>`;}
+  return h;
+}
+
+// ── step builders ──────────────────────────────────────────────────────────
+// All time-series render as STEP charts: each bucket value is held flat across
+// the bucket's horizontal extent [x_i, x_i+sx], then steps vertically to the
+// next value — NO linear interpolation, NO smoothing. `sx` is the bucket width
+// in px; xAt(i)=padL+i*sx is the left edge of bucket i.
+
+// Step polyline ("d" path) through (i, y(v_i)). Holds each y flat for one bucket
+// width then steps. Returns {d, started} where d is "" if no point. Null values
+// break the line into separate segments (each starting with M).
+function stepLine(arr,xAt,yAt,sx){
+  let d='',open=false;
+  for(let i=0;i<arr.length;i++){
+    const v=arr[i];
+    if(v==null){open=false;continue;}
+    const x0=xAt(i),x1=x0+sx,y=yAt(v);
+    if(!open){d+='M'+x0.toFixed(1)+','+y.toFixed(1);open=true;}
+    else{d+='L'+x0.toFixed(1)+','+y.toFixed(1);}
+    d+='L'+x1.toFixed(1)+','+y.toFixed(1);
+  }
+  return d;
+}
+// Stacked step-area band between a lower cumulative and an upper cumulative.
+// Top boundary = forward step polyline of `upper`; bottom = reverse step of
+// `lower`. Closed into a filled polygon. Treats null as 0 (stacked context).
+function stepBand(lower,upper,xAt,yAt,sx){
+  const n=upper.length;let top='';
+  for(let i=0;i<n;i++){const x0=xAt(i),x1=x0+sx,y=yAt(upper[i]||0);
+    top+=(i?'L':'M')+x0.toFixed(1)+','+y.toFixed(1)+'L'+x1.toFixed(1)+','+y.toFixed(1);}
+  let bot='';
+  for(let i=n-1;i>=0;i--){const x0=xAt(i),x1=x0+sx,y=yAt(lower[i]||0);
+    bot+='L'+x1.toFixed(1)+','+y.toFixed(1)+'L'+x0.toFixed(1)+','+y.toFixed(1);}
+  return top+bot+'Z';
+}
+
+// All four chart renderers below take the SHARED geometry `g` (from plotGeom)
+// rather than computing their own — so they share one x-scale and plot rect.
+// `axis` is true only for the bottom chart, which draws the x-axis time labels.
+
+// Chart 1 (top) — host GPU% & wired RAM, two step lines (RAM as a step area).
+function renderHost(tl,g,axis){
+  const el=$('#hostchart'),b=tl.buckets||[],n=g.n;
+  el.setAttribute('viewBox',`0 0 ${g.W} ${g.H}`);
   if(!n){el.innerHTML='<text x="50%" y="50%" text-anchor="middle" class="axis">no data</text>';return;}
-  const cw=W-padL-padR,ch=H-padT-padB,sx=cw/Math.max(n-1,1);
-  let h='';for(let i=0;i<=4;i++){const y=padT+ch/4*i;h+=`<line class="tick" x1="${padL}" y1="${y}" x2="${W-padR}" y2="${y}"/>`;}
+  const{padL,padT,ch,sx,xAt}=g;
+  let h=gridlines(g,b,{axis});
   const gpu=tl.host.gpu_pct,wired=tl.host.wired_gb,total=tl.host.total_gb||256;
-  const line=(arr,max,col)=>{let d='';let started=false;arr.forEach((v,i)=>{if(v==null)return;const x=padL+i*sx,y=padT+ch-(Math.min(v,max)/max)*ch;d+=(started?'L':'M')+x.toFixed(1)+','+y.toFixed(1);started=true;});return d?`<path d="${d}" fill="none" stroke="${col}" stroke-width="1.5"/>`:'';};
-  // wired as area
-  let area='';let st=false;wired.forEach((v,i)=>{if(v==null)return;const x=padL+i*sx,y=padT+ch-(Math.min(v,total)/total)*ch;area+=(st?'L':'M')+x.toFixed(1)+','+y.toFixed(1);st=true;});
-  if(area){const lx=padL+(n-1)*sx;area=`<path d="${area}L${lx.toFixed(1)},${(padT+ch).toFixed(1)}L${padL},${(padT+ch).toFixed(1)}Z" fill="#58a6ff22" stroke="none"/>`;}
-  h+=area+line(wired,total,'#58a6ff')+line(gpu,100,'#f85149');
+  const yWired=v=>padT+ch-(Math.min(v,total)/total)*ch;
+  const yGpu=v=>padT+ch-(Math.min(v,100)/100)*ch;
+  const wd=stepLine(wired,xAt,yWired,sx);
+  if(wd){ // filled step-area under the wired-RAM step line
+    let top='',started=false;
+    for(let i=0;i<n;i++){const v=wired[i];if(v==null)continue;const x0=xAt(i),x1=x0+sx,y=yWired(v);
+      top+=(started?'L':'M')+x0.toFixed(1)+','+y.toFixed(1)+'L'+x1.toFixed(1)+','+y.toFixed(1);started=true;}
+    const base=(padT+ch).toFixed(1),lx=(padL+n*sx).toFixed(1);
+    h+=`<path d="${top}L${lx},${base}L${padL},${base}Z" fill="#58a6ff22" stroke="none"/>`;
+  }
+  if(wd)h+=`<path d="${wd}" fill="none" stroke="#58a6ff" stroke-width="1.5"/>`;
+  const gd=stepLine(gpu,xAt,yGpu,sx);
+  if(gd)h+=`<path d="${gd}" fill="none" stroke="#f85149" stroke-width="1.5"/>`;
   h+=`<text x="${padL-4}" y="${padT+4}" text-anchor="end" class="axis">100%</text>`;
   h+=`<text x="${padL-4}" y="${padT+ch}" text-anchor="end" class="axis">0</text>`;
-  h+=axisX(b,padL,cw,W,padR,H);
   el.innerHTML=h;
 }
 
-function axisX(b,padL,cw,W,padR,H){
-  const n=b.length;if(n<2)return '';
-  const lbl=i=>{const d=new Date(b[i]*1000);return d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});};
-  return `<text x="${padL}" y="${H-4}" class="axis">${lbl(0)}</text>`+
-    `<text x="${padL+cw/2}" y="${H-4}" text-anchor="middle" class="axis">${lbl(Math.floor(n/2))}</text>`+
-    `<text x="${W-padR}" y="${H-4}" text-anchor="end" class="axis">${lbl(n-1)}</text>`;
-}
-
-function renderConc(tl){
-  const el=$('#concchart'),H=150,padL=30,padR=8,padT=8,padB=16;
-  const W=svgW(el);el.setAttribute('viewBox',`0 0 ${W} ${H}`);
-  const b=tl.buckets||[],n=b.length,keys=tl.keys||[],byk=tl.by_key_active||{};
+// Shared stacked STEP-area renderer (charts "work by customer" and "output by
+// model"). Uses the shared geometry `g`; `keys` is the stack order, `byk` maps
+// key→per-bucket value array. fmtY formats the y labels; unit goes in the legend.
+function renderStack(elSel,legSel,b,keys,byk,g,opts){
+  const o=opts||{},el=$(elSel),n=g.n;
+  el.setAttribute('viewBox',`0 0 ${g.W} ${g.H}`);
   const have=keys.some(k=>(byk[k]||[]).some(v=>v>0));
-  if(!n||!have){el.innerHTML='<text x="50%" y="50%" text-anchor="middle" class="axis">no calls in window</text>';$('#conc-legend').innerHTML='';return;}
-  const cw=W-padL-padR,ch=H-padT-padB,sx=cw/Math.max(n-1,1);
-  let maxT=0.001;for(let i=0;i<n;i++){let s=0;keys.forEach(k=>s+=(byk[k]||[])[i]||0);if(s>maxT)maxT=s;}
-  const yOf=v=>padT+ch-(v/maxT)*ch;
-  let h='';for(let i=0;i<=4;i++){const y=padT+ch/4*i;h+=`<line class="tick" x1="${padL}" y1="${y}" x2="${W-padR}" y2="${y}"/>`;}
+  if(!n||!have){el.innerHTML=`<text x="50%" y="50%" text-anchor="middle" class="axis">${o.empty||'no data in window'}</text>`;$(legSel).innerHTML='';return;}
+  const{padL,padT,ch,sx,xAt}=g;
+  let maxT=o.minMax||0.001;
+  for(let i=0;i<n;i++){let s=0;keys.forEach(k=>s+=(byk[k]||[])[i]||0);if(s>maxT)maxT=s;}
+  if(o.round)maxT=Math.ceil(maxT/o.round)*o.round;
+  const yAt=v=>padT+ch-(v/maxT)*ch;
+  let h=gridlines(g,b,{axis:o.axis});
+  for(let i=0;i<=4;i++){const y=padT+ch/4*i;h+=`<text x="${padL-4}" y="${y+3}" text-anchor="end" class="axis">${(o.fmtY||(v=>v.toFixed(1)))(maxT-maxT/4*i)}</text>`;}
   const cum=new Array(n).fill(0);
-  keys.forEach((k,ki)=>{const arr=byk[k]||[];let top='',bot=[];for(let i=0;i<n;i++){const x=padL+i*sx,v=arr[i]||0;top+=(i?'L':'M')+x.toFixed(1)+','+yOf(cum[i]+v).toFixed(1);bot.push(x.toFixed(1)+','+yOf(cum[i]).toFixed(1));}bot.reverse();const c=COLORS[ki%COLORS.length];h+=`<path d="${top}L${bot.join('L')}Z" fill="${c}" fill-opacity="0.55" stroke="${c}" stroke-width="1"/>`;for(let i=0;i<n;i++)cum[i]+=arr[i]||0;});
-  h+=`<text x="${padL-4}" y="${padT+4}" text-anchor="end" class="axis">${maxT.toFixed(1)}</text>`;
-  h+=`<text x="${padL-4}" y="${padT+ch}" text-anchor="end" class="axis">0</text>`;
-  h+=axisX(b,padL,cw,W,padR,H);
+  keys.forEach((k,ki)=>{const arr=byk[k]||[];const up=cum.map((c,i)=>c+(arr[i]||0));
+    const c=COLORS[ki%COLORS.length];
+    h+=`<path d="${stepBand(cum,up,xAt,yAt,sx)}" fill="${c}" fill-opacity="0.55" stroke="${c}" stroke-width="1"/>`;
+    for(let i=0;i<n;i++)cum[i]=up[i];});
   el.innerHTML=h;
-  $('#conc-legend').innerHTML=keys.map((k,i)=>`<span><span style="background:${COLORS[i%COLORS.length]}"></span>${k}</span>`).join('');
+  const unit=o.unit||'';
+  $(legSel).innerHTML=keys.map((k,i)=>{const arr=byk[k]||[];let last=null;
+    for(let j=arr.length-1;j>=0;j--){if(arr[j]!=null){last=arr[j];break;}}
+    const lv=last!=null&&unit?' '+(o.fmtLegend?o.fmtLegend(last):last)+unit:'';
+    return `<span><span style="background:${COLORS[i%COLORS.length]}"></span>${k}${lv}</span>`;}).join('');
 }
 
-function renderPerf(pf){
-  const el=$('#perfchart'),H=150,padL=34,padR=8,padT=8,padB=16;
-  const W=svgW(el);el.setAttribute('viewBox',`0 0 ${W} ${H}`);
-  const b=pf.buckets||[],n=b.length,models=Object.keys(pf.models||{});
-  const series={};let maxY=0;
-  models.forEach(m=>{const s=pf.models[m].decode_solo_p50||[],a=pf.models[m].decode_p50||[];
-    const arr=s.map((v,i)=>v!=null?v:(a[i]!=null?a[i]:null));
-    series[m]=arr;arr.forEach(v=>{if(v!=null&&v>maxY)maxY=v;});});
-  if(!n||!models.length||maxY<=0){el.innerHTML='<text x="50%" y="50%" text-anchor="middle" class="axis">no decode data in window</text>';$('#perf-legend').innerHTML='';return;}
-  maxY=Math.ceil(maxY/20)*20;
-  const cw=W-padL-padR,ch=H-padT-padB,sx=cw/Math.max(n-1,1);
-  let h='';for(let i=0;i<=4;i++){const y=padT+ch/4*i;h+=`<line class="tick" x1="${padL}" y1="${y}" x2="${W-padR}" y2="${y}"/>`;
-    h+=`<text x="${padL-4}" y="${y+3}" text-anchor="end" class="axis">${Math.round(maxY-maxY/4*i)}</text>`;}
-  models.forEach((m,mi)=>{const arr=series[m],col=COLORS[mi%COLORS.length];let d='',started=false,dots='';
-    arr.forEach((v,i)=>{if(v==null){started=false;return;}const x=padL+i*sx,y=padT+ch-(Math.min(v,maxY)/maxY)*ch;
-      d+=(started?'L':'M')+x.toFixed(1)+','+y.toFixed(1);started=true;
-      dots+=`<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="1.6" fill="${col}"/>`;});
-    if(d)h+=`<path d="${d}" fill="none" stroke="${col}" stroke-width="1.5"/>`;h+=dots;});
-  h+=axisX(b,padL,cw,W,padR,H);
-  el.innerHTML=h;
-  $('#perf-legend').innerHTML=models.map((m,i)=>{const arr=series[m];let last=null;
-    for(let j=arr.length-1;j>=0;j--){if(arr[j]!=null){last=arr[j];break;}}
-    return `<span><span style="background:${COLORS[i%COLORS.length]}"></span>${m}${last!=null?' '+last+' tok/s':''}</span>`;}).join('');
+// Chart 2 — work by customer (GPU-busy share = active concurrency by consumer).
+function renderConc(tl,g,axis){
+  renderStack('#concchart','#conc-legend',tl.buckets||[],tl.keys||[],tl.by_key_active||{},g,
+    {empty:'no calls in window',unit:'',axis});
 }
 
-function renderTok(pf){
-  const el=$('#tokchart'),H=150,padL=40,padR=8,padT=8,padB=16;
-  const W=svgW(el);el.setAttribute('viewBox',`0 0 ${W} ${H}`);
-  const b=pf.buckets||[],n=b.length;
-  const models=Object.keys(pf.models||{}).filter(m=>(pf.models[m].comp_tok_p50||[]).some(v=>v!=null));
-  let maxY=0;models.forEach(m=>(pf.models[m].comp_tok_p50||[]).forEach(v=>{if(v!=null&&v>maxY)maxY=v;}));
-  if(!n||!models.length||maxY<=0){el.innerHTML='<text x="50%" y="50%" text-anchor="middle" class="axis">no token data in window</text>';$('#tok-legend').innerHTML='';return;}
-  maxY=Math.ceil(maxY/100)*100;
-  const cw=W-padL-padR,ch=H-padT-padB,sx=cw/Math.max(n-1,1);
-  let h='';for(let i=0;i<=4;i++){const y=padT+ch/4*i;h+=`<line class="tick" x1="${padL}" y1="${y}" x2="${W-padR}" y2="${y}"/>`;
-    h+=`<text x="${padL-4}" y="${y+3}" text-anchor="end" class="axis">${fmt(Math.round(maxY-maxY/4*i))}</text>`;}
-  models.forEach((m,mi)=>{const arr=pf.models[m].comp_tok_p50,col=COLORS[mi%COLORS.length];let d='',started=false,dots='';
-    arr.forEach((v,i)=>{if(v==null){started=false;return;}const x=padL+i*sx,y=padT+ch-(Math.min(v,maxY)/maxY)*ch;
-      d+=(started?'L':'M')+x.toFixed(1)+','+y.toFixed(1);started=true;
-      dots+=`<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="1.6" fill="${col}"/>`;});
-    if(d)h+=`<path d="${d}" fill="none" stroke="${col}" stroke-width="1.5"/>`;h+=dots;});
-  h+=axisX(b,padL,cw,W,padR,H);
-  el.innerHTML=h;
-  $('#tok-legend').innerHTML=models.map((m,i)=>{const arr=pf.models[m].comp_tok_p50;let last=null;
-    for(let j=arr.length-1;j>=0;j--){if(arr[j]!=null){last=arr[j];break;}}
-    return `<span><span style="background:${COLORS[i%COLORS.length]}"></span>${m}${last!=null?' '+fmt(last)+' tok':''}</span>`;}).join('');
+// Chart 4 (bottom) — output throughput by model (completion tok/s), stacked.
+function renderOut(tl,g,axis){
+  renderStack('#outchart','#out-legend',tl.buckets||[],tl.out_models||[],tl.by_model_out_tok_s||{},g,
+    {empty:'no output tokens in window',round:50,unit:' tok/s',fmtY:fmt,fmtLegend:fmt,axis});
 }
+
+// Chart 3 — throughput input vs output (total tok/s across all models), two STEP
+// lines on one auto-scaled axis.
+function renderIO(tl,g,axis){
+  const el=$('#iochart'),b=tl.buckets||[],n=g.n,tot=tl.totals||{};
+  el.setAttribute('viewBox',`0 0 ${g.W} ${g.H}`);
+  const inp=tot.in_tok_s||[],out=tot.out_tok_s||[];
+  const series=[['input',inp,'#58a6ff'],['output',out,'#3fb950']];
+  let maxY=0;series.forEach(([,arr])=>arr.forEach(v=>{if(v!=null&&v>maxY)maxY=v;}));
+  if(!n||maxY<=0){el.innerHTML='<text x="50%" y="50%" text-anchor="middle" class="axis">no token throughput in window</text>';$('#io-legend').innerHTML='';return;}
+  maxY=Math.ceil(maxY/Math.max(1,Math.pow(10,Math.floor(Math.log10(maxY)))))*Math.pow(10,Math.floor(Math.log10(maxY)));
+  const{padL,padT,ch,sx,xAt}=g,yAt=v=>padT+ch-(Math.min(v,maxY)/maxY)*ch;
+  let h=gridlines(g,b,{axis});
+  for(let i=0;i<=4;i++){const y=padT+ch/4*i;h+=`<text x="${padL-4}" y="${y+3}" text-anchor="end" class="axis">${fmt(Math.round(maxY-maxY/4*i))}</text>`;}
+  series.forEach(([,arr,col])=>{const d=stepLine(arr,xAt,yAt,sx);if(d)h+=`<path d="${d}" fill="none" stroke="${col}" stroke-width="1.5"/>`;});
+  el.innerHTML=h;
+  $('#io-legend').innerHTML=series.map(([lbl,arr,col])=>{let last=null;
+    for(let j=arr.length-1;j>=0;j--){if(arr[j]!=null){last=arr[j];break;}}
+    return `<span><span style="background:${col}"></span>${lbl}${last!=null?' '+fmt(Math.round(last))+' tok/s':''}</span>`;}).join('');
+}
+
+// Render the whole stack from one timeline payload, with one shared geometry so
+// all four plot rectangles + vertical gridlines coincide; only the bottom chart
+// labels the x-axis. Stashes geometry + buckets in GEO for the hover crosshair.
+function renderChartStack(tl){
+  LAST_TL=tl;
+  const b=tl.buckets||[];
+  // Shared horizontal geometry (same W,padL,padR,sx,xAt for all four). The
+  // crosshair maps to this; only chart heights differ per row.
+  const g=plotGeom($('#outchart'),b);
+  GEO={g,buckets:b};
+  const gh=id=>{const H=CH_H[id]||130;return Object.assign({},g,{H,ch:H-PLOT.padT-PLOT.padB});};
+  renderHost(tl,gh('hostchart'),false);
+  renderConc(tl,gh('concchart'),false);
+  renderIO(tl,gh('iochart'),false);
+  renderOut(tl,gh('outchart'),true);   // bottom chart owns the x-axis labels
+  placeCrosshairLines();
+}
+
+// ── shared hover crosshair across the four stacked charts ────────────────────
+// One transparent overlay spans the chart column. mouse-x → bucket index →
+// a single vertical dashed line drawn at the same x in EVERY chart, plus a
+// time-of-day readout. Per-series value readouts are folded into the readout
+// when cheap (host GPU% / wired, total tok/s, top stacked customer).
+function placeCrosshairLines(){
+  // (re)attach a hidden vertical crosshair <line> on top of each chart SVG —
+  // each renderer rebuilds innerHTML, so the line is re-created every render.
+  ['#hostchart','#concchart','#iochart','#outchart'].forEach(sel=>{
+    const el=$(sel);if(!el)return;let ln=el.querySelector('.cline');
+    if(!ln){ln=document.createElementNS('http://www.w3.org/2000/svg','line');ln.setAttribute('class','cline');}
+    el.appendChild(ln); // keep it last child = on top
+  });
+}
+function crosshairAt(clientX){
+  const ov=$('#cstack-overlay');if(!ov||!GEO)return;
+  const g=GEO.g,b=GEO.buckets,n=g.n;if(n<1)return;
+  const r=ov.getBoundingClientRect();
+  const px=clientX-r.left;                    // px in CSS space across the column
+  // map CSS-x → SVG-x (charts use viewBox W across the same CSS width) → bucket.
+  const svgX=px/r.width*g.W;
+  let i=Math.floor((svgX-g.padL)/g.sx);
+  i=Math.max(0,Math.min(n-1,i));
+  const cx=g.xAt(i)+g.sx/2;                    // center of the bucket, in SVG units
+  ['hostchart','concchart','iochart','outchart'].forEach(id=>{
+    const ln=$('#'+id)&&$('#'+id).querySelector('.cline');if(!ln)return;
+    const H=CH_H[id]||130;
+    ln.setAttribute('x1',cx.toFixed(1));ln.setAttribute('x2',cx.toFixed(1));
+    ln.setAttribute('y1',PLOT.padT);ln.setAttribute('y2',(H-PLOT.padB).toFixed(1));
+    ln.style.opacity=1;
+  });
+  // time + cheap per-series readout at this bucket.
+  const ro=$('#creadout');if(ro&&LAST_TL){
+    const tl=LAST_TL,t=b[i]?new Date(b[i]*1000).toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'}):'';
+    const host=tl.host||{},tot=tl.totals||{};
+    const gp=(host.gpu_pct||[])[i],wr=(host.wired_gb||[])[i];
+    const ot=(tot.out_tok_s||[])[i],it=(tot.in_tok_s||[])[i];
+    const bits=[t];
+    if(gp!=null)bits.push('gpu '+Math.round(gp)+'%');
+    if(wr!=null)bits.push(Math.round(wr)+'GB');
+    if(it!=null||ot!=null)bits.push('io '+fmt(Math.round(it||0))+'/'+fmt(Math.round(ot||0)));
+    ro.textContent=bits.join(' · ');
+    // position the readout above the crosshair (CSS px), clamped to the column.
+    const left=Math.max(40,Math.min(r.width-40,px));
+    ro.style.left=left+'px';ro.style.opacity=1;
+  }
+}
+function crosshairHide(){
+  ['#hostchart','#concchart','#iochart','#outchart'].forEach(sel=>{
+    const ln=$(sel)&&$(sel).querySelector('.cline');if(ln)ln.style.opacity=0;});
+  const ro=$('#creadout');if(ro)ro.style.opacity=0;
+}
+(function wireCrosshair(){
+  const ov=$('#cstack-overlay');if(!ov)return;
+  ov.addEventListener('mousemove',e=>crosshairAt(e.clientX));
+  ov.addEventListener('mouseleave',crosshairHide);
+})();
 
 function renderNow(now){
   $('#verdict').textContent=now.verdict||'';
@@ -538,6 +784,87 @@ function renderNow(now){
   const rt=$('#rss tbody'),bs=now.host.backends||[];
   const max=bs.length?bs[0].rss_gb:1;
   rt.innerHTML=bs.map(b=>`<tr><td>${b.name}</td><td class="num">${b.rss_gb.toFixed(1)}</td><td><div class="bar"><i style="width:${(b.rss_gb/max*100).toFixed(0)}%"></i></div></td></tr>`).join('')||'<tr><td colspan="3" class="dim">—</td></tr>';
+  renderQueuedByUser(now);
+  renderHealth(now);
+}
+
+// Synthesized server-health verdict (right column). Extends the /now verdict/
+// stall logic: it weighs several signals we already have and reports the WORST
+// one as the reason. State = stalled (hot) | degraded (warn) | ok.
+//   • stall: slots held but GPU idle (wedged backend) — from now.stall.
+//   • backlog: queued waiters or a long oldest wait → degraded.
+//   • saturation: GPU pegged at ~100% with a backlog → degraded (capacity).
+//   • decode drift: a model's solo decode tok/s well below its history would
+//     show here too, but /now has no historical baseline, so we surface the
+//     queue/GPU signals it does carry. (See models table for decode drift.)
+function renderHealth(now){
+  const el=$('#health');if(!el)return;
+  const h=now.host||{},gpu=h.gpu_pct,tot=now.totals||{};
+  const inFlight=tot.in_flight||0,queued=tot.queue_depth||0;
+  // worst-signal wins.
+  let state='ok',reason='nominal — no queue backlog, GPU healthy';
+  if(gpu==null){state='warn';reason='no host sample — GPU/RAM unknown';}
+  if(queued>0){state='warn';reason=`${queued} request${queued>1?'s':''} queued — backend at capacity, callers waiting`;}
+  if(gpu!=null&&gpu>=98&&(inFlight>0||queued>0)){state='warn';reason=`GPU pegged at ${gpu.toFixed(0)}% with ${inFlight} in flight — saturated`;}
+  if(now.stall){state='hot';reason='slots held but GPU idle — wedged backend (stall)';}
+  if(now.queue_available===false){state='hot';reason='queue proxy unreachable — live state unavailable';}
+  const label={ok:'OK',warn:'DEGRADED',hot:'STALLED'}[state];
+  el.innerHTML=`<div class="state ${state}">${label}</div><div class="reason">${reason}</div>`;
+}
+
+// Top-consumers load-share mini-bars (right column, at-a-glance) — share of
+// total service-seconds, top N. The full per-consumer table lives left.
+function miniBars(elSel,rows,opts){
+  const o=opts||{},el=$(elSel);if(!el)return;
+  if(!rows.length){el.innerHTML='<div class="dim">—</div>';return;}
+  const max=rows[0].v||1;
+  el.innerHTML=rows.map((r,i)=>{
+    const w=Math.max(2,Math.round(r.v/max*100));
+    const c=COLORS[i%COLORS.length];
+    return `<div class="mbar"><span class="lbl" title="${r.k}">${r.k}</span>`+
+      `<span class="track"><i style="width:${w}%;background:${c}"></i></span>`+
+      `<span class="val">${o.fmt?o.fmt(r.v):fmt(r.v)}</span></div>`;
+  }).join('');
+}
+function renderTopConsumers(d){
+  const rows=(d.consumers||[]).map(c=>({k:c.key,v:c.service_s||0}))
+    .filter(r=>r.v>0).sort((a,b)=>b.v-a.v).slice(0,6);
+  miniBars('#top-consumers',rows,{fmt:v=>fmt(Math.round(v))+'s'});
+}
+function renderTopModels(d){
+  // load = completed requests (the per-model table carries no token total here).
+  const rows=(d.models||[]).map(m=>({k:m.model,v:m.completed||0}))
+    .filter(r=>r.v>0).sort((a,b)=>b.v-a.v).slice(0,6);
+  miniBars('#top-models',rows,{fmt:fmt});
+}
+
+// Live in-memory queue (waiting requests), grouped by consumer. Reads the flat
+// `now.queued` list (falls back to flattening per-model `queued`). Scheduler
+// fields are null-safe — absent on the kill-switch path.
+const WAIT_REASON={model_cap:'backend full',budget_full:'budget',exclusive:'exclusive'};
+function renderQueuedByUser(now){
+  const el=$('#queued-users');if(!el)return;
+  let q=now.queued;
+  if(!q){q=[];(now.models||[]).forEach(m=>(m.queued||[]).forEach(w=>q.push(Object.assign({model:m.model},w))));}
+  if(!q.length){el.innerHTML='<div class="dim">queue empty</div>';return;}
+  const groups=new Map();
+  q.forEach(w=>{const k=w.key||'—';if(!groups.has(k))groups.set(k,[]);groups.get(k).push(w);});
+  const blocks=[...groups.entries()].map(([key,ws])=>{
+    ws.sort((a,b)=>(b.age_s||0)-(a.age_s||0));
+    const oldest=Math.max(...ws.map(w=>w.age_s||0));
+    return {key,ws,n:ws.length,oldest};
+  }).sort((a,b)=>b.n-a.n||b.oldest-a.oldest);
+  el.innerHTML=blocks.map(g=>{
+    const items=g.ws.map(w=>{
+      const prio=w.effective_priority!=null?w.effective_priority:w.priority;
+      const why=WAIT_REASON[w.wait_reason]||'';
+      const bits=[`<span class="qm">${w.model||'—'}</span>`,`${fmt(Math.round(w.age_s||0))}s`];
+      if(prio!=null)bits.push(`p${prio}`);
+      if(why)bits.push(why);
+      return `<li>${bits.join(' · ')}</li>`;
+    }).join('');
+    return `<div class="quser"><div class="qhead"><b>${g.key}</b><span class="warn">${g.n} queued · oldest ${fmt(Math.round(g.oldest))}s</span></div><ul>${items}</ul></div>`;
+  }).join('');
 }
 
 function renderModels(d){
@@ -557,8 +884,10 @@ function renderModels(d){
       <td class="num">${ms(L.queue_wait_p50)}</td>
       <td class="num">${ms(L.ttft_p50)}</td>
       <td class="num">${ms(L.service_p50)}/${ms(L.service_p95)}</td>
+      <td class="num">${m.decode_solo_tok_s??'<span class="dim">—</span>'}</td>
+      <td class="num">${m.out_tok_p50==null?'<span class="dim">—</span>':fmt(m.out_tok_p50)}</td>
       <td>${tp}</td></tr>`;
-  }).join('')||'<tr><td colspan="10" class="dim">no calls</td></tr>';
+  }).join('')||'<tr><td colspan="12" class="dim">no calls</td></tr>';
   $('#models-note').textContent=(d.notes||[]).join('  ·  ');
 }
 
@@ -592,12 +921,103 @@ function renderWorkloads(d){
   }).join('')||'<tr><td colspan="10" class="dim">no calls</td></tr>';
 }
 
+// ── recent requests: searchable / sortable / filterable client-side table ────
+// Columns: {key, label, num?} — `num` columns sort numerically and right-align.
+// `time` keeps the raw epoch for sorting but renders as local HH:MM:SS.
+const REQ_COLS=[
+  {key:'t_enqueue',label:'time',num:true,time:true},
+  {key:'model',label:'model'},
+  {key:'consumer',label:'consumer'},
+  {key:'workload',label:'workload'},
+  {key:'outcome',label:'outcome'},
+  {key:'queue_wait',label:'qwait',num:true,ms:true},
+  {key:'ttft',label:'ttft',num:true,ms:true},
+  {key:'service',label:'service',num:true,ms:true},
+  {key:'total',label:'total',num:true,ms:true},
+  {key:'prompt_tokens',label:'prompt tok',num:true,tok:true},
+  {key:'completion_tokens',label:'compl tok',num:true,tok:true},
+  {key:'decode_tok_s',label:'decode tok/s',num:true},
+];
+let REQ_ROWS=[];                       // cached fetched rows (never refetched on UI change)
+let REQ_SORT={key:'t_enqueue',asc:false};  // default: time descending (newest first)
+const hhmmss=e=>e==null?'—':new Date(e*1000).toLocaleTimeString([],{hour12:false});
+function reqOutcomeCell(r){
+  // completed=ok, errored=warn, abandoned/cancelled=hot/dim; http status appended.
+  const cls={completed:'ok',upstream_error:'warn',client_abandoned:'hot',cancelled_queued:'dim'}[r.outcome]||'dim';
+  const st=r.http_status!=null?` <span class="dim">${r.http_status}</span>`:'';
+  return `<span class="${cls}">${r.outcome||'—'}</span>${st}`;
+}
+function reqCell(r,c){
+  if(c.time)return hhmmss(r[c.key]);
+  if(c.ms)return ms(r[c.key]);
+  if(c.tok)return fmt(r[c.key]);
+  if(c.key==='decode_tok_s')return r[c.key]==null?'—':r[c.key];
+  const v=r[c.key];return v==null||v===''?'—':v;
+}
+function reqMatchesText(r,q){
+  if(!q)return true;
+  // case-insensitive match across every VISIBLE cell's rendered text.
+  return REQ_COLS.some(c=>{
+    const t=(c.key==='outcome'?r.outcome:reqCell(r,c));
+    return String(t==null?'':t).toLowerCase().includes(q);
+  });
+}
+function renderRequests(){
+  const thead=$('#requests thead tr'),tb=$('#requests tbody');
+  thead.innerHTML=REQ_COLS.map(c=>{
+    const ind=REQ_SORT.key===c.key?`<span class="ind">${REQ_SORT.asc?'▲':'▼'}</span>`:'';
+    return `<th data-k="${c.key}" class="${c.num?'num':''}">${c.label}${ind}</th>`;
+  }).join('');
+  const q=($('#req-search').value||'').trim().toLowerCase();
+  const fm=$('#req-model').value,fc=$('#req-consumer').value,fo=$('#req-outcome').value;
+  let rows=REQ_ROWS.filter(r=>
+    (!fm||r.model===fm)&&(!fc||r.consumer===fc)&&(!fo||r.outcome===fo)&&reqMatchesText(r,q));
+  const col=REQ_COLS.find(c=>c.key===REQ_SORT.key)||REQ_COLS[0],dir=REQ_SORT.asc?1:-1;
+  rows=rows.slice().sort((a,b)=>{
+    let x=a[col.key],y=b[col.key];
+    if(col.num){ // nulls always sort last regardless of direction
+      if(x==null&&y==null)return 0;if(x==null)return 1;if(y==null)return -1;
+      return (x-y)*dir;
+    }
+    x=String(x==null?'':x).toLowerCase();y=String(y==null?'':y).toLowerCase();
+    return x<y?-1*dir:x>y?1*dir:0;
+  });
+  tb.innerHTML=rows.map(r=>'<tr>'+REQ_COLS.map(c=>{
+    const cell=c.key==='outcome'?reqOutcomeCell(r):reqCell(r,c);
+    return `<td class="${c.num?'num':''}">${cell}</td>`;
+  }).join('')+'</tr>').join('')||`<tr><td colspan="${REQ_COLS.length}" class="dim">no matching requests</td></tr>`;
+  $('#req-count').textContent=`${rows.length} / ${REQ_ROWS.length} rows`;
+}
+function fillReqFilter(sel,vals){
+  const cur=sel.value,opts=['<option value="">all '+sel.dataset.all+'</option>']
+    .concat([...new Set(vals)].filter(v=>v!=null&&v!=='').sort().map(v=>`<option>${v}</option>`));
+  sel.innerHTML=opts.join('');
+  if([...sel.options].some(o=>o.value===cur))sel.value=cur;
+}
+function setRequests(d){
+  REQ_ROWS=(d&&d.requests)||[];
+  fillReqFilter($('#req-model'),REQ_ROWS.map(r=>r.model));
+  fillReqFilter($('#req-consumer'),REQ_ROWS.map(r=>r.consumer));
+  fillReqFilter($('#req-outcome'),REQ_ROWS.map(r=>r.outcome));
+  renderRequests();
+}
+$('#req-model').dataset.all='models';$('#req-consumer').dataset.all='consumers';$('#req-outcome').dataset.all='outcomes';
+['#req-search','#req-model','#req-consumer','#req-outcome'].forEach(s=>{
+  $(s).addEventListener('input',renderRequests);$(s).addEventListener('change',renderRequests);});
+$('#requests thead').addEventListener('click',ev=>{
+  const th=ev.target.closest('th');if(!th)return;const k=th.dataset.k;if(!k)return;
+  if(REQ_SORT.key===k)REQ_SORT.asc=!REQ_SORT.asc;
+  else REQ_SORT={key:k,asc:false}; // new column starts descending
+  renderRequests();
+});
+
 async function refresh(){
   const w=$('#window').value;
   try{
-    const [now,tl,mdl,cons,wl,pf]=await Promise.all([
-      J('/now'),J('/timeline?last='+w),J('/models?last='+w),J('/consumers?last='+w),J('/workloads?last='+w),J('/perf?last='+w)]);
-    renderNow(now);renderHost(tl);renderConc(tl);renderModels(mdl);renderConsumers(cons);renderWorkloads(wl);renderPerf(pf);renderTok(pf);
+    const [now,tl,mdl,cons,wl,req]=await Promise.all([
+      J('/now'),J('/timeline?last='+w),J('/models?last='+w),J('/consumers?last='+w),J('/workloads?last='+w),J('/requests?limit=100')]);
+    renderNow(now);renderChartStack(tl);renderModels(mdl);renderConsumers(cons);renderWorkloads(wl);setRequests(req);
+    renderTopConsumers(cons);renderTopModels(mdl);
     $('#footer').textContent='updated '+new Date().toLocaleTimeString()+' · window '+w+' · bucket '+tl.window.bucket_s+'s';
   }catch(e){$('#footer').innerHTML='<span class="err">'+e+'</span>';}
 }
