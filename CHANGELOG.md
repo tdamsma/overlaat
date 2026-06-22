@@ -8,6 +8,11 @@ versions without a compatibility guarantee.
 
 ## [Unreleased]
 
+## [0.0.9] — 2026-06-22
+
+Per-model client-disconnect policy for single-stream engines. Proxy-only — no schema
+or dashboard changes.
+
 ### Added
 - **Per-model `overlaat_abort_on_disconnect` policy** (`model_info` bool, default `true`) —
   governs what an in-flight client disconnect does to the slot. `true` (today's behaviour)
