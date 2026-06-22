@@ -132,6 +132,15 @@ is **no new env knob**. **The default is unchanged:** with every model in the
 single `default` pool, the per-pool arithmetic is identical to the previous single
 shared budget, so existing single-pool deployments behave exactly as before.
 
+A separate per-model `model_info` knob, `overlaat_abort_on_disconnect` (bool, default
+`true`), governs the **client-disconnect** path rather than admission cost. `true`
+releases the slot the instant the client disconnects — correct for abort-honouring
+engines that stop decoding when their upstream connection closes. Set it `false` for a
+single-stream engine with **no abort path**: the proxy then holds the slot and keeps
+draining the upstream to its natural end (bounded by the read-timeout) before releasing,
+so slot accounting tracks the still-busy backend and the next call queues instead of
+stalling on it. #28
+
 ### Prompt-size-weighted cost (closes #18)
 
 A flat `cost = 1/cap` charges a 50-token prompt and a 33k-token prompt the same,
