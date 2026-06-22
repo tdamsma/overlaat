@@ -8,6 +8,8 @@ versions without a compatibility guarantee.
 
 ## [Unreleased]
 
+## [0.0.7] — 2026-06-22
+
 ### Added
 - **Configurable upstream HTTP timeouts** (#24, builds on #18). The proxy's httpx
   timeout to LiteLLM was hardcoded (`connect 5 / read 1200 / write 60 / pool 5`);
@@ -290,7 +292,8 @@ version implements:
 - **Cost-weighted admission** is design-only (see `docs/COST-SCHEDULER.md`); the queue
   is plain per-model FIFO in this version.
 
-[Unreleased]: https://github.com/tdamsma/overlaat/compare/v0.0.6...HEAD
+[Unreleased]: https://github.com/tdamsma/overlaat/compare/v0.0.7...HEAD
+[0.0.7]: https://github.com/tdamsma/overlaat/releases/tag/v0.0.7
 [0.0.6]: https://github.com/tdamsma/overlaat/releases/tag/v0.0.6
 [0.0.5]: https://github.com/tdamsma/overlaat/releases/tag/v0.0.5
 [0.0.4]: https://github.com/tdamsma/overlaat/releases/tag/v0.0.4
