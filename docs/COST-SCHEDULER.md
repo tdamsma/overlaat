@@ -207,14 +207,29 @@ by default:**
    budget is the lever that turns "costs more" into "runs fewer".
 3. **`leave_room` heavy_max caps a single heavy prompt below the whole pool.** The
    default per-pool `heavy_max: leave_room` clamps a weighted cost at
-   `B_pool − base_cost`, so even the heaviest prompt leaves room for at least one
-   more base-cost run of that model. One fast-lane call *always* fits.
+   `B_pool − base_cost`, so even the heaviest prompt leaves a base-cost slot of
+   budget *headroom* free.
 
 Layers 1 and 2 are co-dependent: weighting without a binding budget cannot
 throttle anything (a higher cost against an unbounded budget still always admits),
 and a binding budget without weighting charges a 50-token and a 33k-token prompt
 the same. **Both** are required for self-protection, and both ship on by default —
 so a fresh deploy is protected without setting a single env var.
+
+**What the `leave_room` slot actually guarantees (and what it does not).** The
+clamp is a guarantee about the *budget ledger*, not an unconditional admission
+promise: it ensures `_used` can never be driven so high by one prompt that no
+base-cost run fits the remaining budget. *Which* waiter claims that headroom is
+still decided by priority + the eager head reservation (§3), and the reservation
+that holds a slot for the fast lane **only exists when the budget binds** — with an
+effectively-unbounded budget (see the inert-detection warning below) there is no
+budget-blocked head, so nothing is reserved and the headroom is whatever the raw
+per-model cap leaves. So the precise statement is: *given a binding pool budget, a
+fast-lane call at or above the resident / reserved-head priority always fits beside
+even the heaviest prompt.* A lower-priority light arriving behind an already-reserved
+heavy head waits — by design (that reservation is the anti-starvation guard, §3b),
+not a leak. Priority alone cannot manufacture the reserved slot; only a binding
+budget does, and priority then decides who gets it.
 
 **The startup warning (inert detection).** Because Layers 1 and 2 are
 co-dependent, the protection is inert if **either** is missing — the condition is
