@@ -154,6 +154,49 @@ def _bucket_concurrency(
     return [x / bucket_s for x in secs]
 
 
+def _bucket_weighted(
+    weighted_intervals: list[tuple[float, float, float | None]],
+    t0: float,
+    bucket_s: float,
+    nbuckets: int,
+) -> list[float]:
+    """Per-bucket time-weighted average of a per-interval RATE.
+
+    weighted_intervals: list of (start, end, total) where `total` is a quantity
+    (e.g. tokens) produced uniformly over [start, end]. Returns, per bucket,
+    Σ(total * overlap / (end-start)) / bucket_s  — i.e. the average rate
+    (e.g. tok/s) delivered in that bucket. With total == (end-start) this reduces
+    to mean concurrency, matching _bucket_concurrency.
+
+    Each interval contributes its constant rate `total / (end - start)` to every
+    bucket it overlaps, weighted by the overlap seconds; dividing the bucket sum
+    by `bucket_s` turns the accumulated rate-seconds back into an average rate.
+    Intervals with `end <= start` or `total in (None, 0)` are skipped. The
+    attribution window is the service window [t_acquire, t_done] (slot-held =
+    GPU-busy time): both prompt and completion tokens are spread over it, so
+    "input tok/s" and "output tok/s" share one wall-clock denominator and read as
+    tokens-processed-per-second."""
+    secs = [0.0] * nbuckets
+    span = t0 + nbuckets * bucket_s
+    for s, e, total in weighted_intervals:
+        if total in (None, 0) or e <= s:
+            continue
+        rate = total / (e - s)
+        s = max(s, t0)
+        e = min(e, span)
+        if e <= s:
+            continue
+        bi = int((s - t0) // bucket_s)
+        while bi < nbuckets:
+            bs = t0 + bi * bucket_s
+            ov = min(e, bs + bucket_s) - max(s, bs)
+            if ov <= 0:
+                break
+            secs[bi] += rate * ov
+            bi += 1
+    return [x / bucket_s for x in secs]
+
+
 # ── fetch ───────────────────────────────────────────────────────────────────
 
 
@@ -264,8 +307,15 @@ def latest_host(db_url: str) -> dict | None:
 def build_timeline(
     db_url: str, since: float, now: float, bucket_s: float, aliases: dict[str, str]
 ) -> dict:
-    """Per-bucket concurrency curves (offered/active per model + active per key)
-    plus host GPU%/wired + backend RSS. Drives all charts."""
+    """Per-bucket concurrency curves (offered/active per model + active per key),
+    per-model completion tok/s and aggregate input/output tok/s, plus host
+    GPU%/wired + backend RSS. Drives all charts.
+
+    Token throughput is time-weighted over the service window [t_acquire, t_done]
+    (slot-held = GPU-busy time): both prompt and completion tokens are spread over
+    that one window via _bucket_weighted, so input tok/s and output tok/s share a
+    single wall-clock denominator. Only completed calls with t_acquire,
+    t_done > t_acquire, and the relevant token count present contribute."""
     nbuckets = max(1, int((now - since) // bucket_s) + 1)
     t0 = since
     events = fetch_events(db_url, since - 1, now)
@@ -273,6 +323,10 @@ def build_timeline(
     # per-model interval sets
     models: dict[str, dict] = {}
     keys_active: dict[str, list] = {}
+    # weighted (start, end, tokens) over the service window — for tok/s curves
+    out_tok_iv: dict[str, list] = {}  # per model, completion tokens
+    in_tok_all: list[tuple[float, float, float | None]] = []  # prompt tokens, all models
+    out_tok_all: list[tuple[float, float, float | None]] = []  # completion tokens, all models
     for e in events:
         m = e["model_requested"]
         md = models.setdefault(m, {"offered": [], "active": []})
@@ -281,8 +335,30 @@ def build_timeline(
             md["active"].append((e["t_acquire"], e["t_done"]))
             alias = aliases.get(e["key_fp"], e["key_fp"])
             keys_active.setdefault(alias, []).append((e["t_acquire"], e["t_done"]))
+            if e["outcome"] == "completed" and e["t_done"] > e["t_acquire"]:
+                sa, dn = e["t_acquire"], e["t_done"]
+                if e["completion_tokens"]:
+                    out_tok_iv.setdefault(m, []).append((sa, dn, e["completion_tokens"]))
+                    out_tok_all.append((sa, dn, e["completion_tokens"]))
+                if e["prompt_tokens"]:
+                    in_tok_all.append((sa, dn, e["prompt_tokens"]))
 
     bucket_ts = [round(t0 + i * bucket_s, 3) for i in range(nbuckets)]
+
+    # per-model output tok/s, top-N models by total completion tokens + <other>
+    out_totals = {m: sum(t for _, _, t in iv) for m, iv in out_tok_iv.items()}
+    out_ranked = sorted(out_totals, key=lambda m: out_totals[m], reverse=True)
+    out_top = out_ranked[:TOP_KEYS]
+    out_has_other = len(out_ranked) > TOP_KEYS
+    out_tok_s = {
+        m: [round(x, 2) for x in _bucket_weighted(out_tok_iv[m], t0, bucket_s, nbuckets)]
+        for m in out_top
+    }
+    if out_has_other:
+        other_iv = [iv for m in out_ranked[TOP_KEYS:] for iv in out_tok_iv[m]]
+        out_tok_s["<other>"] = [
+            round(x, 2) for x in _bucket_weighted(other_iv, t0, bucket_s, nbuckets)
+        ]
 
     model_series = {}
     for m, md in models.items():
@@ -294,6 +370,8 @@ def build_timeline(
                 round(x, 3) for x in _bucket_concurrency(md["active"], t0, bucket_s, nbuckets)
             ],
         }
+        if m in out_tok_s:
+            model_series[m]["out_tok_s"] = out_tok_s[m]
 
     # top keys by total active-seconds
     key_totals = {k: sum(e - s for s, e in iv) for k, iv in keys_active.items()}
@@ -323,12 +401,20 @@ def build_timeline(
             bj = s.get("backends_json") or []
             rss_total[bi] = round(sum(b.get("rss_gb", 0) for b in bj), 1) if bj else None
 
+    in_tok_s = [round(x, 2) for x in _bucket_weighted(in_tok_all, t0, bucket_s, nbuckets)]
+    tot_out_tok_s = [round(x, 2) for x in _bucket_weighted(out_tok_all, t0, bucket_s, nbuckets)]
+
     return {
         "bucket_s": bucket_s,
         "buckets": bucket_ts,
         "models": model_series,
         "keys": list(key_series.keys()),
         "by_key_active": key_series,
+        # completion tok/s stacked by model (top-N models + <other>), chart 4
+        "out_models": list(out_tok_s.keys()),
+        "by_model_out_tok_s": out_tok_s,
+        # aggregate input/output tok/s across all models, chart 3
+        "totals": {"in_tok_s": in_tok_s, "out_tok_s": tot_out_tok_s},
         "host": {"gpu_pct": gpu, "wired_gb": wired, "backend_rss_gb": rss_total},
     }
 
@@ -360,6 +446,27 @@ def build_models(db_url: str, since: float, now: float, aliases: dict[str, str])
         ]
         service = [(e["t_done"] - e["t_acquire"]) for e in completed if e["t_acquire"]]
         total = [(e["t_done"] - e["t_enqueue"]) for e in completed]
+
+        # Backend-health signal (folded in from the removed decode-trend chart):
+        # solo decode tok/s = completion_tokens / (t_done - t_first_token) over
+        # streamed completed calls that ran near-alone (time-weighted mean active
+        # concurrency < 1.5), dropping rates above the hardware ceiling as
+        # near-zero-window artifacts. A sustained drop here = backend degradation.
+        solo_decrates: list[float] = []
+        # Output-size/behaviour signal: completion tokens per completed call.
+        out_toks: list[float] = []
+        for e in completed:
+            ct = e["completion_tokens"]
+            if ct is not None:
+                out_toks.append(ct)
+            ft, dn = e["t_first_token"], e["t_done"]
+            if not e["streamed"] or ft is None or ct is None or dn <= ft:
+                continue
+            rate = ct / (dn - ft)
+            if rate > MAX_PLAUSIBLE_DECODE:
+                continue
+            if e["t_acquire"] is not None and conc.mean(e["t_acquire"], dn) < 1.5:
+                solo_decrates.append(rate)
 
         # throughput by measured concurrency
         conc_cells: dict[int, dict] = {}
@@ -422,78 +529,12 @@ def build_models(db_url: str, since: float, now: float, aliases: dict[str, str])
                     "total_p95": round(_pct([s * 1000 for s in total], 0.95)) if total else None,
                 },
                 "throughput_by_concurrency": throughput,
+                "decode_solo_tok_s": round(_pct(solo_decrates, 0.5), 1) if solo_decrates else None,
+                "out_tok_p50": round(_pct(out_toks, 0.5)) if out_toks else None,
             }
         )
     out.sort(key=lambda m: m["requests"], reverse=True)
     return out
-
-
-def build_perf_trend(
-    db_url: str, since: float, now: float, bucket_s: float, aliases: dict[str, str]
-) -> dict:
-    """Per-model decode throughput (tok/s) over time — the monitoring view for
-    server-health drift (e.g. an inference server that gets slower over long
-    uptime; a sustained drop on the solo line is the signal to restart it).
-
-    decode_tok_s = completion_tokens / (t_done - t_first_token), for streamed
-    completed calls only (bucketed by t_done). To separate SERVER HEALTH from
-    concurrency load, each call's time-weighted mean active-concurrency is
-    computed and we report both an all-calls median and a SOLO median (mean
-    concurrency < 1.5). The solo line is the clean health signal: a sustained
-    drop = degradation, independent of how busy the box was.
-
-    Thinking-mode models (first token lands in reasoning_content, so
-    t_first_token is NULL) have no decode window and don't appear here."""
-    nbuckets = max(1, int((now - since) // bucket_s) + 1)
-    t0 = since
-    events = fetch_events(db_url, since, now)
-
-    by_model: dict[str, list] = {}
-    for e in events:
-        by_model.setdefault(e["model_requested"], []).append(e)
-
-    out_models: dict[str, dict] = {}
-    for model, evs in by_model.items():
-        active_iv = [(e["t_acquire"], e["t_done"]) for e in evs if e["t_acquire"] is not None]
-        conc = _ConcIntegral(active_iv)
-        all_b: list[list[float]] = [[] for _ in range(nbuckets)]
-        solo_b: list[list[float]] = [[] for _ in range(nbuckets)]
-        tok_b: list[list[float]] = [[] for _ in range(nbuckets)]
-        for e in evs:
-            if e["outcome"] != "completed":
-                continue
-            ft, dn, ct = e["t_first_token"], e["t_done"], e["completion_tokens"]
-            bi = int((dn - t0) // bucket_s)
-            if not (0 <= bi < nbuckets):
-                continue
-            # Output-size trend: ALL completed calls with a token count, streamed or
-            # not. A step change here is a behavioural shift (thinking-mode toggle,
-            # prompt change, caller change) that is invisible in the tok/s lines.
-            if ct is not None:
-                tok_b[bi].append(ct)
-            if not e["streamed"] or ft is None or ct is None or dn <= ft:
-                continue
-            rate = ct / (dn - ft)
-            if rate > MAX_PLAUSIBLE_DECODE:  # near-zero-window artifact, not a real rate
-                continue
-            all_b[bi].append(rate)
-            if e["t_acquire"] is not None and conc.mean(e["t_acquire"], dn) < 1.5:
-                solo_b[bi].append(rate)
-        if not any(all_b) and not any(tok_b):
-            continue
-        out_models[model] = {
-            "decode_p50": [round(_pct(x, 0.5), 1) if x else None for x in all_b],
-            "decode_solo_p50": [round(_pct(x, 0.5), 1) if x else None for x in solo_b],
-            "comp_tok_p50": [round(_pct(x, 0.5)) if x else None for x in tok_b],
-            "n": [len(x) for x in all_b],
-            "n_tok": [len(x) for x in tok_b],
-        }
-
-    return {
-        "bucket_s": bucket_s,
-        "buckets": [round(t0 + i * bucket_s, 3) for i in range(nbuckets)],
-        "models": out_models,
-    }
 
 
 def build_consumers(db_url: str, since: float, now: float, aliases: dict[str, str]) -> list[dict]:

@@ -11,9 +11,10 @@ Endpoints, each defined by the question it answers:
 
   GET /              dashboard (HTML)
   GET /now           live: per-model in_flight/queued, host GPU%/wired + backend RSS
-  GET /timeline      time-series: host + offered/active concurrency per model & key
-  GET /models        capacity: outcome counts, latency split, throughput-by-concurrency
-  GET /perf          decode-throughput trend per model (server-health monitoring)
+  GET /timeline      time-series: host + offered/active concurrency, by-consumer load,
+                     input/output tok/s, completion tok/s per model
+  GET /models        capacity: outcome counts, latency split, throughput-by-concurrency,
+                     solo decode tok/s + p50 output tokens (backend-health + behaviour)
   GET /consumers     per key_alias: requests, tokens, service-seconds, abandoned rate
   GET /workloads     per workload label: requests, latency p50/p95, tokens, error rate
   GET /healthz
@@ -228,32 +229,11 @@ def models(last: str = Query("24h")):
             "aggregate_tok_s = Σ completion_tokens / Σ service_s within the cell; "
             f"shown only when calls >= {metrics_db.MIN_SAMPLES} (else 'sufficient'=false).",
             "latency: queue_wait/ttft/service/total split, completed calls only.",
-        ],
-    }
-
-
-@app.get("/perf")
-def perf(last: str = Query("24h")):
-    """Decode-throughput trend per model over time — server-health monitoring
-    (catches backend degradation from real traffic, no synthetic load)."""
-    win = parse_window(last)
-    bucket = pick_bucket(win)
-    now_ts = time.time()
-    series = metrics_db.build_perf_trend(DB, now_ts - win, now_ts, bucket, alias_map())
-    return {
-        "_meta": _meta("perf", 30),
-        "window": {"last": last, "bucket_s": bucket},
-        **series,
-        "notes": [
-            "decode_tok_s = completion_tokens / (t_done - t_first_token), "
-            "streamed completed calls only.",
-            "decode_solo_p50 = median for calls at mean concurrency < 1.5 "
-            "(isolates server health from load); a sustained drop = degradation.",
-            "thinking-mode models (first token = reasoning_content) have no "
-            "decode window and don't appear here.",
-            "comp_tok_p50 = median completion tokens per completed call "
-            "(streamed + non-streamed) — output-size/behaviour trend; a step "
-            "change = thinking-mode toggle or prompt change, not load.",
+            "solo decode tok/s = median completion_tokens / (t_done - t_first_token) "
+            "over near-solo (mean concurrency < 1.5) streamed completed calls — the "
+            "backend-health number; a sustained drop with no load = degradation.",
+            "p50 out tok = median completion tokens per completed call (behaviour/"
+            "output-size; a step change = thinking-mode toggle or prompt change).",
         ],
     }
 
@@ -339,7 +319,14 @@ footer{color:var(--dim);font-size:11px;text-align:center;padding:14px}
 <main>
   <div class="card span12"><div class="kpis" id="kpis"></div></div>
 
-  <div class="card span6">
+  <div class="card span8">
+    <h2>work by customer <span class="dim">(where the load comes from — GPU-busy share by consumer)</span></h2>
+    <svg id="concchart" class="chart" preserveAspectRatio="none"></svg>
+    <div class="legend" id="conc-legend"></div>
+    <div class="note">y = service-seconds per second (active concurrency) attributed to the consumer holding the slot, stacked. This is the share of GPU-busy time each customer is responsible for; includes abandoned calls until the slot was released. Step segments = one flat value per bucket.</div>
+  </div>
+
+  <div class="card span4">
     <h2>host — GPU% &amp; wired RAM</h2>
     <svg id="hostchart" class="chart" preserveAspectRatio="none"></svg>
     <div class="legend">
@@ -349,24 +336,17 @@ footer{color:var(--dim);font-size:11px;text-align:center;padding:14px}
   </div>
 
   <div class="card span6">
-    <h2>active concurrency by consumer <span class="dim">(slot-holders)</span></h2>
-    <svg id="concchart" class="chart" preserveAspectRatio="none"></svg>
-    <div class="legend" id="conc-legend"></div>
-    <div class="note">y = mean simultaneous slot-holders per key (capped per model by definition). Includes abandoned calls until the slot was released.</div>
+    <h2>throughput — input vs output <span class="dim">(tok/s, all models)</span></h2>
+    <svg id="iochart" class="chart" preserveAspectRatio="none"></svg>
+    <div class="legend" id="io-legend"></div>
+    <div class="note">total prompt (input) and completion (output) tok/s across all models, time-weighted over each call's service window [acquire, done]. Input ≫ output is normal for prompt-heavy workloads. Step segments = one flat value per bucket.</div>
   </div>
 
-  <div class="card span12">
-    <h2>decode throughput trend <span class="dim">(tok/s — server-health monitor)</span></h2>
-    <svg id="perfchart" class="chart" preserveAspectRatio="none"></svg>
-    <div class="legend" id="perf-legend"></div>
-    <div class="note">solo decode tok/s (calls at mean concurrency &lt; 1.5) per model — isolates backend health from load. A sustained drop with no load = backend degradation (e.g. some engines slow down over long uptime → restart the backend service to recover). Thinking-mode models excluded (no first-token marker).</div>
-  </div>
-
-  <div class="card span12">
-    <h2>output size trend <span class="dim">(p50 completion tokens/call — behaviour monitor)</span></h2>
-    <svg id="tokchart" class="chart" preserveAspectRatio="none"></svg>
-    <div class="legend" id="tok-legend"></div>
-    <div class="note">median completion tokens per completed call, per model (streamed + non-streamed). A step change = a behavioural shift, not a load change: thinking mode toggled, a prompt edit, or a different caller — e.g. disabling thinking shows as a 2-3&times; drop while decode tok/s stays flat.</div>
+  <div class="card span6">
+    <h2>output throughput by model <span class="dim">(completion tok/s, stacked)</span></h2>
+    <svg id="outchart" class="chart" preserveAspectRatio="none"></svg>
+    <div class="legend" id="out-legend"></div>
+    <div class="note">completion tok/s per model, time-weighted over the service window and stacked (top models + &lt;other&gt;). The combined view of where output tokens are produced. Step segments = one flat value per bucket.</div>
   </div>
 
   <div class="card span4">
@@ -386,6 +366,7 @@ footer{color:var(--dim);font-size:11px;text-align:center;padding:14px}
       <th>model</th><th class="num">req</th><th class="num">ok</th><th class="num">aband</th>
       <th class="num">err</th><th class="num">canc</th>
       <th class="num">qwait p50</th><th class="num">ttft p50</th><th class="num">service p50/p95</th>
+      <th class="num">solo decode tok/s</th><th class="num">p50 out tok</th>
       <th>throughput @ concurrency (tok/s)</th>
     </tr></thead><tbody></tbody></table>
     <div class="note" id="models-note"></div>
@@ -418,19 +399,65 @@ async function J(u){const r=await fetch(u);if(!r.ok)throw new Error(u+' '+r.stat
 
 function svgW(el){return Math.max(Math.round(el.clientWidth)||600,200);}
 
+// ── step builders ──────────────────────────────────────────────────────────
+// All time-series render as STEP charts: each bucket value is held flat across
+// the bucket's horizontal extent [x_i, x_i+sx], then steps vertically to the
+// next value — NO linear interpolation, NO smoothing. `sx` is the bucket width
+// in px; xAt(i)=padL+i*sx is the left edge of bucket i.
+
+// Step polyline ("d" path) through (i, y(v_i)). Holds each y flat for one bucket
+// width then steps. Returns {d, started} where d is "" if no point. Null values
+// break the line into separate segments (each starting with M).
+function stepLine(arr,xAt,yAt,sx){
+  let d='',open=false;
+  for(let i=0;i<arr.length;i++){
+    const v=arr[i];
+    if(v==null){open=false;continue;}
+    const x0=xAt(i),x1=x0+sx,y=yAt(v);
+    if(!open){d+='M'+x0.toFixed(1)+','+y.toFixed(1);open=true;}
+    else{d+='L'+x0.toFixed(1)+','+y.toFixed(1);}
+    d+='L'+x1.toFixed(1)+','+y.toFixed(1);
+  }
+  return d;
+}
+// Stacked step-area band between a lower cumulative and an upper cumulative.
+// Top boundary = forward step polyline of `upper`; bottom = reverse step of
+// `lower`. Closed into a filled polygon. Treats null as 0 (stacked context).
+function stepBand(lower,upper,xAt,yAt,sx){
+  const n=upper.length;let top='';
+  for(let i=0;i<n;i++){const x0=xAt(i),x1=x0+sx,y=yAt(upper[i]||0);
+    top+=(i?'L':'M')+x0.toFixed(1)+','+y.toFixed(1)+'L'+x1.toFixed(1)+','+y.toFixed(1);}
+  let bot='';
+  for(let i=n-1;i>=0;i--){const x0=xAt(i),x1=x0+sx,y=yAt(lower[i]||0);
+    bot+='L'+x1.toFixed(1)+','+y.toFixed(1)+'L'+x0.toFixed(1)+','+y.toFixed(1);}
+  return top+bot+'Z';
+}
+
 function renderHost(tl){
   const el=$('#hostchart'),H=150,padL=30,padR=8,padT=8,padB=16;
   const W=svgW(el);el.setAttribute('viewBox',`0 0 ${W} ${H}`);
   const b=tl.buckets||[],n=b.length;
   if(!n){el.innerHTML='<text x="50%" y="50%" text-anchor="middle" class="axis">no data</text>';return;}
-  const cw=W-padL-padR,ch=H-padT-padB,sx=cw/Math.max(n-1,1);
+  const cw=W-padL-padR,ch=H-padT-padB,sx=cw/Math.max(n,1);
+  const xAt=i=>padL+i*sx;
   let h='';for(let i=0;i<=4;i++){const y=padT+ch/4*i;h+=`<line class="tick" x1="${padL}" y1="${y}" x2="${W-padR}" y2="${y}"/>`;}
   const gpu=tl.host.gpu_pct,wired=tl.host.wired_gb,total=tl.host.total_gb||256;
-  const line=(arr,max,col)=>{let d='';let started=false;arr.forEach((v,i)=>{if(v==null)return;const x=padL+i*sx,y=padT+ch-(Math.min(v,max)/max)*ch;d+=(started?'L':'M')+x.toFixed(1)+','+y.toFixed(1);started=true;});return d?`<path d="${d}" fill="none" stroke="${col}" stroke-width="1.5"/>`:'';};
-  // wired as area
-  let area='';let st=false;wired.forEach((v,i)=>{if(v==null)return;const x=padL+i*sx,y=padT+ch-(Math.min(v,total)/total)*ch;area+=(st?'L':'M')+x.toFixed(1)+','+y.toFixed(1);st=true;});
-  if(area){const lx=padL+(n-1)*sx;area=`<path d="${area}L${lx.toFixed(1)},${(padT+ch).toFixed(1)}L${padL},${(padT+ch).toFixed(1)}Z" fill="#58a6ff22" stroke="none"/>`;}
-  h+=area+line(wired,total,'#58a6ff')+line(gpu,100,'#f85149');
+  const yWired=v=>padT+ch-(Math.min(v,total)/total)*ch;
+  const yGpu=v=>padT+ch-(Math.min(v,100)/100)*ch;
+  // wired as a step area (fill under the step line)
+  const lows=new Array(n).fill(0),ups=wired.map(v=>v==null?0:v);
+  const wd=stepLine(wired,xAt,yWired,sx);
+  if(wd){
+    // build a filled step-area: top step of wired, floor at baseline
+    let top='',started=false;
+    for(let i=0;i<n;i++){const v=wired[i];if(v==null)continue;const x0=xAt(i),x1=x0+sx,y=yWired(v);
+      top+=(started?'L':'M')+x0.toFixed(1)+','+y.toFixed(1)+'L'+x1.toFixed(1)+','+y.toFixed(1);started=true;}
+    const base=(padT+ch).toFixed(1),lx=(padL+n*sx).toFixed(1);
+    h+=`<path d="${top}L${lx},${base}L${padL},${base}Z" fill="#58a6ff22" stroke="none"/>`;
+  }
+  if(wd)h+=`<path d="${wd}" fill="none" stroke="#58a6ff" stroke-width="1.5"/>`;
+  const gd=stepLine(gpu,xAt,yGpu,sx);
+  if(gd)h+=`<path d="${gd}" fill="none" stroke="#f85149" stroke-width="1.5"/>`;
   h+=`<text x="${padL-4}" y="${padT+4}" text-anchor="end" class="axis">100%</text>`;
   h+=`<text x="${padL-4}" y="${padT+ch}" text-anchor="end" class="axis">0</text>`;
   h+=axisX(b,padL,cw,W,padR,H);
@@ -445,71 +472,71 @@ function axisX(b,padL,cw,W,padR,H){
     `<text x="${W-padR}" y="${H-4}" text-anchor="end" class="axis">${lbl(n-1)}</text>`;
 }
 
-function renderConc(tl){
-  const el=$('#concchart'),H=150,padL=30,padR=8,padT=8,padB=16;
+// Shared stacked STEP-area renderer (charts 1 "work by customer" and 4 "output
+// by model"). `keys` is the stack order, `byk` maps key→per-bucket value array.
+// fmtY formats the y-axis max label; unit is appended to legend last-values.
+function renderStack(elSel,legSel,b,keys,byk,opts){
+  const o=opts||{},el=$(elSel),H=150,padL=o.padL||34,padR=8,padT=8,padB=16;
   const W=svgW(el);el.setAttribute('viewBox',`0 0 ${W} ${H}`);
-  const b=tl.buckets||[],n=b.length,keys=tl.keys||[],byk=tl.by_key_active||{};
+  const n=b.length;
   const have=keys.some(k=>(byk[k]||[]).some(v=>v>0));
-  if(!n||!have){el.innerHTML='<text x="50%" y="50%" text-anchor="middle" class="axis">no calls in window</text>';$('#conc-legend').innerHTML='';return;}
-  const cw=W-padL-padR,ch=H-padT-padB,sx=cw/Math.max(n-1,1);
-  let maxT=0.001;for(let i=0;i<n;i++){let s=0;keys.forEach(k=>s+=(byk[k]||[])[i]||0);if(s>maxT)maxT=s;}
-  const yOf=v=>padT+ch-(v/maxT)*ch;
-  let h='';for(let i=0;i<=4;i++){const y=padT+ch/4*i;h+=`<line class="tick" x1="${padL}" y1="${y}" x2="${W-padR}" y2="${y}"/>`;}
-  const cum=new Array(n).fill(0);
-  keys.forEach((k,ki)=>{const arr=byk[k]||[];let top='',bot=[];for(let i=0;i<n;i++){const x=padL+i*sx,v=arr[i]||0;top+=(i?'L':'M')+x.toFixed(1)+','+yOf(cum[i]+v).toFixed(1);bot.push(x.toFixed(1)+','+yOf(cum[i]).toFixed(1));}bot.reverse();const c=COLORS[ki%COLORS.length];h+=`<path d="${top}L${bot.join('L')}Z" fill="${c}" fill-opacity="0.55" stroke="${c}" stroke-width="1"/>`;for(let i=0;i<n;i++)cum[i]+=arr[i]||0;});
-  h+=`<text x="${padL-4}" y="${padT+4}" text-anchor="end" class="axis">${maxT.toFixed(1)}</text>`;
-  h+=`<text x="${padL-4}" y="${padT+ch}" text-anchor="end" class="axis">0</text>`;
-  h+=axisX(b,padL,cw,W,padR,H);
-  el.innerHTML=h;
-  $('#conc-legend').innerHTML=keys.map((k,i)=>`<span><span style="background:${COLORS[i%COLORS.length]}"></span>${k}</span>`).join('');
-}
-
-function renderPerf(pf){
-  const el=$('#perfchart'),H=150,padL=34,padR=8,padT=8,padB=16;
-  const W=svgW(el);el.setAttribute('viewBox',`0 0 ${W} ${H}`);
-  const b=pf.buckets||[],n=b.length,models=Object.keys(pf.models||{});
-  const series={};let maxY=0;
-  models.forEach(m=>{const s=pf.models[m].decode_solo_p50||[],a=pf.models[m].decode_p50||[];
-    const arr=s.map((v,i)=>v!=null?v:(a[i]!=null?a[i]:null));
-    series[m]=arr;arr.forEach(v=>{if(v!=null&&v>maxY)maxY=v;});});
-  if(!n||!models.length||maxY<=0){el.innerHTML='<text x="50%" y="50%" text-anchor="middle" class="axis">no decode data in window</text>';$('#perf-legend').innerHTML='';return;}
-  maxY=Math.ceil(maxY/20)*20;
-  const cw=W-padL-padR,ch=H-padT-padB,sx=cw/Math.max(n-1,1);
+  if(!n||!have){el.innerHTML=`<text x="50%" y="50%" text-anchor="middle" class="axis">${o.empty||'no data in window'}</text>`;$(legSel).innerHTML='';return;}
+  const cw=W-padL-padR,ch=H-padT-padB,sx=cw/Math.max(n,1);
+  const xAt=i=>padL+i*sx;
+  let maxT=o.minMax||0.001;
+  for(let i=0;i<n;i++){let s=0;keys.forEach(k=>s+=(byk[k]||[])[i]||0);if(s>maxT)maxT=s;}
+  if(o.round)maxT=Math.ceil(maxT/o.round)*o.round;
+  const yAt=v=>padT+ch-(v/maxT)*ch;
   let h='';for(let i=0;i<=4;i++){const y=padT+ch/4*i;h+=`<line class="tick" x1="${padL}" y1="${y}" x2="${W-padR}" y2="${y}"/>`;
-    h+=`<text x="${padL-4}" y="${y+3}" text-anchor="end" class="axis">${Math.round(maxY-maxY/4*i)}</text>`;}
-  models.forEach((m,mi)=>{const arr=series[m],col=COLORS[mi%COLORS.length];let d='',started=false,dots='';
-    arr.forEach((v,i)=>{if(v==null){started=false;return;}const x=padL+i*sx,y=padT+ch-(Math.min(v,maxY)/maxY)*ch;
-      d+=(started?'L':'M')+x.toFixed(1)+','+y.toFixed(1);started=true;
-      dots+=`<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="1.6" fill="${col}"/>`;});
-    if(d)h+=`<path d="${d}" fill="none" stroke="${col}" stroke-width="1.5"/>`;h+=dots;});
+    h+=`<text x="${padL-4}" y="${y+3}" text-anchor="end" class="axis">${(o.fmtY||(v=>v.toFixed(1)))(maxT-maxT/4*i)}</text>`;}
+  const cum=new Array(n).fill(0);
+  keys.forEach((k,ki)=>{const arr=byk[k]||[];const up=cum.map((c,i)=>c+(arr[i]||0));
+    const c=COLORS[ki%COLORS.length];
+    h+=`<path d="${stepBand(cum,up,xAt,yAt,sx)}" fill="${c}" fill-opacity="0.55" stroke="${c}" stroke-width="1"/>`;
+    for(let i=0;i<n;i++)cum[i]=up[i];});
   h+=axisX(b,padL,cw,W,padR,H);
   el.innerHTML=h;
-  $('#perf-legend').innerHTML=models.map((m,i)=>{const arr=series[m];let last=null;
+  const unit=o.unit||'';
+  $(legSel).innerHTML=keys.map((k,i)=>{const arr=byk[k]||[];let last=null;
     for(let j=arr.length-1;j>=0;j--){if(arr[j]!=null){last=arr[j];break;}}
-    return `<span><span style="background:${COLORS[i%COLORS.length]}"></span>${m}${last!=null?' '+last+' tok/s':''}</span>`;}).join('');
+    const lv=last!=null&&unit?' '+(o.fmtLegend?o.fmtLegend(last):last)+unit:'';
+    return `<span><span style="background:${COLORS[i%COLORS.length]}"></span>${k}${lv}</span>`;}).join('');
 }
 
-function renderTok(pf){
-  const el=$('#tokchart'),H=150,padL=40,padR=8,padT=8,padB=16;
+// Chart 1 — HEADLINE: work by customer (GPU-busy share = active concurrency by
+// consumer), stacked STEP area. Reuses /timeline's by_key_active.
+function renderConc(tl){
+  renderStack('#concchart','#conc-legend',tl.buckets||[],tl.keys||[],tl.by_key_active||{},
+    {padL:30,empty:'no calls in window',unit:''});
+}
+
+// Chart 4 — output throughput by model (completion tok/s), stacked STEP area.
+function renderOut(tl){
+  renderStack('#outchart','#out-legend',tl.buckets||[],tl.out_models||[],tl.by_model_out_tok_s||{},
+    {padL:40,empty:'no output tokens in window',round:50,unit:' tok/s',fmtY:fmt,fmtLegend:fmt});
+}
+
+// Chart 3 — throughput input vs output (total tok/s across all models), two STEP
+// lines on one auto-scaled axis.
+function renderIO(tl){
+  const el=$('#iochart'),H=150,padL=40,padR=8,padT=8,padB=16;
   const W=svgW(el);el.setAttribute('viewBox',`0 0 ${W} ${H}`);
-  const b=pf.buckets||[],n=b.length;
-  const models=Object.keys(pf.models||{}).filter(m=>(pf.models[m].comp_tok_p50||[]).some(v=>v!=null));
-  let maxY=0;models.forEach(m=>(pf.models[m].comp_tok_p50||[]).forEach(v=>{if(v!=null&&v>maxY)maxY=v;}));
-  if(!n||!models.length||maxY<=0){el.innerHTML='<text x="50%" y="50%" text-anchor="middle" class="axis">no token data in window</text>';$('#tok-legend').innerHTML='';return;}
-  maxY=Math.ceil(maxY/100)*100;
-  const cw=W-padL-padR,ch=H-padT-padB,sx=cw/Math.max(n-1,1);
+  const b=tl.buckets||[],n=b.length,tot=tl.totals||{};
+  const inp=tot.in_tok_s||[],out=tot.out_tok_s||[];
+  const series=[['input',inp,'#58a6ff'],['output',out,'#3fb950']];
+  let maxY=0;series.forEach(([,arr])=>arr.forEach(v=>{if(v!=null&&v>maxY)maxY=v;}));
+  if(!n||maxY<=0){el.innerHTML='<text x="50%" y="50%" text-anchor="middle" class="axis">no token throughput in window</text>';$('#io-legend').innerHTML='';return;}
+  maxY=Math.ceil(maxY/Math.max(1,Math.pow(10,Math.floor(Math.log10(maxY)))))*Math.pow(10,Math.floor(Math.log10(maxY)));
+  const cw=W-padL-padR,ch=H-padT-padB,sx=cw/Math.max(n,1);
+  const xAt=i=>padL+i*sx,yAt=v=>padT+ch-(Math.min(v,maxY)/maxY)*ch;
   let h='';for(let i=0;i<=4;i++){const y=padT+ch/4*i;h+=`<line class="tick" x1="${padL}" y1="${y}" x2="${W-padR}" y2="${y}"/>`;
     h+=`<text x="${padL-4}" y="${y+3}" text-anchor="end" class="axis">${fmt(Math.round(maxY-maxY/4*i))}</text>`;}
-  models.forEach((m,mi)=>{const arr=pf.models[m].comp_tok_p50,col=COLORS[mi%COLORS.length];let d='',started=false,dots='';
-    arr.forEach((v,i)=>{if(v==null){started=false;return;}const x=padL+i*sx,y=padT+ch-(Math.min(v,maxY)/maxY)*ch;
-      d+=(started?'L':'M')+x.toFixed(1)+','+y.toFixed(1);started=true;
-      dots+=`<circle cx="${x.toFixed(1)}" cy="${y.toFixed(1)}" r="1.6" fill="${col}"/>`;});
-    if(d)h+=`<path d="${d}" fill="none" stroke="${col}" stroke-width="1.5"/>`;h+=dots;});
+  series.forEach(([,arr,col])=>{const d=stepLine(arr,xAt,yAt,sx);if(d)h+=`<path d="${d}" fill="none" stroke="${col}" stroke-width="1.5"/>`;});
   h+=axisX(b,padL,cw,W,padR,H);
   el.innerHTML=h;
-  $('#tok-legend').innerHTML=models.map((m,i)=>{const arr=pf.models[m].comp_tok_p50;let last=null;
+  $('#io-legend').innerHTML=series.map(([lbl,arr,col])=>{let last=null;
     for(let j=arr.length-1;j>=0;j--){if(arr[j]!=null){last=arr[j];break;}}
-    return `<span><span style="background:${COLORS[i%COLORS.length]}"></span>${m}${last!=null?' '+fmt(last)+' tok':''}</span>`;}).join('');
+    return `<span><span style="background:${col}"></span>${lbl}${last!=null?' '+fmt(Math.round(last))+' tok/s':''}</span>`;}).join('');
 }
 
 function renderNow(now){
@@ -557,8 +584,10 @@ function renderModels(d){
       <td class="num">${ms(L.queue_wait_p50)}</td>
       <td class="num">${ms(L.ttft_p50)}</td>
       <td class="num">${ms(L.service_p50)}/${ms(L.service_p95)}</td>
+      <td class="num">${m.decode_solo_tok_s??'<span class="dim">—</span>'}</td>
+      <td class="num">${m.out_tok_p50==null?'<span class="dim">—</span>':fmt(m.out_tok_p50)}</td>
       <td>${tp}</td></tr>`;
-  }).join('')||'<tr><td colspan="10" class="dim">no calls</td></tr>';
+  }).join('')||'<tr><td colspan="12" class="dim">no calls</td></tr>';
   $('#models-note').textContent=(d.notes||[]).join('  ·  ');
 }
 
@@ -595,9 +624,9 @@ function renderWorkloads(d){
 async function refresh(){
   const w=$('#window').value;
   try{
-    const [now,tl,mdl,cons,wl,pf]=await Promise.all([
-      J('/now'),J('/timeline?last='+w),J('/models?last='+w),J('/consumers?last='+w),J('/workloads?last='+w),J('/perf?last='+w)]);
-    renderNow(now);renderHost(tl);renderConc(tl);renderModels(mdl);renderConsumers(cons);renderWorkloads(wl);renderPerf(pf);renderTok(pf);
+    const [now,tl,mdl,cons,wl]=await Promise.all([
+      J('/now'),J('/timeline?last='+w),J('/models?last='+w),J('/consumers?last='+w),J('/workloads?last='+w)]);
+    renderNow(now);renderConc(tl);renderHost(tl);renderIO(tl);renderOut(tl);renderModels(mdl);renderConsumers(cons);renderWorkloads(wl);
     $('#footer').textContent='updated '+new Date().toLocaleTimeString()+' · window '+w+' · bucket '+tl.window.bucket_s+'s';
   }catch(e){$('#footer').innerHTML='<span class="err">'+e+'</span>';}
 }

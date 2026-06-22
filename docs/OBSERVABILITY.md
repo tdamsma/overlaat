@@ -20,7 +20,7 @@ plus a host sampler.
                                                                           ▲
   host sampler (5s) ── host GPU%/RAM + per-backend RSS ────────────────────┘ host_samples (PG)
 
-  usage-api reads both tables ──▶ /now /timeline /models /perf /consumers /workloads + dashboard
+  usage-api reads both tables ──▶ /now /timeline /models /consumers /workloads + dashboard
 ```
 
 The queue-proxy is the only component that sees **every** request's full
@@ -218,6 +218,52 @@ than `MIN_SAMPLES` (default 5) calls are returned with `sufficient: false` and
 are **never** shown as a trend. A two-sample throughput number is noise; the gate
 keeps the chart from drawing a confident line through noise.
 
+## Dashboard charts — time-weighted, step-rendered
+
+Every dashboard time-series is **time-weighted** over the interval each call was
+actually running, and **step-rendered**: one flat horizontal segment per bucket
+with a vertical transition at the bucket boundary — no linear interpolation, no
+smoothing. A call is *not* attributed whole to the single bucket containing its
+`t_done`; its quantity is spread across every bucket its interval overlaps,
+weighted by the overlap. The four charts, in dashboard order:
+
+1. **Work by customer** (headline). Stacked step-area of **active concurrency by
+   consumer** = service-seconds per second held by the key holding the slot
+   (`by_key_active`). This is the GPU-busy share each customer is responsible for;
+   it includes client-abandoned calls until the slot was released.
+2. **Host GPU% & wired RAM.** The host sampler's GPU% and wired-RAM, as step
+   line + step area.
+3. **Throughput — input vs output.** Two step lines: total prompt (input) tok/s
+   and total completion (output) tok/s across all models (`totals.in_tok_s` /
+   `totals.out_tok_s`). Input ≫ output is normal for prompt-heavy workloads.
+4. **Output throughput by model.** Stacked step-area of completion tok/s per
+   model (`by_model_out_tok_s`, top-N + `<other>`) — the combined view of where
+   output tokens are produced.
+
+### Token-attribution window — the service window
+
+Both prompt and completion tokens are spread over the **service window
+`[t_acquire, t_done]`** (slot-held = GPU-busy time), via a generic
+time-weighted helper (`metrics_db._bucket_weighted`): each call contributes its
+constant rate `tokens / (t_done - t_acquire)` to every bucket it overlaps,
+weighted by the overlap seconds, and the per-bucket sum is divided by the bucket
+width to recover an average tok/s.
+
+Spreading **both** input and output over the *same* window gives a single,
+consistent wall-clock denominator, so "input tok/s" and "output tok/s" are both
+tokens-processed-per-second-of-wall-clock and can be read against each other.
+(Output is deliberately *not* spread over the decode window `[t_first_token,
+t_done]` only — that would give output a different, shorter denominator than
+input and break the comparison, and would also exclude non-streamed calls.) Only
+completed calls with `t_acquire`, `t_done > t_acquire`, and the relevant token
+count present contribute; `NULL` token counts are skipped, never zero-filled.
+
+The former *decode-throughput trend* and *output-size trend* line charts are
+gone; their signal survives as two current-window numbers in the per-model table:
+`decode_solo_tok_s` (median decode tok/s over near-solo streamed calls — the
+backend-health number) and `out_tok_p50` (median completion tokens per call — the
+behaviour/output-size number).
+
 ## Endpoints
 
 The usage-API is a read-only FastAPI app (`overlaat.usage_api:app`). It has no
@@ -228,9 +274,8 @@ gate.
 |---|---|
 | `GET /` | dashboard (HTML) |
 | `GET /now` | live: per-model in-flight / queued (scraped from the queue-proxy's `:4000/__queue/status`), host GPU% / wired RAM + backend RSS (latest sample), recent-5m completed per key. Live in-flight comes from the proxy because `request_events` rows are written on completion — the proxy is the only thing that knows what is in flight *right now*. |
-| `GET /timeline?last=` | time-series for charts: host GPU% / wired RAM + backend RSS, per-model offered / active, per-key active concurrency. Bucket width is auto-picked from the window (30m→5s, 1h→15s, 6h→60s, 24h→5m, 7d→1h). |
-| `GET /models?last=` | capacity view: per-model outcome counts, latency split (`queue_wait` / `ttft` / `service` / `total`, p50 + p95), and throughput-by-measured-concurrency (min-sample guarded). |
-| `GET /perf?last=` | **backend-health monitoring**: per-model decode tok/s over time (`completion_tokens / (t_done - t_first_token)`, streamed completed calls only). Reports an all-calls median and a **solo** median (calls at mean concurrency < 1.5) that isolates backend health from load — a sustained drop in the solo line is degradation, not contention (some engines slow down over long uptime; the fix is to restart the backend service). Rates above a hardware ceiling are dropped as near-zero-window artifacts; thinking-mode models that emit no `t_first_token` do not appear here. |
+| `GET /timeline?last=` | time-series for **all** charts: host GPU% / wired RAM + backend RSS; per-model offered / active concurrency; per-consumer active concurrency (the *work-by-customer* headline); aggregate input vs output **tok/s** (`totals.in_tok_s` / `totals.out_tok_s`); and completion **tok/s per model** (`by_model_out_tok_s`, stacked, top-N + `<other>`). Bucket width is auto-picked from the window (30m→5s, 1h→15s, 6h→60s, 24h→5m, 7d→1h). |
+| `GET /models?last=` | capacity view: per-model outcome counts, latency split (`queue_wait` / `ttft` / `service` / `total`, p50 + p95), throughput-by-measured-concurrency (min-sample guarded), **`decode_solo_tok_s`** (median decode tok/s over near-solo streamed calls — the backend-health number) and **`out_tok_p50`** (median completion tokens per completed call — the output-size/behaviour number). |
 | `GET /consumers?last=` | per key alias: requests by outcome, tokens, service-seconds, abandoned-rate, models used. |
 | `GET /workloads?last=` | per workload label: requests by outcome, p50/p95 queue wait + total latency, completion tokens, abandoned/error rate (untagged traffic under `(untagged)`). |
 | `GET /healthz` | liveness + DB check. |
