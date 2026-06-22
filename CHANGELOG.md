@@ -8,6 +8,17 @@ versions without a compatibility guarantee.
 
 ## [Unreleased]
 
+### Changed
+- **Docs: the `leave_room` "fast-lane" guarantee is stated precisely** (follow-up to
+  #24). `docs/COST-SCHEDULER.md` previously read "one fast-lane call *always* fits",
+  which overstates it. `leave_room` is a guarantee about the *budget ledger* (one
+  base-cost slot of headroom is always left free); *which* waiter claims it is decided
+  by priority + the eager head reservation, and that reservation only exists when the
+  budget binds. The wording now states the actual guarantee — *given a binding pool
+  budget, a fast-lane call at or above the resident/reserved-head priority always fits
+  beside even the heaviest prompt* — and notes that with an effectively-unbounded
+  budget no slot is reserved at all. Documentation only; no behavior change.
+
 ## [0.0.7] — 2026-06-22
 
 ### Added
