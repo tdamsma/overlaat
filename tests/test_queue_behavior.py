@@ -385,6 +385,98 @@ async def test_outcome_client_abandoned(monkeypatch, isolate_state):
     await qp.app.state.client.aclose()
 
 
+async def test_client_abandoned_no_abort_holds_slot_until_upstream_drains(
+    monkeypatch, isolate_state
+):
+    """With overlaat_abort_on_disconnect=False, a mid-stream client disconnect does
+    NOT release the slot immediately: the proxy keeps draining the still-producing
+    upstream to its natural end first, so slot accounting tracks the busy
+    single-stream backend (#28). The slot frees only once upstream ends; the outcome
+    is still `client_abandoned`."""
+    from starlette.requests import Request
+
+    events = isolate_state
+    monkeypatch.setattr(qp, "CAPS", {"m": 1})
+    monkeypatch.setattr(qp, "ABORT_ON_DISCONNECT", {"m": False})
+
+    gate = asyncio.Event()
+
+    class _GatedStream(httpx.AsyncByteStream):
+        def __init__(self, gate):
+            self._gate = gate
+
+        async def __aiter__(self):
+            yield b'{"choices":[{"delta":{"content":"hi"}}]}\n'
+            await self._gate.wait()  # upstream still decoding after client left
+            yield b'{"usage":{"prompt_tokens":1,"completion_tokens":2}}'
+
+        async def aclose(self):
+            pass
+
+    class _GatedTransport(httpx.AsyncBaseTransport):
+        def __init__(self, gate):
+            self._gate = gate
+
+        async def handle_async_request(self, request):
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/event-stream"},
+                stream=_GatedStream(self._gate),
+            )
+
+    qp.app.state.client = httpx.AsyncClient(transport=_GatedTransport(gate), base_url=qp.UPSTREAM)
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": [(b"authorization", b"Bearer sk-x")],
+        "query_string": b"",
+        "app": qp.app,
+    }
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    request = Request(scope, receive)
+
+    sem = qp.get_semaphore("m")
+    await sem.acquire()
+    qp.METRICS["m"]["in_flight"] += 1
+    ev = {
+        "t_enqueue": 0.0,
+        "t_acquire": 0.0,
+        "t_first_token": None,
+        "model_requested": "m",
+        "key_fp": "x",
+        "streamed": True,
+    }
+
+    resp = await qp._forward(
+        request, "/v1/chat/completions", b'{"model":"m","stream":true}', "m", sem, ev
+    )
+    body = resp.body_iterator
+    await body.__anext__()  # read the first chunk
+
+    # Disconnect: closing the iterator throws GeneratorExit into stream_body. With
+    # abort=False the finally must drain the (gated, still-producing) upstream
+    # before releasing, so aclose() does not return yet.
+    closer = asyncio.create_task(body.aclose())
+    await asyncio.sleep(0.1)
+    assert qp.METRICS["m"]["in_flight"] == 1  # slot STILL held: drain parked on gate
+    assert sem.locked()
+    assert not events  # not finished yet
+
+    gate.set()  # upstream finishes its completion
+    await closer  # drain completes, slot releases
+    await _wait_for(lambda: bool(events))
+
+    assert qp.METRICS["m"]["in_flight"] == 0  # released only after upstream drained
+    assert not sem.locked()
+    assert events[0]["outcome"] == "client_abandoned"
+    await qp.app.state.client.aclose()
+
+
 # ── d. cost-weighted scheduler (OVERLAAT_SCHEDULER on) ────────────────────────
 
 

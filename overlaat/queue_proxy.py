@@ -29,11 +29,26 @@ Endpoints outside the proxy:
 - POST /__queue/cancel-all?model=&key_fp= — cancel all queued requests in scope
 
 Cancel only affects queued (not-yet-dispatched) requests — those never touched the
-GPU, so they are safe to drop (caller gets 499). In-flight requests are NOT
-cancellable: with a single-stream engine, a client disconnect lets the engine keep
-decoding while the proxy releases its slot → the next call stalls on a busy
-backend. So release-on-disconnect does NOT stop the backend; only cancelling
-still-queued requests is safe.
+GPU, so they are safe to drop (caller gets 499). Whether an *in-flight* client
+disconnect also stops the backend depends on the ENGINE, not on this proxy, so the
+disconnect path is governed by a per-model ``overlaat_abort_on_disconnect`` policy
+(default ``true``):
+
+- ``true`` — abort-honouring engines (continuous-batching, e.g. rapid-mlx /
+  vllm-mlx, which poll ``request.is_disconnected()`` → ``scheduler.abort_request``).
+  The proxy's upstream ``aclose()`` (see ``stream_body``'s finally) propagates
+  through LiteLLM and the sequence leaves the batch within the engine's poll
+  interval, so releasing the slot the instant the client disconnects is correct.
+- ``false`` — single-stream engines with NO abort path: the engine keeps decoding
+  the abandoned completion to EOS/its own timeout regardless of the connection. So
+  ``stream_body`` does NOT release on disconnect; it keeps draining the upstream to
+  its natural end (bounded by the read-timeout) and releases only then, so the slot
+  tracks real backend occupancy and the next call QUEUES instead of stalling on a
+  still-busy backend. Clearing a *true* wedge (engine never finishes) still needs an
+  engine restart — out of scope here. See #28.
+
+In-flight requests are never proxy-CANCELLABLE either way (no preemption); only
+still-queued requests can be dropped.
 """
 
 from __future__ import annotations
@@ -242,13 +257,19 @@ def load_caps(path: Path) -> dict[str, int]:
     return out
 
 
-def load_model_info(path: Path) -> tuple[dict[str, float], dict[str, str], dict[str, bool]]:
+def load_model_info(
+    path: Path,
+) -> tuple[dict[str, float], dict[str, str], dict[str, bool], dict[str, bool]]:
     """Read the scheduler-specific per-model knobs from the LiteLLM config's
     ``model_info`` blocks: an explicit cost override (``overlaat_cost``), the
-    resource-pool assignment (``overlaat_pool``), and the deprecated swap-slot
-    alias (``overlaat_slot``).
+    resource-pool assignment (``overlaat_pool``), the deprecated swap-slot
+    alias (``overlaat_slot``), and the client-disconnect policy
+    (``overlaat_abort_on_disconnect`` — a per-model bool; default ``True`` =
+    release the slot on client disconnect; ``False`` = hold the slot until the
+    upstream drains, for single-stream engines with no abort path — issue #28).
 
-    Returns ``(costs, pool_of, exclusive_seed)`` keyed by model_name / pool_name:
+    Returns ``(costs, pool_of, exclusive_seed, abort_on_disconnect)`` keyed by
+    model_name / pool_name:
       - ``costs[model]``    — explicit pool-fraction cost override (float > 0).
       - ``pool_of[model]``  — the named resource pool the model is admitted
         against. A model with no ``overlaat_pool`` is in the ``default`` pool.
@@ -257,18 +278,21 @@ def load_model_info(path: Path) -> tuple[dict[str, float], dict[str, str], dict[
         ``overlaat_slot: NAME`` and no ``overlaat_pool`` is treated as
         ``overlaat_pool: NAME`` with that pool auto-marked exclusive — so old
         swap-slot configs keep working (a cap-1 slot is byte-identical).
+      - ``abort_on_disconnect[model]`` — explicit per-model bool override of the
+        client-disconnect policy. A model absent here defaults to ``True``.
     Models without any of these keys simply don't appear in ``costs`` (the
     scheduler derives cost from ``1/cap`` or the default) and land in ``default``.
     """
     if not path.exists():
-        return {}, {}, {}
+        return {}, {}, {}, {}
     try:
         cfg = yaml.safe_load(path.read_text()) or {}
     except Exception:
-        return {}, {}, {}
+        return {}, {}, {}, {}
     costs: dict[str, float] = {}
     pool_of: dict[str, str] = {}
     exclusive_seed: dict[str, bool] = {}
+    abort_on_disconnect: dict[str, bool] = {}
     for m in cfg.get("model_list", []):
         name = m.get("model_name")
         if not isinstance(name, str):
@@ -285,7 +309,10 @@ def load_model_info(path: Path) -> tuple[dict[str, float], dict[str, str], dict[
             # Legacy bridge: overlaat_slot: NAME -> overlaat_pool: NAME, auto-exclusive.
             pool_of[name] = legacy_slot
             exclusive_seed[legacy_slot] = True
-    return costs, pool_of, exclusive_seed
+        a = info.get("overlaat_abort_on_disconnect")
+        if isinstance(a, bool):
+            abort_on_disconnect[name] = a
+    return costs, pool_of, exclusive_seed, abort_on_disconnect
 
 
 def load_pools(path: Path) -> tuple[dict[str, float], set[str]]:
@@ -529,8 +556,7 @@ def warn_if_self_protection_inert(
             )
         if unbounded:
             pool_list = ", ".join(
-                f"'{p}' (budget {pool_budget.get(p, default_budget):g})"
-                for p in sorted(unbounded)
+                f"'{p}' (budget {pool_budget.get(p, default_budget):g})" for p in sorted(unbounded)
             )
             reasons.append(
                 "these pools have a budget that can never bind given their caps, so "
@@ -551,7 +577,7 @@ def warn_if_self_protection_inert(
 
 
 CAPS: dict[str, int] = load_caps(LITELLM_CONFIG)
-COSTS, POOL_OF, _EXCLUSIVE_SEED = load_model_info(LITELLM_CONFIG)
+COSTS, POOL_OF, _EXCLUSIVE_SEED, ABORT_ON_DISCONNECT = load_model_info(LITELLM_CONFIG)
 _DECLARED_BUDGETS, _DECLARED_EXCLUSIVE = load_pools(LITELLM_CONFIG)
 POOL_BUDGET, POOL_EXCLUSIVE = resolve_pool_config(
     CAPS,
@@ -1132,8 +1158,19 @@ async def _forward(
     async def stream_body():
         tail = bytearray()
         natural = False
+        # Per-model client-disconnect policy (#28). True (default): release the
+        # slot the instant the client disconnects — correct for abort-honouring
+        # continuous-batching engines, which stop decoding when their upstream
+        # connection closes. False: a single-stream engine with NO abort path
+        # keeps decoding the abandoned completion regardless, so releasing early
+        # manufactures a phantom-free slot that immediately stalls the next call;
+        # instead keep draining the upstream to its natural end (bounded by the
+        # read-timeout) before releasing, so the slot tracks real backend
+        # occupancy and the next call queues rather than stalling.
+        abort = ABORT_ON_DISCONNECT.get(model, True) if model is not None else True
+        raw = upstream_resp.aiter_raw()
         try:
-            async for chunk in upstream_resp.aiter_raw():
+            async for chunk in raw:
                 if (
                     ev is not None
                     and ev.get("streamed")
@@ -1147,6 +1184,18 @@ async def _forward(
                 yield chunk
             natural = True
         finally:
+            # Client disconnect (GeneratorExit before done) on a no-abort engine:
+            # drain upstream to its natural end before releasing (#28). Discarded
+            # (no client to yield to); bounded by the upstream read-timeout — a
+            # read-timeout/connection error just ends the drain. Never yield here.
+            if not natural and base_outcome != "upstream_error" and not abort:
+                try:
+                    async for chunk in raw:
+                        tail.extend(chunk)
+                        if len(tail) > USAGE_TAIL_BYTES:
+                            del tail[:-USAGE_TAIL_BYTES]
+                except Exception:
+                    pass
             await upstream_resp.aclose()
             release(upstream_resp.status_code)
             # natural completion vs client disconnect (GeneratorExit before done)

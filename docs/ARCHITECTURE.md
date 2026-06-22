@@ -294,6 +294,15 @@ This has a direct consequence for the accounting (stated once, in the caveats):
 past a release. After an abandon, a single-stream engine can keep decoding briefly
 beyond `t_done`.
 
+The desync above describes the **default** (`true`) behaviour, which is correct for
+abort-honouring engines: their decoding stops when the upstream connection closes, so
+releasing the slot on disconnect matches the backend. For single-stream engines with no
+abort path, this engine-class hazard is now addressed by the per-model
+`overlaat_abort_on_disconnect: false` policy (#28): for such models the proxy does **not**
+release on disconnect — it holds the slot and keeps draining the upstream to its natural
+end (bounded by the read-timeout) before releasing, so the proxy's model of backend
+occupancy stays correct and the next call queues rather than stalling.
+
 ---
 
 ## 6. The read-only usage-API

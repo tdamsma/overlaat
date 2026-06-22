@@ -9,7 +9,11 @@
 # default; see docs/COST-SCHEDULER.md) it also reads two OPTIONAL `model_info`
 # keys per model: `overlaat_cost` (explicit pool-fraction cost override; default
 # is 1/cap) and `overlaat_pool` (the named resource pool the model is admitted
-# against; default `default`). It also reads an OPTIONAL top-level `overlaat.pools`
+# against; default `default`). A further OPTIONAL `model_info` key,
+# `overlaat_abort_on_disconnect` (bool, default `true`), governs the client-disconnect
+# path: `true` releases the slot the instant the client disconnects; `false` holds the
+# slot until the upstream drains, for single-stream engines with no abort path (#28).
+# It also reads an OPTIONAL top-level `overlaat.pools`
 # section that declares each pool's `budget` and `exclusive` flag (see the bottom
 # of this file). The deprecated `overlaat_slot` key is still accepted as a LEGACY
 # ALIAS: `overlaat_slot: NAME` is treated as `overlaat_pool: NAME` with that pool
@@ -123,6 +127,7 @@ model_list:
       max_parallel_requests: 1
     model_info:
       overlaat_pool: fat-slot   # ← same pool → mutually exclusive with model-b (cost = 1/cap = 1.0)
+      overlaat_abort_on_disconnect: false   # single-stream engine, no abort API: hold the slot until upstream drains on client disconnect (#28)
       # Legacy: `overlaat_slot: fat-slot` is still accepted here and means the
       # same thing (overlaat_pool: fat-slot + auto exclusive: true).
 

@@ -551,7 +551,7 @@ model_list:
         path = Path(f.name)
 
     caps = qp.load_caps(path)
-    costs, pool_of, exclusive_seed = qp.load_model_info(path)
+    costs, pool_of, exclusive_seed, _ = qp.load_model_info(path)
     declared_budgets, declared_exclusive = qp.load_pools(path)
     pool_budget, pool_exclusive = qp.resolve_pool_config(
         caps, costs, pool_of, exclusive_seed, declared_budgets, declared_exclusive, 1.0, log=False

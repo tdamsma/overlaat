@@ -25,6 +25,24 @@ def test_load_caps_missing(tmp_path):
     assert qp.load_caps(tmp_path / "nope.yaml") == {}
 
 
+def test_load_model_info_abort_on_disconnect(tmp_path):
+    cfg = tmp_path / "c.yaml"
+    cfg.write_text(
+        "model_list:\n"
+        "  - model_name: ds4\n"
+        "    litellm_params: { model: x/ds4, max_parallel_requests: 1 }\n"
+        "    model_info: { overlaat_abort_on_disconnect: false }\n"
+        "  - model_name: rapid\n"
+        "    litellm_params: { model: x/rapid, max_parallel_requests: 4 }\n"
+        "    model_info: { overlaat_abort_on_disconnect: true }\n"
+        "  - model_name: plain\n"
+        "    litellm_params: { model: x/plain, max_parallel_requests: 2 }\n"
+    )
+    _costs, _pool_of, _excl, abort = qp.load_model_info(cfg)
+    assert abort == {"ds4": False, "rapid": True}  # explicit only
+    assert abort.get("plain", True) is True  # absent -> default True
+
+
 def test_extract_tokens():
     tail = b'data: {"usage":{"prompt_tokens":12,"completion_tokens":34}}\n\ndata: [DONE]\n'
     assert qp._extract_tokens(tail) == (12, 34)
@@ -197,48 +215,39 @@ def test_self_protection_inert_detector():
     #    9999, so only the per-model cap binds — identical to the incident. The
     #    non-flat default does NOT save it: INERT. (Regression for the dropped
     #    `if not flat: return []` short-circuit that used to miss this.)
-    assert (
-        qp.warn_if_self_protection_inert(
-            caps={"m": 4},
-            costs={},
-            pool_of={},
-            pool_budget={},
-            default_budget=9999.0,
-            tiers=nonflat,
-            log=False,
-        )
-        == ["default"]
-    )
+    assert qp.warn_if_self_protection_inert(
+        caps={"m": 4},
+        costs={},
+        pool_of={},
+        pool_budget={},
+        default_budget=9999.0,
+        tiers=nonflat,
+        log=False,
+    ) == ["default"]
 
     # 3. Flat tiers + an unbounded budget (the original incident config): INERT.
-    assert (
-        qp.warn_if_self_protection_inert(
-            caps={"m": 4},
-            costs={},
-            pool_of={},
-            pool_budget={},
-            default_budget=9999.0,
-            tiers=flat,
-            log=False,
-        )
-        == ["default"]
-    )
+    assert qp.warn_if_self_protection_inert(
+        caps={"m": 4},
+        costs={},
+        pool_of={},
+        pool_budget={},
+        default_budget=9999.0,
+        tiers=flat,
+        log=False,
+    ) == ["default"]
 
     # 4. Flat tiers even with a BOUNDED budget that binds cross-model (two cap-4
     #    models, budget 1.0): a giant prompt still costs the same as a tiny one, so
     #    no fast-lane slot is reserved → INERT (inert ⟺ flat OR unbounded, not AND).
-    assert (
-        qp.warn_if_self_protection_inert(
-            caps={"m": 4, "n": 4},
-            costs={},
-            pool_of={},
-            pool_budget={},
-            default_budget=1.0,
-            tiers=flat,
-            log=False,
-        )
-        == ["default"]
-    )
+    assert qp.warn_if_self_protection_inert(
+        caps={"m": 4, "n": 4},
+        costs={},
+        pool_of={},
+        pool_budget={},
+        default_budget=1.0,
+        tiers=flat,
+        log=False,
+    ) == ["default"]
 
     # 5. Non-flat tiers + an UNCAPPED model → unbounded in_flight can always reach
     #    B, so the budget stays bindable: NOT flagged as unbounded.

@@ -8,6 +8,15 @@ versions without a compatibility guarantee.
 
 ## [Unreleased]
 
+### Added
+- **Per-model `overlaat_abort_on_disconnect` policy** (`model_info` bool, default `true`) —
+  governs what an in-flight client disconnect does to the slot. `true` (today's behaviour)
+  releases the slot the instant the client disconnects, correct for abort-honouring
+  continuous-batching engines. `false` holds the slot and keeps draining the upstream to its
+  natural end (bounded by the read-timeout) before releasing, for single-stream engines with
+  no abort path — so slot accounting stays in sync with real backend occupancy and the next
+  call queues instead of stalling on a still-busy backend. #28
+
 ## [0.0.8] — 2026-06-22
 
 Usage-dashboard redesign. Observability/UI only — no scheduler, proxy, or schema changes.
