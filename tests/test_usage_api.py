@@ -107,6 +107,15 @@ async def test_consumers(monkeypatch):
     assert r.status_code == 200
 
 
+async def test_workloads(monkeypatch):
+    row = {"workload": "scout", "requests": 3, "latency_ms": {}}
+    monkeypatch.setattr(mdb, "build_workloads", lambda *a, **k: [row])
+    async with asgi() as c:
+        r = await c.get("/workloads?last=24h")
+    assert r.status_code == 200
+    assert r.json()["workloads"] == [row]
+
+
 async def test_dashboard_shows_version():
     async with asgi() as c:
         r = await c.get("/")

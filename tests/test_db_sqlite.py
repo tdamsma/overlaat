@@ -151,6 +151,81 @@ def test_end_to_end_roundtrip(tmp_path, monkeypatch):
     assert {c["key"] for c in consumers} == {"k1", "k2"}
 
 
+# ── 1b. workload column survives the proxy → metrics round-trip (#19) ───────────
+
+
+def test_workload_column_roundtrip(tmp_path):
+    """Proves the workload column/param parity end to end: an event carrying a
+    `workload` is INSERTed through the EXACT proxy SQLite writer (qp._EVENT_COLS /
+    qp._INSERT_SQL_SQLITE) and read back, then grouped by build_workloads. A column
+    list ↔ params mismatch would break this write outright."""
+    url = _sqlite_url(tmp_path)
+    db.init_db(url)
+
+    base = {
+        "t_enqueue": 0.0,
+        "t_acquire": 1.0,
+        "t_first_token": 2.0,
+        "t_done": 5.0,
+        "model_requested": "m1",
+        "key_fp": "k1",
+        "streamed": True,
+        "outcome": "completed",
+        "http_status": 200,
+        "prompt_tokens": 10,
+        "completion_tokens": 20,
+    }
+    _write_events_via_proxy_path(
+        url,
+        [
+            {**base, "workload": "scout"},
+            {**base, "completion_tokens": 40},  # no workload key → NULL/untagged
+        ],
+    )
+
+    # The raw column is read back (fetch_events selects `workload`).
+    got = m.fetch_events(url, since=0.0)
+    assert sorted((e.get("workload") or "") for e in got) == ["", "scout"]
+
+    # Grouped view: tagged + untagged buckets, tokens attributed correctly.
+    rows = m.build_workloads(url, since=0.0, now=10.0)
+    by = {r["workload"]: r for r in rows}
+    assert set(by) == {"scout", m.UNTAGGED}
+    assert by["scout"]["completion_tokens"] == 20
+    assert by[m.UNTAGGED]["completion_tokens"] == 40
+
+
+def test_init_db_adds_workload_to_legacy_table(tmp_path):
+    """Idempotent upgrade: a request_events table created WITHOUT workload (a
+    pre-#19 db) gains the column on the next init_db — the sqlite mirror of
+    schema.sql's `ALTER TABLE ... ADD COLUMN IF NOT EXISTS workload TEXT`."""
+    url = _sqlite_url(tmp_path)
+    conn = db.connect_sqlite_write(url)
+    try:
+        # Minimal legacy table: no `workload` column.
+        conn.execute(
+            "CREATE TABLE request_events ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, t_enqueue DOUBLE PRECISION NOT NULL, "
+            "t_done DOUBLE PRECISION NOT NULL, model_requested TEXT NOT NULL, "
+            "key_fp TEXT NOT NULL, outcome TEXT NOT NULL)"
+        )
+        conn.commit()
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(request_events)")}
+        assert "workload" not in cols
+    finally:
+        conn.close()
+
+    db.init_db(url)  # idempotent upgrade
+
+    conn = db.connect_sqlite_write(url)
+    try:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(request_events)")}
+        assert "workload" in cols
+        db.init_db(url)  # second run is a no-op (no duplicate-column error)
+    finally:
+        conn.close()
+
+
 # ── 2. per-backend normalization on SQLite reads ────────────────────────────────
 
 

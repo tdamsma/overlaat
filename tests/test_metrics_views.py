@@ -60,6 +60,37 @@ def test_build_consumers(monkeypatch):
     assert rows[0]["completion_tokens"] == 20  # only the completed call had a count
 
 
+def test_sanitize_label():
+    assert m.sanitize_label("scout") == "scout"
+    assert m.sanitize_label(None) == m.UNTAGGED
+    assert m.sanitize_label("") == m.UNTAGGED
+    assert m.sanitize_label("   ") == m.UNTAGGED
+
+
+def test_build_workloads(monkeypatch):
+    events = [
+        {**ev(enq=0.0, acq=1.0, done=5.0), "workload": "scout"},  # completed, tagged
+        {
+            **ev(enq=0.0, acq=None, done=2.0, outcome="cancelled_queued", ct=None),
+            "workload": "scout",
+        },
+        {**ev(enq=0.0, acq=1.0, done=3.0), "workload": None},  # untagged bucket
+    ]
+    monkeypatch.setattr(m, "fetch_events", lambda *a, **k: events)
+    rows = m.build_workloads("db", 0, 100)
+    by = {r["workload"]: r for r in rows}
+    assert set(by) == {"scout", m.UNTAGGED}
+    scout = by["scout"]
+    assert scout["requests"] == 2
+    assert scout["completed"] == 1
+    assert scout["cancelled_queued"] == 1
+    assert scout["completion_tokens"] == 20  # only the completed call counted
+    # Latency percentiles populated from the one completed call (ms).
+    assert scout["latency_ms"]["queue_wait_p50"] == 1000  # (1.0-0.0)*1000
+    assert scout["latency_ms"]["total_p50"] == 5000  # (5.0-0.0)*1000
+    assert by[m.UNTAGGED]["requests"] == 1
+
+
 def test_build_timeline(monkeypatch):
     monkeypatch.setattr(m, "fetch_events", lambda *a, **k: [ev(enq=0, acq=1, done=5)])
     monkeypatch.setattr(

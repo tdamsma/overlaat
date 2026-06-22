@@ -36,7 +36,7 @@ MAX_PLAUSIBLE_DECODE = 500  # tok/s hardware ceiling; above this a decode rate i
 _EVENT_SELECT = (
     "SELECT t_enqueue, t_acquire, t_first_token, t_done, model_requested, "
     "key_fp, streamed, outcome, http_status, prompt_tokens, completion_tokens, "
-    "priority, cost, wait_reason "
+    "priority, cost, wait_reason, workload "
     "FROM request_events"
 )
 _EVENT_FIELDS = (
@@ -54,6 +54,7 @@ _EVENT_FIELDS = (
     "priority",
     "cost",
     "wait_reason",
+    "workload",
 )
 
 
@@ -541,4 +542,71 @@ def build_consumers(db_url: str, since: float, now: float, aliases: dict[str, st
         d["abandoned_rate"] = round(d["abandoned"] / d["requests"], 3) if d["requests"] else 0
         out.append(d)
     out.sort(key=lambda d: d["service_s"], reverse=True)
+    return out
+
+
+UNTAGGED = "(untagged)"  # bucket label for events with workload IS NULL
+
+
+def sanitize_label(value: object) -> str:
+    """Map a stored workload value to a display bucket: a non-empty string as-is,
+    anything else (NULL / non-string / empty) → `(untagged)`."""
+    if isinstance(value, str) and value.strip():
+        return value
+    return UNTAGGED
+
+
+def build_workloads(db_url: str, since: float, now: float) -> list[dict]:
+    """Per workload label (#19): requests by outcome, p50/p95 queue wait + total
+    latency (completed only, ms), completion tokens, and error/abandoned rate.
+    Mirrors build_consumers but groups on the caller-supplied `workload` tag —
+    so one key's latency-critical and bulk traffic can be read apart. Events with
+    `workload IS NULL` group under `(untagged)`. Observability only."""
+    events = fetch_events(db_url, since, now)
+    by_wl: dict[str, dict] = {}
+    for e in events:
+        label = sanitize_label(e.get("workload"))
+        d = by_wl.setdefault(
+            label,
+            {
+                "workload": label,
+                "requests": 0,
+                "completed": 0,
+                "abandoned": 0,
+                "errored": 0,
+                "cancelled_queued": 0,
+                "completion_tokens": 0,
+                "qwait": [],  # ms, completed only
+                "total": [],  # ms, completed only
+            },
+        )
+        d["requests"] += 1
+        oc = e["outcome"]
+        if oc == "completed":
+            d["completed"] += 1
+            if e["t_acquire"] is not None:
+                d["qwait"].append((e["t_acquire"] - e["t_enqueue"]) * 1000)
+            d["total"].append((e["t_done"] - e["t_enqueue"]) * 1000)
+        elif oc == "client_abandoned":
+            d["abandoned"] += 1
+        elif oc == "upstream_error":
+            d["errored"] += 1
+        elif oc == "cancelled_queued":
+            d["cancelled_queued"] += 1
+        if e["completion_tokens"]:
+            d["completion_tokens"] += e["completion_tokens"]
+
+    out = []
+    for d in by_wl.values():
+        qwait, total = d.pop("qwait"), d.pop("total")
+        d["latency_ms"] = {
+            "queue_wait_p50": round(_pct(qwait, 0.5)) if qwait else None,
+            "queue_wait_p95": round(_pct(qwait, 0.95)) if qwait else None,
+            "total_p50": round(_pct(total, 0.5)) if total else None,
+            "total_p95": round(_pct(total, 0.95)) if total else None,
+        }
+        d["abandoned_rate"] = round(d["abandoned"] / d["requests"], 3) if d["requests"] else 0
+        d["error_rate"] = round(d["errored"] / d["requests"], 3) if d["requests"] else 0
+        out.append(d)
+    out.sort(key=lambda d: d["requests"], reverse=True)
     return out

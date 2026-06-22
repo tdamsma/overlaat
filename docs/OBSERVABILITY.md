@@ -20,7 +20,7 @@ plus a host sampler.
                                                                           ▲
   host sampler (5s) ── host GPU%/RAM + per-backend RSS ────────────────────┘ host_samples (PG)
 
-  usage-api reads both tables ──▶ /now /timeline /models /perf /consumers + dashboard
+  usage-api reads both tables ──▶ /now /timeline /models /perf /consumers /workloads + dashboard
 ```
 
 The queue-proxy is the only component that sees **every** request's full
@@ -82,9 +82,15 @@ Written by the queue-proxy when a request reaches a terminal state.
 | `cost` | pool-fraction cost charged for this run (`1/cap` by default; an `overlaat_cost` override; `1.0` for an uncapped model). `NULL` when the scheduler is off |
 | `wait_reason` | why the request waited before admission: `none` (admitted on first pump) \| `reserved` (was the reserved head, admitted once the budget drained for it) \| `aged_in` (aging lifted it above equal-priority peers) \| `budget_full` (the pool budget had no room) \| `model_cap` (per-model backend cap was full) \| `exclusive` (a *different* member held the request's exclusive pool's one-distinct-member mutex). `NULL` when the scheduler is off |
 | `pool` | the resource pool the request was admitted against (`default` for an unconfigured model; an `overlaat_pool` name otherwise). `NULL` when the scheduler is off or the row predates this column |
+| `workload` | a caller-supplied workload label, taken from the `X-Overlaat-Workload` header (wins) or the request body's `metadata.workload` field (fallback), trimmed to 64 chars. Lets one consumer key's mixed traffic (e.g. bulk summaries vs interactive synthesis) be reported apart. **Observability only — never read by the scheduler.** `NULL` when the caller sent no label or the row predates this column |
 
 The cost-weighted scheduler (on by default since 0.0.3) populates `priority`, `cost`,
 `wait_reason`, and `pool`; see [`COST-SCHEDULER.md`](COST-SCHEDULER.md) for the algorithm.
+`workload` is independent of the scheduler: it is resolved at ingress and stripped from the
+forwarded request (header dropped hop-by-hop; the `metadata.workload` sub-key popped), so it
+never reaches the backend and never affects admission. The usage-api `GET /workloads`
+endpoint and the dashboard's *workloads* card break traffic down per label (untagged rows
+group under `(untagged)`).
 With `OVERLAAT_SCHEDULER=off` (the kill-switch restoring per-model FIFO semaphores) and
 for rows written before these columns existed, they are `NULL`. `wait_reason` is the
 cheapest way to see *why* a queue is deep: a run of `budget_full` means the request's
@@ -226,6 +232,7 @@ gate.
 | `GET /models?last=` | capacity view: per-model outcome counts, latency split (`queue_wait` / `ttft` / `service` / `total`, p50 + p95), and throughput-by-measured-concurrency (min-sample guarded). |
 | `GET /perf?last=` | **backend-health monitoring**: per-model decode tok/s over time (`completion_tokens / (t_done - t_first_token)`, streamed completed calls only). Reports an all-calls median and a **solo** median (calls at mean concurrency < 1.5) that isolates backend health from load — a sustained drop in the solo line is degradation, not contention (some engines slow down over long uptime; the fix is to restart the backend service). Rates above a hardware ceiling are dropped as near-zero-window artifacts; thinking-mode models that emit no `t_first_token` do not appear here. |
 | `GET /consumers?last=` | per key alias: requests by outcome, tokens, service-seconds, abandoned-rate, models used. |
+| `GET /workloads?last=` | per workload label: requests by outcome, p50/p95 queue wait + total latency, completion tokens, abandoned/error rate (untagged traffic under `(untagged)`). |
 | `GET /healthz` | liveness + DB check. |
 
 `window` (`last=`) accepts `30m | 1h | 6h | 24h | 7d`.
