@@ -13,6 +13,10 @@
 # `overlaat_abort_on_disconnect` (bool, default `true`), governs the client-disconnect
 # path: `true` releases the slot the instant the client disconnects; `false` holds the
 # slot until the upstream drains, for single-stream engines with no abort path (#28).
+# A further OPTIONAL `model_info` key, `overlaat_max_prompt_tokens` (positive int,
+# default unset = no ceiling), rejects a request whose estimated prompt exceeds it at
+# admission with HTTP 413 — before any slot or budget is taken — so no caller can hand
+# the runtime a single job too large to process healthily (#30).
 # It also reads an OPTIONAL top-level `overlaat.pools`
 # section that declares each pool's `budget` and `exclusive` flag (see the bottom
 # of this file). The deprecated `overlaat_slot` key is still accepted as a LEGACY
@@ -128,6 +132,7 @@ model_list:
     model_info:
       overlaat_pool: fat-slot   # ← same pool → mutually exclusive with model-b (cost = 1/cap = 1.0)
       overlaat_abort_on_disconnect: false   # single-stream engine, no abort API: hold the slot until upstream drains on client disconnect (#28)
+      # overlaat_max_prompt_tokens: 8000    # OPTIONAL: reject prompts estimated >8k tokens with 413 before admission; callers must chunk (#30)
       # Legacy: `overlaat_slot: fat-slot` is still accepted here and means the
       # same thing (overlaat_pool: fat-slot + auto exclusive: true).
 
