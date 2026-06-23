@@ -141,6 +141,14 @@ draining the upstream to its natural end (bounded by the read-timeout) before re
 so slot accounting tracks the still-busy backend and the next call queues instead of
 stalling on it. #28
 
+Another per-model `model_info` knob, `overlaat_max_prompt_tokens` (positive int, default
+unset = no ceiling), is a pre-admission size gate rather than a cost: a request whose
+estimated prompt exceeds the ceiling is rejected with **413** (`outcome=rejected_oversized`)
+*before* any slot or budget is taken — because the cost-clamp guarantees even a giant prompt
+is otherwise admitted whole, this is the only thing that stops one oversized job from
+collapsing the runtime. Set the same ceiling on every alias of a runtime (it is keyed by
+model-name, not engine). #30
+
 ### Prompt-size-weighted cost (closes #18)
 
 A flat `cost = 1/cap` charges a 50-token prompt and a 33k-token prompt the same,

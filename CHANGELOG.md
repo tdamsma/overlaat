@@ -8,6 +8,17 @@ versions without a compatibility guarantee.
 
 ## [Unreleased]
 
+### Added
+- **Per-model `overlaat_max_prompt_tokens` ceiling** (`model_info` positive int, default unset
+  = no ceiling) — a prompt whose estimated size exceeds its model's ceiling is rejected at the
+  admission point with **413** (`{"error": {"type": "overlaat_prompt_too_large", …}}`) *before*
+  it is queued or any pool budget is charged, and emits one lifecycle event with
+  `outcome="rejected_oversized"` so the dashboards count it. overlaat is the single model-aware
+  choke point and already estimates prompt size for weighting; the cost-clamp guarantees even a
+  giant prompt is otherwise admitted whole, so a per-request size limit closes the gap where one
+  oversized prompt can collapse the runtime's decode. Config is per-model-**name**, so set the
+  same ceiling on every alias of a runtime. #30
+
 ### Changed
 - **Dashboard redesigned to a top-to-bottom, variable-width layout** — a full-width time-chart
   stack on top (host, work-by-customer, and a combined dual-y-axis throughput chart: output on

@@ -918,3 +918,82 @@ async def test_upstream_timeout_built_from_knobs(monkeypatch):
     assert t.connect == 5.0
     assert t.write == 60.0
     assert t.pool == 5.0
+
+
+# ── per-model overlaat_max_prompt_tokens ceiling (#30) ──────────────────────────
+
+
+async def test_oversized_prompt_rejected_413(monkeypatch, isolate_state):
+    """A prompt whose estimate exceeds the model's `overlaat_max_prompt_tokens`
+    is rejected at admission with 413 BEFORE any slot/budget is taken: exactly
+    one `rejected_oversized` event is emitted, the upstream is never hit, and the
+    model's semaphore stays free (in_flight 0)."""
+    events = isolate_state
+    monkeypatch.setattr(qp, "CAPS", {"m": 1})
+    monkeypatch.setattr(qp, "MAX_PROMPT_TOKENS", {"m": 100})
+
+    hit = {"count": 0}
+
+    async def handler(request):
+        hit["count"] += 1
+        return PlainTextResponse('{"usage":{"prompt_tokens":7,"completion_tokens":9}}')
+
+    upstream = Starlette(routes=[Route("/{path:path}", handler, methods=["POST"])])
+    qp.app.state.client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=upstream), base_url=qp.UPSTREAM
+    )
+
+    # 500 chars / CHARS_PER_TOKEN(4) = 125 est tokens > ceiling 100.
+    big = "x" * 500
+    async with asgi() as c:
+        r = await c.post(
+            "/v1/chat/completions",
+            json={"model": "m", "stream": False, "messages": [{"role": "user", "content": big}]},
+        )
+
+    assert r.status_code == 413
+    body = r.json()
+    assert body["error"]["type"] == "overlaat_prompt_too_large"
+
+    # exactly one lifecycle event, marked rejected before admission
+    assert len(events) == 1
+    ev = events[0]
+    assert ev["outcome"] == "rejected_oversized"
+    assert ev["http_status"] == 413
+    assert ev["prompt_tokens"] == 125
+    assert ev["completion_tokens"] is None
+    assert ev["t_acquire"] is None  # no slot acquired
+
+    # no slot taken, upstream never reached
+    assert hit["count"] == 0
+    sem = qp.get_semaphore("m")
+    assert not sem.locked()
+    assert qp.METRICS["m"]["in_flight"] == 0
+    await qp.app.state.client.aclose()
+
+
+async def test_small_prompt_under_ceiling_passes_through(monkeypatch, isolate_state):
+    """A prompt under the ceiling is NOT rejected: it forwards to the upstream and
+    completes normally (no `rejected_oversized` event)."""
+    events = isolate_state
+    monkeypatch.setattr(qp, "CAPS", {"m": 1})
+    monkeypatch.setattr(qp, "MAX_PROMPT_TOKENS", {"m": 100})
+
+    async def handler(request):
+        return PlainTextResponse('{"usage":{"prompt_tokens":7,"completion_tokens":9}}')
+
+    upstream = Starlette(routes=[Route("/{path:path}", handler, methods=["POST"])])
+    qp.app.state.client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=upstream), base_url=qp.UPSTREAM
+    )
+
+    async with asgi() as c:
+        r = await c.post(
+            "/v1/chat/completions",
+            json={"model": "m", "stream": False, "messages": [{"role": "user", "content": "hi"}]},
+        )
+
+    assert r.status_code == 200
+    assert len(events) == 1
+    assert events[0]["outcome"] == "completed"
+    await qp.app.state.client.aclose()
