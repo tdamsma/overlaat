@@ -259,17 +259,19 @@ def load_caps(path: Path) -> dict[str, int]:
 
 def load_model_info(
     path: Path,
-) -> tuple[dict[str, float], dict[str, str], dict[str, bool], dict[str, bool]]:
+) -> tuple[dict[str, float], dict[str, str], dict[str, bool], dict[str, bool], dict[str, int]]:
     """Read the scheduler-specific per-model knobs from the LiteLLM config's
     ``model_info`` blocks: an explicit cost override (``overlaat_cost``), the
     resource-pool assignment (``overlaat_pool``), the deprecated swap-slot
-    alias (``overlaat_slot``), and the client-disconnect policy
+    alias (``overlaat_slot``), the client-disconnect policy
     (``overlaat_abort_on_disconnect`` — a per-model bool; default ``True`` =
     release the slot on client disconnect; ``False`` = hold the slot until the
-    upstream drains, for single-stream engines with no abort path — issue #28).
+    upstream drains, for single-stream engines with no abort path — issue #28),
+    and the per-model prompt-size ceiling (``overlaat_max_prompt_tokens`` — a
+    positive int; default unset = no ceiling — issue #30).
 
-    Returns ``(costs, pool_of, exclusive_seed, abort_on_disconnect)`` keyed by
-    model_name / pool_name:
+    Returns ``(costs, pool_of, exclusive_seed, abort_on_disconnect,
+    max_prompt_tokens)`` keyed by model_name / pool_name:
       - ``costs[model]``    — explicit pool-fraction cost override (float > 0).
       - ``pool_of[model]``  — the named resource pool the model is admitted
         against. A model with no ``overlaat_pool`` is in the ``default`` pool.
@@ -280,19 +282,24 @@ def load_model_info(
         swap-slot configs keep working (a cap-1 slot is byte-identical).
       - ``abort_on_disconnect[model]`` — explicit per-model bool override of the
         client-disconnect policy. A model absent here defaults to ``True``.
+      - ``max_prompt_tokens[model]`` — explicit per-model prompt-size ceiling
+        (positive int). A prompt whose estimate exceeds it is rejected at
+        admission with 413 before any slot/budget is taken. A model absent here
+        has no ceiling.
     Models without any of these keys simply don't appear in ``costs`` (the
     scheduler derives cost from ``1/cap`` or the default) and land in ``default``.
     """
     if not path.exists():
-        return {}, {}, {}, {}
+        return {}, {}, {}, {}, {}
     try:
         cfg = yaml.safe_load(path.read_text()) or {}
     except Exception:
-        return {}, {}, {}, {}
+        return {}, {}, {}, {}, {}
     costs: dict[str, float] = {}
     pool_of: dict[str, str] = {}
     exclusive_seed: dict[str, bool] = {}
     abort_on_disconnect: dict[str, bool] = {}
+    max_prompt_tokens: dict[str, int] = {}
     for m in cfg.get("model_list", []):
         name = m.get("model_name")
         if not isinstance(name, str):
@@ -312,7 +319,10 @@ def load_model_info(
         a = info.get("overlaat_abort_on_disconnect")
         if isinstance(a, bool):
             abort_on_disconnect[name] = a
-    return costs, pool_of, exclusive_seed, abort_on_disconnect
+        mpt = info.get("overlaat_max_prompt_tokens")
+        if isinstance(mpt, int) and not isinstance(mpt, bool) and mpt > 0:
+            max_prompt_tokens[name] = mpt
+    return costs, pool_of, exclusive_seed, abort_on_disconnect, max_prompt_tokens
 
 
 def load_pools(path: Path) -> tuple[dict[str, float], set[str]]:
@@ -577,7 +587,9 @@ def warn_if_self_protection_inert(
 
 
 CAPS: dict[str, int] = load_caps(LITELLM_CONFIG)
-COSTS, POOL_OF, _EXCLUSIVE_SEED, ABORT_ON_DISCONNECT = load_model_info(LITELLM_CONFIG)
+COSTS, POOL_OF, _EXCLUSIVE_SEED, ABORT_ON_DISCONNECT, MAX_PROMPT_TOKENS = load_model_info(
+    LITELLM_CONFIG
+)
 _DECLARED_BUDGETS, _DECLARED_EXCLUSIVE = load_pools(LITELLM_CONFIG)
 POOL_BUDGET, POOL_EXCLUSIVE = resolve_pool_config(
     CAPS,
@@ -1285,6 +1297,36 @@ async def proxy(full_path: str, request: Request):
             "pool": None,
             "workload": workload,
         }
+
+    # Per-model prompt-size ceiling (#30): reject an oversized prompt here —
+    # AFTER the event skeleton (so the rejection is counted as one lifecycle
+    # event) and BEFORE any dispatch — so no slot is acquired, no budget charged,
+    # nothing queued. A model with no `overlaat_max_prompt_tokens` has no ceiling.
+    if (
+        model is not None
+        and model in MAX_PROMPT_TOKENS
+        and prompt_tokens_est > MAX_PROMPT_TOKENS[model]
+    ):
+        if ev is not None:
+            ev["t_acquire"] = None
+            ev["t_done"] = time.time()
+            ev["outcome"] = "rejected_oversized"
+            ev["http_status"] = 413
+            ev["prompt_tokens"] = prompt_tokens_est
+            ev["completion_tokens"] = None
+            emit_event(ev)
+        return JSONResponse(
+            status_code=413,
+            content={
+                "error": {
+                    "message": (
+                        f"prompt {prompt_tokens_est} tokens exceeds max_prompt_tokens "
+                        f"{MAX_PROMPT_TOKENS[model]} for {model}; chunk the input"
+                    ),
+                    "type": "overlaat_prompt_too_large",
+                }
+            },
+        )
 
     if SCHEDULER_ON and model is not None and SCHED is not None:
         return await _admit_scheduler(
