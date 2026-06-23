@@ -18,6 +18,17 @@ versions without a compatibility guarantee.
   giant prompt is otherwise admitted whole, so a per-request size limit closes the gap where one
   oversized prompt can collapse the runtime's decode. Config is per-model-**name**, so set the
   same ceiling on every alias of a runtime. #30
+- **Per-model `overlaat_breaker` health-gated admission circuit breaker** (`model_info`
+  `{fails, cooldown_s}`, default unset = off) — admission was otherwise open-loop, with no signal
+  that the *runtime* was unhealthy, so a wedged backend kept being fed. The breaker trips **open**
+  after `fails` consecutive `upstream_error` outcomes (upstream 5xx, connection errors, and
+  read-timeouts all surface as `upstream_error`) and **fast-fails** new requests for `cooldown_s`
+  seconds with **503** (`{"error": {"type": "overlaat_backend_unhealthy", …}}`) + a `Retry-After`
+  header — rather than holding them in queue, which would only pile callers onto the wedged
+  backend — emitting one lifecycle event with `outcome="rejected_unhealthy"`. After the cooldown a
+  single **half-open** probe is allowed: success closes the breaker, failure re-opens it with a
+  fresh cooldown. Zero-token completions are deliberately NOT treated as failures (too noisy — legit
+  short/empty/embeddings responses). #31
 
 ### Changed
 - **Dashboard redesigned to a top-to-bottom, variable-width layout** — a full-width time-chart

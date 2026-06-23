@@ -70,6 +70,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from overlaat import __version__, db
+from overlaat.breaker import Breaker
 from overlaat.scheduler import Scheduler, Waiter
 
 UPSTREAM = os.environ.get("QUEUE_PROXY_UPSTREAM", "http://127.0.0.1:4002")
@@ -259,7 +260,14 @@ def load_caps(path: Path) -> dict[str, int]:
 
 def load_model_info(
     path: Path,
-) -> tuple[dict[str, float], dict[str, str], dict[str, bool], dict[str, bool], dict[str, int]]:
+) -> tuple[
+    dict[str, float],
+    dict[str, str],
+    dict[str, bool],
+    dict[str, bool],
+    dict[str, int],
+    dict[str, dict],
+]:
     """Read the scheduler-specific per-model knobs from the LiteLLM config's
     ``model_info`` blocks: an explicit cost override (``overlaat_cost``), the
     resource-pool assignment (``overlaat_pool``), the deprecated swap-slot
@@ -267,11 +275,13 @@ def load_model_info(
     (``overlaat_abort_on_disconnect`` — a per-model bool; default ``True`` =
     release the slot on client disconnect; ``False`` = hold the slot until the
     upstream drains, for single-stream engines with no abort path — issue #28),
-    and the per-model prompt-size ceiling (``overlaat_max_prompt_tokens`` — a
-    positive int; default unset = no ceiling — issue #30).
+    the per-model prompt-size ceiling (``overlaat_max_prompt_tokens`` — a
+    positive int; default unset = no ceiling — issue #30), and the per-model
+    health circuit breaker (``overlaat_breaker`` — ``{fails, cooldown_s}``;
+    default unset = off — issue #31).
 
     Returns ``(costs, pool_of, exclusive_seed, abort_on_disconnect,
-    max_prompt_tokens)`` keyed by model_name / pool_name:
+    max_prompt_tokens, breaker)`` keyed by model_name / pool_name:
       - ``costs[model]``    — explicit pool-fraction cost override (float > 0).
       - ``pool_of[model]``  — the named resource pool the model is admitted
         against. A model with no ``overlaat_pool`` is in the ``default`` pool.
@@ -286,20 +296,25 @@ def load_model_info(
         (positive int). A prompt whose estimate exceeds it is rejected at
         admission with 413 before any slot/budget is taken. A model absent here
         has no ceiling.
+      - ``breaker[model]`` — ``{"fails": int, "cooldown_s": float}`` for the
+        per-model health circuit breaker. Both keys are required and positive;
+        a malformed / partial entry is skipped (breaker off for that model). A
+        model absent here is never gated.
     Models without any of these keys simply don't appear in ``costs`` (the
     scheduler derives cost from ``1/cap`` or the default) and land in ``default``.
     """
     if not path.exists():
-        return {}, {}, {}, {}, {}
+        return {}, {}, {}, {}, {}, {}
     try:
         cfg = yaml.safe_load(path.read_text()) or {}
     except Exception:
-        return {}, {}, {}, {}, {}
+        return {}, {}, {}, {}, {}, {}
     costs: dict[str, float] = {}
     pool_of: dict[str, str] = {}
     exclusive_seed: dict[str, bool] = {}
     abort_on_disconnect: dict[str, bool] = {}
     max_prompt_tokens: dict[str, int] = {}
+    breaker: dict[str, dict] = {}
     for m in cfg.get("model_list", []):
         name = m.get("model_name")
         if not isinstance(name, str):
@@ -322,7 +337,20 @@ def load_model_info(
         mpt = info.get("overlaat_max_prompt_tokens")
         if isinstance(mpt, int) and not isinstance(mpt, bool) and mpt > 0:
             max_prompt_tokens[name] = mpt
-    return costs, pool_of, exclusive_seed, abort_on_disconnect, max_prompt_tokens
+        bk = info.get("overlaat_breaker")
+        if isinstance(bk, dict):
+            fails = bk.get("fails")
+            cooldown = bk.get("cooldown_s")
+            if (
+                isinstance(fails, int)
+                and not isinstance(fails, bool)
+                and fails > 0
+                and isinstance(cooldown, (int, float))
+                and not isinstance(cooldown, bool)
+                and cooldown > 0
+            ):
+                breaker[name] = {"fails": int(fails), "cooldown_s": float(cooldown)}
+    return costs, pool_of, exclusive_seed, abort_on_disconnect, max_prompt_tokens, breaker
 
 
 def load_pools(path: Path) -> tuple[dict[str, float], set[str]]:
@@ -587,8 +615,8 @@ def warn_if_self_protection_inert(
 
 
 CAPS: dict[str, int] = load_caps(LITELLM_CONFIG)
-COSTS, POOL_OF, _EXCLUSIVE_SEED, ABORT_ON_DISCONNECT, MAX_PROMPT_TOKENS = load_model_info(
-    LITELLM_CONFIG
+COSTS, POOL_OF, _EXCLUSIVE_SEED, ABORT_ON_DISCONNECT, MAX_PROMPT_TOKENS, BREAKER_CFG = (
+    load_model_info(LITELLM_CONFIG)
 )
 _DECLARED_BUDGETS, _DECLARED_EXCLUSIVE = load_pools(LITELLM_CONFIG)
 POOL_BUDGET, POOL_EXCLUSIVE = resolve_pool_config(
@@ -601,6 +629,11 @@ POOL_BUDGET, POOL_EXCLUSIVE = resolve_pool_config(
     BUDGET,
 )
 POOL_HEAVY_MAX: dict[str, str] = load_pool_heavy_max(LITELLM_CONFIG)
+
+# Per-model health-gated admission circuit breaker (#31). Default OFF: a model
+# with no `overlaat_breaker` config is never gated. Pure in-memory state machine,
+# one per process, no locks — same single-event-loop invariant as the scheduler.
+BREAKER = Breaker(BREAKER_CFG)
 
 # Emit the self-protection inert warning alongside the other startup-time pool
 # logging (kept silent on the kill-switch path). See warn_if_self_protection_inert.
@@ -1157,6 +1190,13 @@ async def _forward(
         ev["prompt_tokens"] = pt
         ev["completion_tokens"] = ct
         emit_event(ev)
+        # Feed the health breaker (#31) exactly once per terminal upstream
+        # outcome. This is reached only by real upstream attempts, so the
+        # admission-time rejections emitted elsewhere (`rejected_oversized`,
+        # `rejected_unhealthy`, `cancelled_queued`) correctly never feed it.
+        # `completed` → success, `upstream_error` → failure, others neutral.
+        if model is not None:
+            BREAKER.record(model, outcome)
 
     try:
         upstream_resp = await client.send(upstream_req, stream=True)
@@ -1327,6 +1367,38 @@ async def proxy(full_path: str, request: Request):
                 }
             },
         )
+
+    # Per-model health circuit breaker (#31): consult AFTER the #30 size gate and
+    # BEFORE any dispatch (scheduler or semaphore). While the breaker is OPEN for
+    # this model, fast-fail with 503 + Retry-After rather than holding the request
+    # in queue — piling callers onto a wedged backend is exactly what this guards
+    # against. No slot is acquired and no pool budget is charged. A model with no
+    # `overlaat_breaker` config (the default) always returns allowed.
+    if model is not None:
+        allowed, _reason = BREAKER.allow(model)
+        if not allowed:
+            retry_after = BREAKER.retry_after(model)
+            if ev is not None:
+                ev["t_acquire"] = None
+                ev["t_done"] = time.time()
+                ev["outcome"] = "rejected_unhealthy"
+                ev["http_status"] = 503
+                ev["prompt_tokens"] = prompt_tokens_est
+                ev["completion_tokens"] = None
+                emit_event(ev)
+            return JSONResponse(
+                status_code=503,
+                headers={"Retry-After": str(retry_after)},
+                content={
+                    "error": {
+                        "message": (
+                            f"model {model} temporarily unavailable — backend health "
+                            f"circuit open; retry after {retry_after}s"
+                        ),
+                        "type": "overlaat_backend_unhealthy",
+                    }
+                },
+            )
 
     if SCHEDULER_ON and model is not None and SCHED is not None:
         return await _admit_scheduler(

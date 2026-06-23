@@ -997,3 +997,79 @@ async def test_small_prompt_under_ceiling_passes_through(monkeypatch, isolate_st
     assert len(events) == 1
     assert events[0]["outcome"] == "completed"
     await qp.app.state.client.aclose()
+
+
+# ── i. health-gated admission circuit breaker (#31) ───────────────────────────
+
+
+async def test_breaker_trips_503_then_recovers_after_cooldown(monkeypatch, isolate_state):
+    """End-to-end: after K consecutive upstream errors the breaker opens and the
+    next request fast-fails with 503 (`overlaat_backend_unhealthy` + Retry-After)
+    BEFORE touching the upstream, emitting exactly one `rejected_unhealthy` event.
+    After the injected clock advances past the cooldown, the next request is
+    admitted (the half-open probe), and a `completed` closes the breaker so traffic
+    flows normally again."""
+    from overlaat.breaker import Breaker
+
+    events = isolate_state
+    monkeypatch.setattr(qp, "CAPS", {"m": 1})
+
+    # Controllable injected monotonic clock for the breaker's cooldown.
+    fake = {"t": 0.0}
+
+    def clock():
+        return fake["t"]
+
+    monkeypatch.setattr(qp, "BREAKER", Breaker({"m": {"fails": 2, "cooldown_s": 30}}, now=clock))
+
+    hit = {"count": 0}
+    mode = {"status": 500}  # flip to 200 once we want a healthy probe
+
+    async def handler(request):
+        hit["count"] += 1
+        if mode["status"] >= 400:
+            return PlainTextResponse("upstream boom", status_code=mode["status"])
+        return PlainTextResponse('{"usage":{"prompt_tokens":7,"completion_tokens":9}}')
+
+    upstream = Starlette(routes=[Route("/{path:path}", handler, methods=["POST"])])
+    qp.app.state.client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=upstream), base_url=qp.UPSTREAM
+    )
+
+    async with asgi() as c:
+        # Two upstream errors trip the breaker (fails=2).
+        r1 = await c.post("/v1/chat/completions", json={"model": "m", "stream": False})
+        r2 = await c.post("/v1/chat/completions", json={"model": "m", "stream": False})
+        assert r1.status_code == 500
+        assert r2.status_code == 500
+        assert hit["count"] == 2
+        assert qp.BREAKER.state("m") == "open"
+
+        # Third request is fast-failed with 503 BEFORE the upstream is reached.
+        r3 = await c.post("/v1/chat/completions", json={"model": "m", "stream": False})
+        assert r3.status_code == 503
+        assert r3.headers.get("Retry-After") == "30"
+        assert r3.json()["error"]["type"] == "overlaat_backend_unhealthy"
+        assert hit["count"] == 2  # upstream NOT hit for the rejected one
+
+        # Exactly one rejected_unhealthy event, marked rejected (no slot acquired).
+        unhealthy = [e for e in events if e["outcome"] == "rejected_unhealthy"]
+        assert len(unhealthy) == 1
+        assert unhealthy[0]["http_status"] == 503
+        assert unhealthy[0]["t_acquire"] is None
+        assert qp.METRICS["m"]["in_flight"] == 0
+
+        # Advance the clock past the cooldown → next request is admitted (probe).
+        fake["t"] += 31.0
+        mode["status"] = 200
+        r4 = await c.post("/v1/chat/completions", json={"model": "m", "stream": False})
+        assert r4.status_code == 200
+        assert hit["count"] == 3  # the probe DID reach the upstream
+        assert qp.BREAKER.state("m") == "closed"  # probe success closed it
+
+        # Traffic flows normally again.
+        r5 = await c.post("/v1/chat/completions", json={"model": "m", "stream": False})
+        assert r5.status_code == 200
+        assert hit["count"] == 4
+
+    await qp.app.state.client.aclose()
