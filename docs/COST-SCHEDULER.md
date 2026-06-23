@@ -149,6 +149,17 @@ is otherwise admitted whole, this is the only thing that stops one oversized job
 collapsing the runtime. Set the same ceiling on every alias of a runtime (it is keyed by
 model-name, not engine). #30
 
+Another per-model `model_info` knob, `overlaat_breaker: { fails, cooldown_s }` (both
+positive; default unset = off), is a **health gate** rather than a cost. Admission is
+otherwise open-loop, so a wedged backend keeps being fed; the breaker watches the terminal
+outcome the proxy already records and, after `fails` consecutive `upstream_error` outcomes
+(upstream 5xx, connection errors, and read-timeouts all surface as `upstream_error`), trips
+**open** and **fast-fails** new requests with **503** + a `Retry-After` header
+(`outcome=rejected_unhealthy`) for `cooldown_s` seconds — it does *not* hold them in the
+queue, which would only pile callers onto the wedge. After the cooldown a single **half-open**
+probe is admitted; its success closes the breaker, its failure re-opens it with a fresh
+cooldown. Zero-token completions are deliberately not treated as failures (too noisy). #31
+
 ### Prompt-size-weighted cost (closes #18)
 
 A flat `cost = 1/cap` charges a 50-token prompt and a 33k-token prompt the same,

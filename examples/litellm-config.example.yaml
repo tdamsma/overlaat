@@ -17,6 +17,11 @@
 # default unset = no ceiling), rejects a request whose estimated prompt exceeds it at
 # admission with HTTP 413 — before any slot or budget is taken — so no caller can hand
 # the runtime a single job too large to process healthily (#30).
+# A further OPTIONAL `model_info` key, `overlaat_breaker: { fails, cooldown_s }` (both
+# positive; default unset = off), is a per-model HEALTH circuit breaker: after `fails`
+# consecutive upstream errors/timeouts the model trips open and new requests fast-fail
+# with HTTP 503 + `Retry-After` for `cooldown_s` seconds (a single half-open probe then
+# tests recovery), so a wedged backend stops being fed instead of being piled on (#31).
 # It also reads an OPTIONAL top-level `overlaat.pools`
 # section that declares each pool's `budget` and `exclusive` flag (see the bottom
 # of this file). The deprecated `overlaat_slot` key is still accepted as a LEGACY
@@ -55,6 +60,13 @@ model_list:
       # `think` is an Ollama extension passed through via extra_body; harmless
       # to omit. Shown only to illustrate that LiteLLM forwards extra fields.
       extra_body: {"think": false}
+    model_info:
+      # OPTIONAL per-model health circuit breaker (#31), default unset = off.
+      # Trips OPEN after `fails` consecutive upstream errors/timeouts and
+      # fast-fails new requests with 503 + Retry-After for `cooldown_s` seconds,
+      # then allows one half-open probe to test recovery. Stops feeding a wedged
+      # backend instead of piling more requests onto it.
+      # overlaat_breaker: { fails: 5, cooldown_s: 30 }
 
   # ─── Example 2: an embeddings model ───────────────────────────────────────
   # Embeddings are short and cheap; a modest cap is plenty. The cap is still the

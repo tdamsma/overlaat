@@ -38,7 +38,7 @@ def test_load_model_info_abort_on_disconnect(tmp_path):
         "  - model_name: plain\n"
         "    litellm_params: { model: x/plain, max_parallel_requests: 2 }\n"
     )
-    _costs, _pool_of, _excl, abort, _ = qp.load_model_info(cfg)
+    _costs, _pool_of, _excl, abort, _, _ = qp.load_model_info(cfg)
     assert abort == {"ds4": False, "rapid": True}  # explicit only
     assert abort.get("plain", True) is True  # absent -> default True
 
@@ -65,7 +65,7 @@ def test_load_model_info_max_prompt_tokens(tmp_path):
         "  - model_name: plain\n"  # absent -> not present
         "    litellm_params: { model: x/plain, max_parallel_requests: 2 }\n"
     )
-    _costs, _pool_of, _excl, _abort, mpt = qp.load_model_info(cfg)
+    _costs, _pool_of, _excl, _abort, mpt, _ = qp.load_model_info(cfg)
     assert mpt == {"capped": 8000}  # positive int only
     assert "plain" not in mpt  # absent -> no ceiling
 
