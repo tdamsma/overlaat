@@ -19,6 +19,20 @@ versions without a compatibility guarantee.
   oversized prompt can collapse the runtime's decode. Config is per-model-**name**, so set the
   same ceiling on every alias of a runtime. #30
 
+### Changed
+- **Dashboard redesigned to a top-to-bottom, variable-width layout** — a full-width time-chart
+  stack on top (host, work-by-customer, and a combined dual-y-axis throughput chart: output on
+  the left axis, input on the right, independently scaled), a narrow status row, then full-width
+  data tables. Replaces the previous three-column layout; the per-model output chart folds into
+  the dual-axis throughput chart and the hover readout shows both input and output tok/s. (#32)
+
+### Fixed
+- **Server-health verdict no longer flags a saturated GPU as "degraded".** A pegged GPU doing
+  useful work — even with overflow queued — is overlaat working as intended, not a problem. The
+  verdict now reports DEGRADED only when the GPU is pegged yet barely producing tokens
+  (busy-but-unproductive → wedged/thrashing decode), and the GPU KPI no longer shows alarm-red
+  at high utilization.
+
 ## [0.0.9] — 2026-06-22
 
 Per-model client-disconnect policy for single-stream engines. Proxy-only — no schema

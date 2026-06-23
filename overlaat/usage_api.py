@@ -787,7 +787,9 @@ function renderNow(now){
   const h=now.host||{};
   const wiredPct=h.wired_gb&&h.total_gb?h.wired_gb/h.total_gb*100:0;
   const kc=[
-    ['GPU now',h.gpu_pct==null?'—':h.gpu_pct.toFixed(0)+'%',h.gpu_pct>=95?'hot':h.gpu_pct>=70?'warn':'ok'],
+    // High GPU = the GPU is doing work, which is the goal — show it green (ok),
+    // never alarm-red. Health nuance (busy-but-unproductive) lives in the verdict.
+    ['GPU now',h.gpu_pct==null?'—':h.gpu_pct.toFixed(0)+'%',h.gpu_pct==null?'':h.gpu_pct>=50?'ok':''],
     ['wired RAM',h.wired_gb==null?'—':h.wired_gb.toFixed(0)+' GB',wiredPct>=88?'hot':wiredPct>=70?'warn':'ok'],
     ['free RAM',h.free_gb==null?'—':h.free_gb.toFixed(1)+' GB',h.free_gb<2?'hot':''],
     ['in flight',now.totals.in_flight,''],
@@ -811,24 +813,38 @@ function renderNow(now){
   renderHealth(now);
 }
 
-// Synthesized server-health verdict (right column). Extends the /now verdict/
-// stall logic: it weighs several signals we already have and reports the WORST
-// one as the reason. State = stalled (hot) | degraded (warn) | ok.
-//   • stall: slots held but GPU idle (wedged backend) — from now.stall.
-//   • backlog: queued waiters or a long oldest wait → degraded.
-//   • saturation: GPU pegged at ~100% with a backlog → degraded (capacity).
-//   • decode drift: a model's solo decode tok/s well below its history would
-//     show here too, but /now has no historical baseline, so we surface the
-//     queue/GPU signals it does carry. (See models table for decode drift.)
+// Recent aggregate output throughput (tok/s), averaged over the last few timeline
+// buckets — the live "is the GPU actually producing useful work?" signal that
+// renderHealth pairs with GPU%. Reads LAST_TL (already fetched for the charts);
+// returns null when there's no timeline data yet (so health never false-trips on
+// a missing signal). Averaging a few buckets rides out a single prefill bucket.
+function recentOutTokS(){
+  const tl=LAST_TL;if(!tl||!tl.totals)return null;
+  const a=tl.totals.out_tok_s||[],xs=[];
+  for(let i=a.length-1;i>=0&&xs.length<3;i--){if(a[i]!=null)xs.push(a[i]);}
+  return xs.length?xs.reduce((s,v)=>s+v,0)/xs.length:null;
+}
+// Synthesized server-health verdict (right column). overlaat's GOAL is a SATURATED
+// GPU doing useful work, with overflow queued fairly — so a pegged GPU and a queue
+// backlog are NORMAL, not degradation. The signals that actually mean trouble
+// (worst wins): the GPU busy but UNPRODUCTIVE (pegged yet ~0 tok/s → wedged /
+// thrashing decode, e.g. an oversized prompt collapsing the runtime), or slots
+// held while the GPU sits idle (stall), or no host sample / proxy unreachable.
+// State = stalled (hot) | degraded (warn) | ok. (Per-model decode-rate drift has
+// no /now baseline — see the models table.)
 function renderHealth(now){
   const el=$('#health');if(!el)return;
   const h=now.host||{},gpu=h.gpu_pct,tot=now.totals||{};
   const inFlight=tot.in_flight||0,queued=tot.queue_depth||0;
+  const outTps=recentOutTokS();
+  const UNPRODUCTIVE_TOK_S=5;   // aggregate output below this with a pegged GPU = stuck, not working
   // worst-signal wins.
-  let state='ok',reason='nominal — no queue backlog, GPU healthy';
+  let state='ok',reason=queued>0
+    ?`${inFlight} in flight, ${queued} queued — GPU saturated, overflow queued (working as intended)`
+    :'nominal — GPU productive, no backlog';
   if(gpu==null){state='warn';reason='no host sample — GPU/RAM unknown';}
-  if(queued>0){state='warn';reason=`${queued} request${queued>1?'s':''} queued — backend at capacity, callers waiting`;}
-  if(gpu!=null&&gpu>=98&&(inFlight>0||queued>0)){state='warn';reason=`GPU pegged at ${gpu.toFixed(0)}% with ${inFlight} in flight — saturated`;}
+  if(gpu!=null&&gpu>=95&&inFlight>0&&outTps!=null&&outTps<UNPRODUCTIVE_TOK_S){
+    state='warn';reason=`GPU pegged at ${gpu.toFixed(0)}% but only ${fmt(Math.round(outTps))} tok/s out — busy but unproductive (wedged decode?)`;}
   if(now.stall){state='hot';reason='slots held but GPU idle — wedged backend (stall)';}
   if(now.queue_available===false){state='hot';reason='queue proxy unreachable — live state unavailable';}
   const label={ok:'OK',warn:'DEGRADED',hot:'STALLED'}[state];
