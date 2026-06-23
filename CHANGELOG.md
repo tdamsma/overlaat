@@ -8,6 +8,11 @@ versions without a compatibility guarantee.
 
 ## [Unreleased]
 
+## [0.0.10] — 2026-06-23
+
+Runtime-overfeed protection — a per-request prompt-size ceiling and a per-model health-gate
+circuit breaker — plus a dashboard layout redesign and a health-verdict fix.
+
 ### Added
 - **Per-model `overlaat_max_prompt_tokens` ceiling** (`model_info` positive int, default unset
   = no ceiling) — a prompt whose estimated size exceeds its model's ceiling is rejected at the
