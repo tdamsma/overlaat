@@ -313,12 +313,13 @@ header .verdict{color:var(--accent);font-family:var(--mono);font-size:13px}
 header .spacer{flex:1}
 select,button{background:var(--panel);color:var(--text);border:1px solid var(--line);padding:6px 10px;border-radius:6px;font:inherit;font-size:12px;cursor:pointer}
 main{padding:16px 20px}
-/* Three columns: detail tables (~5) · charts-in-time (~4) · at-a-glance summary (~3).
-   Collapses to a single stacked column on narrow viewports. */
-.cols{display:grid;gap:16px;grid-template-columns:5fr 4fr 3fr;align-items:start}
-.col{display:flex;flex-direction:column;gap:16px;min-width:0}
-@media(max-width:1100px){.cols{grid-template-columns:1fr}}
-.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px}
+/* Top-to-bottom variable-width layout: a full-width chart stack, a narrow status
+   row, then full-width / two-up data tables — all stacked with one shared gap. */
+.stack{display:flex;flex-direction:column;gap:16px;min-width:0}
+.statusrow{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;align-items:start}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:16px;align-items:start}
+@media(max-width:900px){.row2{grid-template-columns:1fr}}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;min-width:0}
 .card h2{margin:0 0 10px;font-size:12px;font-weight:600;text-transform:uppercase;color:var(--dim);letter-spacing:.5px}
 /* recent-requests is 13 wide — let it scroll inside its card, not blow out the column */
 .scrollx{overflow-x:auto}
@@ -337,10 +338,14 @@ svg.chart{width:100%;height:150px;display:block}
 .axis{fill:var(--dim);font-size:10px;font-family:var(--mono)}
 .legend{display:flex;gap:14px;flex-wrap:wrap;font-size:11px;color:var(--dim);margin-top:6px}
 .legend span span{display:inline-block;width:10px;height:10px;border-radius:2px;vertical-align:middle;margin-right:4px}
-/* shared-axis chart stack: four charts in one column, one x-axis, one hover crosshair */
+/* shared-axis chart stack: three full-width charts, one x-axis, one hover crosshair.
+   Each chart's CSS height MUST equal its CH_H viewBox height (preserveAspectRatio
+   is "none", so the SVG — text included — stretches to the CSS box; mismatched
+   heights distort the labels). Keep these in lockstep with the CH_H map in the JS. */
 .chartstack{position:relative}
-.chartstack .chart{height:130px}
-.chartstack .chart.short{height:96px}
+#hostchart{height:110px}
+#concchart{height:120px}
+#iochart{height:160px}
 .cline{stroke:var(--accent);stroke-width:1;stroke-dasharray:3 3;pointer-events:none;opacity:0}
 .cstack-overlay{position:absolute;inset:0;cursor:crosshair}
 .creadout{position:absolute;top:2px;font-family:var(--mono);font-size:11px;color:var(--text);background:rgba(13,17,23,.85);border:1px solid var(--line);border-radius:4px;padding:1px 6px;pointer-events:none;opacity:0;white-space:nowrap;transform:translateX(-50%);z-index:2}
@@ -390,105 +395,33 @@ table.sortable th .ind{color:var(--accent);margin-left:3px}
   <button id="refresh">refresh</button>
 </header>
 <main>
- <div class="cols">
+ <div class="stack">
 
-  <!-- ── LEFT: detail tables ─────────────────────────────────────────── -->
-  <div class="col" id="col-left">
-    <div class="card">
-      <h2>live now</h2>
-      <table id="now-models"><thead><tr><th>model</th><th class="num">in&nbsp;flight</th><th class="num">queued</th></tr></thead><tbody></tbody></table>
-      <div class="note" id="now-note"></div>
+  <!-- ── TOP: full-width charts in time, one shared x-axis + hover crosshair ── -->
+  <div class="card chartstack" id="chartstack">
+    <h2>host — GPU% &amp; wired RAM</h2>
+    <svg id="hostchart" class="chart" preserveAspectRatio="none"></svg>
+    <div class="legend">
+      <span><span style="background:#f85149"></span>GPU %</span>
+      <span><span style="background:#58a6ff"></span>wired GB / total</span>
     </div>
 
-    <div class="card">
-      <h2>queued now — by user</h2>
-      <div id="queued-users"></div>
-      <div class="note">Live in-memory queue state from the proxy — requests waiting <em>right now</em>, grouped by consumer. Distinct from the recent-requests table below, which is finished requests.</div>
-    </div>
+    <h2>work by customer <span class="dim">(GPU-busy share by consumer)</span></h2>
+    <svg id="concchart" class="chart" preserveAspectRatio="none"></svg>
+    <div class="legend" id="conc-legend"></div>
 
-    <div class="card">
-      <h2>models — outcomes, latency &amp; throughput vs measured concurrency</h2>
-      <div class="scrollx">
-      <table id="models"><thead><tr>
-        <th>model</th><th class="num">req</th><th class="num">ok</th><th class="num">aband</th>
-        <th class="num">err</th><th class="num">canc</th>
-        <th class="num">qwait p50</th><th class="num">ttft p50</th><th class="num">service p50/p95</th>
-        <th class="num">solo decode tok/s</th><th class="num">p50 out tok</th>
-        <th>throughput @ concurrency (tok/s)</th>
-      </tr></thead><tbody></tbody></table>
-      </div>
-      <div class="note" id="models-note"></div>
-    </div>
+    <h2>throughput — input vs output <span class="dim">(tok/s, all models · dual y-axis)</span></h2>
+    <svg id="iochart" class="chart" preserveAspectRatio="none"></svg>
+    <div class="legend" id="io-legend"></div>
 
-    <div class="card">
-      <h2>consumers</h2>
-      <div class="scrollx">
-      <table id="consumers"><thead><tr>
-        <th>key</th><th class="num">req</th><th class="num">ok</th><th class="num">aband</th>
-        <th class="num">aband %</th><th class="num">err</th>
-        <th class="num">prompt tok</th><th class="num">compl tok</th><th class="num">service s</th><th>models</th>
-      </tr></thead><tbody></tbody></table>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>workloads</h2>
-      <div class="scrollx">
-      <table id="workloads"><thead><tr>
-        <th>workload</th><th class="num">req</th><th class="num">ok</th><th class="num">aband %</th>
-        <th class="num">err %</th><th class="num">qwait p50</th><th class="num">qwait p95</th>
-        <th class="num">total p50</th><th class="num">total p95</th><th class="num">compl tok</th>
-      </tr></thead><tbody></tbody></table>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>recent requests <span class="dim">(latest 100 — search, filter, sort)</span></h2>
-      <div class="controls">
-        <input id="req-search" type="search" placeholder="search any column…" autocomplete="off">
-        <select id="req-model"><option value="">all models</option></select>
-        <select id="req-consumer"><option value="">all consumers</option></select>
-        <select id="req-outcome"><option value="">all outcomes</option></select>
-        <span class="count" id="req-count"></span>
-      </div>
-      <div class="scrollx">
-        <table id="requests" class="sortable"><thead><tr></tr></thead><tbody></tbody></table>
-      </div>
-      <div class="note">One row per request lifecycle (newest first) — includes queued / abandoned rows whose latencies are not yet computable (shown as —). No prompt or response text is stored; only counts, timings, model, consumer and workload.</div>
-    </div>
+    <div class="note">Output is scaled on the LEFT y-axis (green), input on the RIGHT y-axis (blue) — each axis auto-scales independently. Input is typically ~10× output, so the two lines share one visual band without clipping when the ratio drifts. All three charts share one time window, bucket and horizontal plot rectangle — their vertical gridlines line up; only this bottom chart labels the x-axis. Hover anywhere to drop a shared time crosshair. Step segments = one flat value per bucket; no smoothing.</div>
+    <!-- transparent overlay spanning the stack: maps mouse-x → bucket → crosshair -->
+    <div class="cstack-overlay" id="cstack-overlay"></div>
+    <div class="creadout" id="creadout"></div>
   </div>
 
-  <!-- ── MIDDLE: charts in time, one shared x-axis + hover crosshair ──── -->
-  <div class="col" id="col-mid">
-    <div class="card chartstack" id="chartstack">
-      <h2>host — GPU% &amp; wired RAM</h2>
-      <svg id="hostchart" class="chart short" preserveAspectRatio="none"></svg>
-      <div class="legend">
-        <span><span style="background:#f85149"></span>GPU %</span>
-        <span><span style="background:#58a6ff"></span>wired GB / total</span>
-      </div>
-
-      <h2>work by customer <span class="dim">(GPU-busy share by consumer)</span></h2>
-      <svg id="concchart" class="chart short" preserveAspectRatio="none"></svg>
-      <div class="legend" id="conc-legend"></div>
-
-      <h2>throughput — input vs output <span class="dim">(tok/s, all models)</span></h2>
-      <svg id="iochart" class="chart short" preserveAspectRatio="none"></svg>
-      <div class="legend" id="io-legend"></div>
-
-      <h2>output throughput by model <span class="dim">(completion tok/s, stacked)</span></h2>
-      <svg id="outchart" class="chart" preserveAspectRatio="none"></svg>
-      <div class="legend" id="out-legend"></div>
-
-      <div class="note">All four charts share one time window, bucket and horizontal plot rectangle — their vertical gridlines line up; only the bottom chart labels the x-axis. Hover anywhere to drop a shared time crosshair. Step segments = one flat value per bucket; no smoothing.</div>
-      <!-- transparent overlay spanning the stack: maps mouse-x → bucket → crosshair -->
-      <div class="cstack-overlay" id="cstack-overlay"></div>
-      <div class="creadout" id="creadout"></div>
-    </div>
-  </div>
-
-  <!-- ── RIGHT: at-a-glance summary / attribution ────────────────────── -->
-  <div class="col" id="col-right">
+  <!-- ── STATUS ROW: narrow at-a-glance cards ────────────────────────── -->
+  <div class="statusrow">
     <div class="card">
       <h2>server health</h2>
       <div class="health" id="health"><div class="state">…</div><div class="reason"></div></div>
@@ -512,6 +445,77 @@ table.sortable th .ind{color:var(--accent);margin-left:3px}
     </div>
   </div>
 
+  <!-- ── live now + queued-by-user, side by side ─────────────────────── -->
+  <div class="row2">
+    <div class="card">
+      <h2>live now</h2>
+      <table id="now-models"><thead><tr><th>model</th><th class="num">in&nbsp;flight</th><th class="num">queued</th></tr></thead><tbody></tbody></table>
+      <div class="note" id="now-note"></div>
+    </div>
+
+    <div class="card">
+      <h2>queued now — by user</h2>
+      <div id="queued-users"></div>
+      <div class="note">Live in-memory queue state from the proxy — requests waiting <em>right now</em>, grouped by consumer. Distinct from the recent-requests table below, which is finished requests.</div>
+    </div>
+  </div>
+
+  <!-- ── models — full width (13 columns; scrolls inside its card) ───── -->
+  <div class="card">
+    <h2>models — outcomes, latency &amp; throughput vs measured concurrency</h2>
+    <div class="scrollx">
+    <table id="models"><thead><tr>
+      <th>model</th><th class="num">req</th><th class="num">ok</th><th class="num">aband</th>
+      <th class="num">err</th><th class="num">canc</th>
+      <th class="num">qwait p50</th><th class="num">ttft p50</th><th class="num">service p50/p95</th>
+      <th class="num">solo decode tok/s</th><th class="num">p50 out tok</th>
+      <th>throughput @ concurrency (tok/s)</th>
+    </tr></thead><tbody></tbody></table>
+    </div>
+    <div class="note" id="models-note"></div>
+  </div>
+
+  <!-- ── consumers + workloads, side by side ─────────────────────────── -->
+  <div class="row2">
+    <div class="card">
+      <h2>consumers</h2>
+      <div class="scrollx">
+      <table id="consumers"><thead><tr>
+        <th>key</th><th class="num">req</th><th class="num">ok</th><th class="num">aband</th>
+        <th class="num">aband %</th><th class="num">err</th>
+        <th class="num">prompt tok</th><th class="num">compl tok</th><th class="num">service s</th><th>models</th>
+      </tr></thead><tbody></tbody></table>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>workloads</h2>
+      <div class="scrollx">
+      <table id="workloads"><thead><tr>
+        <th>workload</th><th class="num">req</th><th class="num">ok</th><th class="num">aband %</th>
+        <th class="num">err %</th><th class="num">qwait p50</th><th class="num">qwait p95</th>
+        <th class="num">total p50</th><th class="num">total p95</th><th class="num">compl tok</th>
+      </tr></thead><tbody></tbody></table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── recent requests — full width ────────────────────────────────── -->
+  <div class="card">
+    <h2>recent requests <span class="dim">(latest 100 — search, filter, sort)</span></h2>
+    <div class="controls">
+      <input id="req-search" type="search" placeholder="search any column…" autocomplete="off">
+      <select id="req-model"><option value="">all models</option></select>
+      <select id="req-consumer"><option value="">all consumers</option></select>
+      <select id="req-outcome"><option value="">all outcomes</option></select>
+      <span class="count" id="req-count"></span>
+    </div>
+    <div class="scrollx">
+      <table id="requests" class="sortable"><thead><tr></tr></thead><tbody></tbody></table>
+    </div>
+    <div class="note">One row per request lifecycle (newest first) — includes queued / abandoned rows whose latencies are not yet computable (shown as —). No prompt or response text is stored; only counts, timings, model, consumer and workload.</div>
+  </div>
+
  </div>
 </main>
 <footer id="footer"></footer>
@@ -524,17 +528,22 @@ async function J(u){const r=await fetch(u);if(!r.ok)throw new Error(u+' '+r.stat
 
 function svgW(el){return Math.max(Math.round(el.clientWidth)||600,200);}
 
-// ── shared plot geometry (the four stacked charts must line up) ──────────────
-// Every chart in the middle column uses the SAME horizontal plot rectangle —
+// ── shared plot geometry (the three stacked charts must line up) ─────────────
+// Every chart in the full-width stack uses the SAME horizontal plot rectangle —
 // identical padL/padR and identical pixel↔time mapping — so their vertical
-// gridlines align perfectly when stacked. padL is a fixed constant for all four
+// gridlines align perfectly when stacked. padL is a fixed constant for all three
 // (not per-chart) so the left edges coincide to the pixel. Only the bottom chart
 // renders x-axis time labels; the others draw the vertical gridlines and omit
 // the labels, so the stack reads as one shared axis.
-const PLOT={padL:40,padR:8,padT:8,padB:14};   // shared; padB leaves room for bottom labels only
+// padR is intentionally wide (44px) — it's SHARED across all three charts so the
+// vertical gridlines stay aligned, AND it leaves room for the combined chart's
+// RIGHT-axis (input) labels. host/conc just get the extra right gutter.
+const PLOT={padL:40,padR:44,padT:8,padB:14};  // shared; padB leaves room for bottom labels only
 // Fixed viewBox heights (px) per chart row — deterministic (not layout-derived),
-// so geometry is identical headless or in-browser. Upper three are "short".
-const CH_H={hostchart:96,concchart:96,iochart:96,outchart:130};
+// so geometry is identical headless or in-browser. MUST match the per-chart CSS
+// heights (#hostchart/#concchart/#iochart) — preserveAspectRatio="none" stretches
+// the SVG (text included) to the CSS box, so a mismatch distorts the labels.
+const CH_H={hostchart:110,concchart:120,iochart:160};
 let GEO=null;     // last shared geometry — drives the crosshair
 let LAST_TL=null; // last /timeline payload — read by the crosshair readout
 function plotGeom(el,b){
@@ -592,7 +601,7 @@ function stepBand(lower,upper,xAt,yAt,sx){
   return top+bot+'Z';
 }
 
-// All four chart renderers below take the SHARED geometry `g` (from plotGeom)
+// All three chart renderers below take the SHARED geometry `g` (from plotGeom)
 // rather than computing their own — so they share one x-scale and plot rect.
 // `axis` is true only for the bottom chart, which draws the x-axis time labels.
 
@@ -622,9 +631,9 @@ function renderHost(tl,g,axis){
   el.innerHTML=h;
 }
 
-// Shared stacked STEP-area renderer (charts "work by customer" and "output by
-// model"). Uses the shared geometry `g`; `keys` is the stack order, `byk` maps
-// key→per-bucket value array. fmtY formats the y labels; unit goes in the legend.
+// Stacked STEP-area renderer (the "work by customer" chart). Uses the shared
+// geometry `g`; `keys` is the stack order, `byk` maps key→per-bucket value array.
+// fmtY formats the y labels; unit goes in the legend.
 function renderStack(elSel,legSel,b,keys,byk,g,opts){
   const o=opts||{},el=$(elSel),n=g.n;
   el.setAttribute('viewBox',`0 0 ${g.W} ${g.H}`);
@@ -656,59 +665,72 @@ function renderConc(tl,g,axis){
     {empty:'no calls in window',unit:'',axis});
 }
 
-// Chart 4 (bottom) — output throughput by model (completion tok/s), stacked.
-function renderOut(tl,g,axis){
-  renderStack('#outchart','#out-legend',tl.buckets||[],tl.out_models||[],tl.by_model_out_tok_s||{},g,
-    {empty:'no output tokens in window',round:50,unit:' tok/s',fmtY:fmt,fmtLegend:fmt,axis});
-}
+// nice-rounded ceiling for an axis max (1/2/5-ish via the leading magnitude):
+// round up to the next multiple of 10^floor(log10(m)). Guards m<=0.
+function niceCeil(m){if(m<=0)return 0;const p=Math.pow(10,Math.floor(Math.log10(m)));return Math.ceil(m/p)*p;}
 
-// Chart 3 — throughput input vs output (total tok/s across all models), two STEP
-// lines on one auto-scaled axis.
+// last non-null value of an array (or null).
+function lastVal(arr){for(let j=arr.length-1;j>=0;j--){if(arr[j]!=null)return arr[j];}return null;}
+
+// Chart 3 (bottom) — combined throughput on DUAL Y-AXES: output tok/s on the LEFT
+// axis (green) and input tok/s on the RIGHT axis (blue), each auto-scaled to its
+// own nice-rounded max. Input is typically ~10× output, so independent scales keep
+// both as one set of overlaid step lines sharing a visual band — clip-safe when
+// the ratio drifts. Owns the x-axis time labels (it's the bottom chart).
 function renderIO(tl,g,axis){
   const el=$('#iochart'),b=tl.buckets||[],n=g.n,tot=tl.totals||{};
   el.setAttribute('viewBox',`0 0 ${g.W} ${g.H}`);
   const inp=tot.in_tok_s||[],out=tot.out_tok_s||[];
-  const series=[['input',inp,'#58a6ff'],['output',out,'#3fb950']];
-  let maxY=0;series.forEach(([,arr])=>arr.forEach(v=>{if(v!=null&&v>maxY)maxY=v;}));
-  if(!n||maxY<=0){el.innerHTML='<text x="50%" y="50%" text-anchor="middle" class="axis">no token throughput in window</text>';$('#io-legend').innerHTML='';return;}
-  maxY=Math.ceil(maxY/Math.max(1,Math.pow(10,Math.floor(Math.log10(maxY)))))*Math.pow(10,Math.floor(Math.log10(maxY)));
-  const{padL,padT,ch,sx,xAt}=g,yAt=v=>padT+ch-(Math.min(v,maxY)/maxY)*ch;
+  let maxIn=0,maxOut=0;
+  inp.forEach(v=>{if(v!=null&&v>maxIn)maxIn=v;});
+  out.forEach(v=>{if(v!=null&&v>maxOut)maxOut=v;});
+  if(!n||(maxIn<=0&&maxOut<=0)){el.innerHTML='<text x="50%" y="50%" text-anchor="middle" class="axis">no token throughput in window</text>';$('#io-legend').innerHTML='';return;}
+  const leftMax=niceCeil(maxOut)||1,rightMax=niceCeil(maxIn)||1;
+  const{padL,padR,padT,ch,sx,xAt,W}=g;
+  const yL=v=>padT+ch-(Math.min(v,leftMax)/leftMax)*ch;   // output → left axis
+  const yR=v=>padT+ch-(Math.min(v,rightMax)/rightMax)*ch;  // input  → right axis
   let h=gridlines(g,b,{axis});
-  for(let i=0;i<=4;i++){const y=padT+ch/4*i;h+=`<text x="${padL-4}" y="${y+3}" text-anchor="end" class="axis">${fmt(Math.round(maxY-maxY/4*i))}</text>`;}
-  series.forEach(([,arr,col])=>{const d=stepLine(arr,xAt,yAt,sx);if(d)h+=`<path d="${d}" fill="none" stroke="${col}" stroke-width="1.5"/>`;});
+  // left-axis labels (output, green)
+  for(let i=0;i<=4;i++){const y=padT+ch/4*i;h+=`<text x="${padL-4}" y="${y+3}" text-anchor="end" class="axis" fill="#3fb950">${fmt(Math.round(leftMax-leftMax/4*i))}</text>`;}
+  // right-axis labels (input, blue)
+  for(let i=0;i<=4;i++){const y=padT+ch/4*i;h+=`<text x="${W-padR+4}" y="${y+3}" text-anchor="start" class="axis" fill="#58a6ff">${fmt(Math.round(rightMax-rightMax/4*i))}</text>`;}
+  const od=stepLine(out,xAt,yL,sx);if(od)h+=`<path d="${od}" fill="none" stroke="#3fb950" stroke-width="1.5"/>`;
+  const idp=stepLine(inp,xAt,yR,sx);if(idp)h+=`<path d="${idp}" fill="none" stroke="#58a6ff" stroke-width="1.5"/>`;
   el.innerHTML=h;
-  $('#io-legend').innerHTML=series.map(([lbl,arr,col])=>{let last=null;
-    for(let j=arr.length-1;j>=0;j--){if(arr[j]!=null){last=arr[j];break;}}
-    return `<span><span style="background:${col}"></span>${lbl}${last!=null?' '+fmt(Math.round(last))+' tok/s':''}</span>`;}).join('');
+  const lo=lastVal(out),li=lastVal(inp);
+  $('#io-legend').innerHTML=
+    `<span><span style="background:#3fb950"></span>output${lo!=null?' '+fmt(Math.round(lo))+' tok/s':''} (left)</span>`+
+    `<span><span style="background:#58a6ff"></span>input${li!=null?' '+fmt(Math.round(li))+' tok/s':''} (right)</span>`;
 }
 
 // Render the whole stack from one timeline payload, with one shared geometry so
-// all four plot rectangles + vertical gridlines coincide; only the bottom chart
-// labels the x-axis. Stashes geometry + buckets in GEO for the hover crosshair.
+// all three plot rectangles + vertical gridlines coincide; only the bottom chart
+// (the combined throughput chart) labels the x-axis. Stashes geometry + buckets in
+// GEO for the hover crosshair.
 function renderChartStack(tl){
   LAST_TL=tl;
   const b=tl.buckets||[];
-  // Shared horizontal geometry (same W,padL,padR,sx,xAt for all four). The
-  // crosshair maps to this; only chart heights differ per row.
-  const g=plotGeom($('#outchart'),b);
+  // Shared horizontal geometry (same W,padL,padR,sx,xAt for all three). The
+  // crosshair maps to this; only chart heights differ per row. Computed from the
+  // bottom chart (iochart), which carries the widest layout role.
+  const g=plotGeom($('#iochart'),b);
   GEO={g,buckets:b};
   const gh=id=>{const H=CH_H[id]||130;return Object.assign({},g,{H,ch:H-PLOT.padT-PLOT.padB});};
   renderHost(tl,gh('hostchart'),false);
   renderConc(tl,gh('concchart'),false);
-  renderIO(tl,gh('iochart'),false);
-  renderOut(tl,gh('outchart'),true);   // bottom chart owns the x-axis labels
+  renderIO(tl,gh('iochart'),true);   // bottom chart owns the x-axis labels
   placeCrosshairLines();
 }
 
-// ── shared hover crosshair across the four stacked charts ────────────────────
+// ── shared hover crosshair across the three stacked charts ───────────────────
 // One transparent overlay spans the chart column. mouse-x → bucket index →
 // a single vertical dashed line drawn at the same x in EVERY chart, plus a
 // time-of-day readout. Per-series value readouts are folded into the readout
-// when cheap (host GPU% / wired, total tok/s, top stacked customer).
+// when cheap (host GPU% / wired, input & output tok/s).
 function placeCrosshairLines(){
   // (re)attach a hidden vertical crosshair <line> on top of each chart SVG —
   // each renderer rebuilds innerHTML, so the line is re-created every render.
-  ['#hostchart','#concchart','#iochart','#outchart'].forEach(sel=>{
+  ['#hostchart','#concchart','#iochart'].forEach(sel=>{
     const el=$(sel);if(!el)return;let ln=el.querySelector('.cline');
     if(!ln){ln=document.createElementNS('http://www.w3.org/2000/svg','line');ln.setAttribute('class','cline');}
     el.appendChild(ln); // keep it last child = on top
@@ -724,7 +746,7 @@ function crosshairAt(clientX){
   let i=Math.floor((svgX-g.padL)/g.sx);
   i=Math.max(0,Math.min(n-1,i));
   const cx=g.xAt(i)+g.sx/2;                    // center of the bucket, in SVG units
-  ['hostchart','concchart','iochart','outchart'].forEach(id=>{
+  ['hostchart','concchart','iochart'].forEach(id=>{
     const ln=$('#'+id)&&$('#'+id).querySelector('.cline');if(!ln)return;
     const H=CH_H[id]||130;
     ln.setAttribute('x1',cx.toFixed(1));ln.setAttribute('x2',cx.toFixed(1));
@@ -740,7 +762,8 @@ function crosshairAt(clientX){
     const bits=[t];
     if(gp!=null)bits.push('gpu '+Math.round(gp)+'%');
     if(wr!=null)bits.push(Math.round(wr)+'GB');
-    if(it!=null||ot!=null)bits.push('io '+fmt(Math.round(it||0))+'/'+fmt(Math.round(ot||0)));
+    if(it!=null)bits.push('in '+fmt(Math.round(it))+' tok/s');
+    if(ot!=null)bits.push('out '+fmt(Math.round(ot))+' tok/s');
     ro.textContent=bits.join(' · ');
     // position the readout above the crosshair (CSS px), clamped to the column.
     const left=Math.max(40,Math.min(r.width-40,px));
@@ -748,7 +771,7 @@ function crosshairAt(clientX){
   }
 }
 function crosshairHide(){
-  ['#hostchart','#concchart','#iochart','#outchart'].forEach(sel=>{
+  ['#hostchart','#concchart','#iochart'].forEach(sel=>{
     const ln=$(sel)&&$(sel).querySelector('.cline');if(ln)ln.style.opacity=0;});
   const ro=$('#creadout');if(ro)ro.style.opacity=0;
 }
