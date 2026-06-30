@@ -8,6 +8,11 @@ versions without a compatibility guarantee.
 
 ## [Unreleased]
 
+## [0.0.11] — 2026-06-30
+
+Bug-fix release — a single mis-sized model can no longer deadlock a whole shared scheduler
+pool (an unsatisfiable budget reservation that never cleared).
+
 ### Fixed
 - **Cost-scheduler no longer deadlocks a whole pool when a model's cost exceeds the pool
   budget.** A model whose effective admission cost (`overlaat_cost`, else
