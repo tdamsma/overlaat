@@ -71,14 +71,17 @@ DEFAULT_POOL = "default"
 class Waiter:
     """One queued request awaiting admission.
 
-    ``fut`` is resolved with ``True`` exactly once, when the request is admitted.
-    The caller awaits it; on cancel-while-queued the caller calls
-    ``Scheduler.withdraw`` instead (and never resolves the future). ``cost``,
-    ``base_priority`` and ``key_fp`` are resolved once at enqueue time by the
-    proxy; aging is recomputed on every pump from ``enqueued_at``.
+    ``fut`` is resolved exactly once, with ``True`` when the request is admitted
+    or ``False`` when it is terminally rejected (its cost can never fit its pool —
+    see :meth:`Scheduler._reject`). The caller awaits it; on cancel-while-queued
+    the caller calls ``Scheduler.withdraw`` instead (and never resolves the
+    future). ``cost``, ``base_priority`` and ``key_fp`` are resolved once at
+    enqueue time by the proxy; aging is recomputed on every pump from
+    ``enqueued_at``.
 
     ``wait_reason`` is set at admission to one of the values documented on
-    ``Scheduler.pump`` so the proxy can log *why* a request waited.
+    ``Scheduler.pump`` so the proxy can log *why* a request waited, or to
+    ``"cost_exceeds_pool_budget"`` on a terminal rejection.
     """
 
     req_id: str
@@ -347,7 +350,25 @@ class Scheduler:
     # -- queue mutation ----------------------------------------------------
 
     def enqueue(self, waiter: Waiter) -> None:
-        """Append a waiter and run the admit loop."""
+        """Append a waiter and run the admit loop, unless it can never be admitted.
+
+        A waiter whose ``cost`` exceeds its pool's TOTAL budget is unsatisfiable:
+        ``used + cost <= B_pool`` fails even at ``used == 0``. Admitting it to the
+        waiters list would make it the eager-reserved pool head forever — the
+        reservation never clears and head-of-line-blocks *every other* member of
+        the pool, deadlocking it (issue #36). So such a waiter is **rejected at
+        admission** instead of enqueued: its future is resolved ``False`` (not
+        ``True`` — see :meth:`_reject`), its ``wait_reason`` is set to
+        ``"cost_exceeds_pool_budget"``, and it is never appended, so it can never
+        take a reservation, charge budget, or block a sibling. The proxy maps the
+        ``False`` future + that reason to an HTTP error. (Config-load validation in
+        the proxy normally catches this sizing mistake before any traffic; this
+        runtime guard keeps the pure scheduler safe on its own, regardless of the
+        config path.)
+        """
+        if not self._cost_fits_pool(waiter):
+            self._reject(waiter, "cost_exceeds_pool_budget")
+            return
         self.waiters.append(waiter)
         self.pump(self._now())
 
@@ -426,6 +447,24 @@ class Scheduler:
         """True if ``w``'s per-model backend cap currently has no free slot."""
         cap = self.caps.get(w.model)
         return cap is not None and self.in_flight.get(w.model, 0) >= cap
+
+    def _cost_fits_pool(self, w: Waiter) -> bool:
+        """True iff ``w.cost`` can fit its pool's TOTAL budget (so it is at all
+        admittable). False means the request can *never* be admitted — not even
+        into an empty pool — and must be rejected rather than enqueued/reserved,
+        because an unsatisfiable reserved head deadlocks the whole pool (#36)."""
+        return w.cost <= self.budget(self.pool(w.model)) + EPS
+
+    def _reject(self, w: Waiter, reason: str) -> None:
+        """Terminally reject a waiter: label why and resolve its future ``False``.
+
+        ``False`` (vs ``True`` for an admission) tells the proxy this is a hard
+        rejection, not an admission. The waiter is NOT added to ``self.waiters``,
+        so it never holds a slot, charges budget, or becomes a pool's reserved
+        head. Idempotent on an already-resolved future."""
+        w.wait_reason = reason
+        if not w.fut.done():
+            w.fut.set_result(False)
 
     def _admit(self, w: Waiter, reason: str) -> None:
         p = self.pool(w.model)

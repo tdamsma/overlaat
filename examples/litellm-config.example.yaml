@@ -167,6 +167,12 @@ model_list:
 # references but does not declare is auto-created (non-exclusive, OVERLAAT_BUDGET)
 # and logged at startup.
 #
+# SIZING RULE (#36): a model's cost (`overlaat_cost`, else 1/max_parallel_requests)
+# MUST be <= its pool's budget, or it can never be admitted — e.g. a cap-1 model
+# (cost 1/1 = 1.0) in a `budget: 0.75` pool. The proxy REFUSES TO START on such a
+# config (it would otherwise deadlock the whole pool). Fix by lowering the model's
+# `overlaat_cost`, raising the pool budget, or moving the model to its own pool.
+#
 # `exclusive: true` makes the pool a HARD MUTEX over its distinct members: at most
 # one member id may be active at a time; the resident member's cap + this budget
 # govern how many of its streams run. This REPLACES the old forced-1.0 fat-slot

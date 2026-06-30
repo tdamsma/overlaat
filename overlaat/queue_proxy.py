@@ -465,8 +465,17 @@ def resolve_pool_config(
 ) -> tuple[dict[str, float], set[str]]:
     """Merge declared pools with the pools models reference, auto-creating any
     referenced-but-undeclared pool (non-exclusive, ``default_budget``) and folding
-    in the legacy-slot exclusivity seed. Logs each auto-created pool and any model
-    whose cost exceeds its pool budget (a never-admit guard).
+    in the legacy-slot exclusivity seed. Logs each auto-created pool.
+
+    **Fails fast** (raises :class:`ValueError`) if any model's effective cost
+    (``overlaat_cost`` if set, else ``1/max_parallel_requests``) exceeds its pool's
+    budget: such a model can NEVER be admitted (``used + cost <= B`` is
+    unsatisfiable even at ``used == 0``) and, as the eager-reserved pool head,
+    would deadlock every other member of the pool (issue #36). This is always an
+    operator sizing mistake, so it is caught at config load before any traffic
+    rather than warned-and-ignored. (The scheduler also rejects such a request
+    defensively at runtime with ``cost_exceeds_pool_budget``; the startup error is
+    the belt to that suspenders.)
 
     Returns the final ``(pool_budget, pool_exclusive)`` to hand the Scheduler.
     Pool budgets are returned for every referenced/declared pool (so the snapshot
@@ -493,22 +502,37 @@ def resolve_pool_config(
                     f"with budget {default_budget} (OVERLAAT_BUDGET)\n"
                 )
 
-    # Never-admit guard: warn loudly if any model's cost exceeds its pool budget.
-    if log:
-        for model in set(caps) | set(costs) | set(pool_of):
-            pool = pool_of.get(model, "default")
-            b = pool_budget.get(pool, default_budget)
-            if model in costs:
-                c = costs[model]
-            else:
-                cap = caps.get(model)
-                c = 1.0 / cap if cap and cap > 0 else None
-            if c is not None and c > b + 1e-9:
-                sys.stderr.write(
-                    f"queue-proxy: WARNING model '{model}' cost {c:g} exceeds its pool "
-                    f"'{pool}' budget {b:g} — it can NEVER be admitted\n"
-                )
-        sys.stderr.flush()
+    # Never-admit guard (issue #36): a model whose effective cost exceeds its pool
+    # budget can never be admitted, and as the eager-reserved pool head it would
+    # deadlock every other member of the pool. Fail fast at config load — this is
+    # always an operator sizing mistake, not a tuning suggestion. Independent of
+    # `log`: it is a correctness gate, not logging.
+    offenders: list[tuple[str, float, str, float]] = []
+    for model in sorted(set(caps) | set(costs) | set(pool_of)):
+        pool = pool_of.get(model, "default")
+        b = pool_budget.get(pool, default_budget)
+        if model in costs:
+            c = costs[model]
+        else:
+            cap = caps.get(model)
+            c = 1.0 / cap if cap and cap > 0 else None
+        if c is not None and c > b + 1e-9:
+            offenders.append((model, c, pool, b))
+    if offenders:
+        detail = "\n".join(
+            f"  - model '{m}' effective cost {c:g} > pool '{p}' budget {b:g}"
+            for m, c, p, b in offenders
+        )
+        raise ValueError(
+            "queue-proxy: invalid scheduler config — the following models have an "
+            "admission cost that exceeds their pool's budget and can NEVER be "
+            "admitted (a single such model deadlocks its whole pool — issue #36):\n"
+            f"{detail}\n"
+            "Fix one of: set an explicit model_info.overlaat_cost <= the pool "
+            "budget, raise the pool's budget (overlaat.pools.<pool>.budget / "
+            "OVERLAAT_BUDGET), or move the model to a pool whose budget fits its "
+            "cost (default cost = 1/max_parallel_requests)."
+        )
 
     return pool_budget, pool_exclusive
 
@@ -1544,12 +1568,48 @@ async def _admit_scheduler(
             ev["pool"] = pool
             emit_event(ev)
 
+    def _emit_rejected():
+        if ev is not None:
+            ev["t_acquire"] = None
+            ev["t_done"] = time.time()
+            ev["outcome"] = "rejected_unadmittable"
+            ev["http_status"] = 503
+            ev["prompt_tokens"] = None
+            ev["completion_tokens"] = None
+            ev["priority"] = base_priority
+            ev["cost"] = cost
+            ev["wait_reason"] = waiter.wait_reason  # "cost_exceeds_pool_budget"
+            ev["pool"] = pool
+            emit_event(ev)
+
     if not waiter.fut.done():
         # cancel won the race → we never got admitted; withdraw (clears any
         # reservation this waiter held) and re-pump so the freed head can flow.
         sched.withdraw(waiter)
         _emit_cancelled()
         return _cancelled_response(req_id, model)
+    if waiter.fut.result() is False:
+        # Terminal rejection (issue #36): the scheduler refused this request
+        # because its cost can never fit its pool's total budget — so it was NOT
+        # enqueued and holds no reservation, and the pool is never deadlocked. No
+        # slot was acquired and no budget charged, so there is nothing to release.
+        # Fast-fail with 503 (retrying cannot help — this is a sizing mistake the
+        # startup config validation normally catches first).
+        _emit_rejected()
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "message": (
+                        f"request for {model} has admission cost {cost:g} which "
+                        f"exceeds pool '{pool}' budget {sched.budget(pool):g}; it can "
+                        "never be admitted — lower model_info.overlaat_cost or raise "
+                        "the pool budget"
+                    ),
+                    "type": "overlaat_cost_exceeds_pool_budget",
+                }
+            },
+        )
     if cancel_fut.done():
         # Admitted and cancelled at the same instant: the admission already
         # charged the budget, so give it back via release (not withdraw, which is

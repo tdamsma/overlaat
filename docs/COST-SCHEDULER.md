@@ -345,6 +345,40 @@ a guarantee rather than a hope.
 > starving; in the common case where the head fits immediately, packing is fully
 > work-conserving and nothing is reserved.
 
+### 3d. The reservation assumes the head is *eventually* satisfiable (#36)
+
+Reservation drains the pool *toward* the head's cost, so it only bounds the
+head's wait if that cost can ever fit. A request whose `cost > B_pool` — the
+**whole** pool budget — is the degenerate case: `used + cost <= B_pool` fails even
+at `used == 0`, so the reservation never clears, the impossible head pins the pool
+forever, and **every other member of that pool blocks on `budget_full`
+indefinitely** (one mis-sized model silently takes down a whole shared pool). The
+default `cost = 1/cap` reaches this trap directly: a `max_parallel_requests: 1`
+model has `cost = 1.0`, so dropping it into any pool with `budget < 1.0` wedges
+that pool.
+
+Two guards, belt-and-suspenders, keep this from happening:
+
+1. **Config-load validation fails fast.** At startup the proxy errors (does not
+   start) if any model's effective cost (`overlaat_cost`, else `1/cap`) exceeds its
+   pool's `budget`. Such a model can never serve a request, so this is treated as a
+   hard misconfiguration, not a tuning warning — caught before any traffic.
+2. **The scheduler rejects the impossible at admission.** Independently of config
+   validation, `Scheduler.enqueue` refuses a waiter whose `cost > B_pool`: it is
+   **never** added to the waiters list (so it can never become a reserved head),
+   its future is resolved as a terminal rejection, and the proxy returns **503**
+   with `wait_reason = cost_exceeds_pool_budget` (`outcome = rejected_unadmittable`).
+   The pool keeps flowing for every other member.
+
+The cost is **not** silently clamped down to the budget: that would change the
+request's admission semantics without telling anyone (the operator asked for a cost
+the pool cannot honour — the honest answer is to reject and surface the sizing
+mistake, not to quietly admit a different request). The `weighted_cost` clamp (§ the
+prompt-size-weighted-cost block above) is a *separate* mechanism that bounds the
+*weight multiplier* so a heavy prompt cannot push an otherwise-valid base cost over
+the budget; it does not — and must not — paper over a base cost that already exceeds
+the budget.
+
 ---
 
 ## 4. Interactions with existing constraints
