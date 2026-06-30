@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 
+import pytest
 from starlette.requests import Request
 
 from overlaat import queue_proxy as qp
@@ -164,6 +165,56 @@ def test_load_pool_heavy_max(tmp_path):
     hm = qp.load_pool_heavy_max(cfg)
     assert hm == {"default": "leave_room", "batch": "full_pool"}
     assert qp.load_pool_heavy_max(tmp_path / "nope.yaml") == {}
+
+
+# -- config-load never-admit guard (cost > pool budget, #36) -----------------
+
+
+def test_resolve_pool_config_rejects_cost_over_pool_budget():
+    # Issue #36 fail-fast: a model whose derived cost (1/cap) exceeds its pool's
+    # budget can never be admitted, so config load must error rather than start a
+    # proxy whose pool will deadlock. Repro: cap-1 model (cost 1.0) in a 0.75 pool.
+    with pytest.raises(ValueError, match="can NEVER be admitted"):
+        qp.resolve_pool_config(
+            caps={"think": 1},
+            costs={},
+            pool_of={"think": "qwen36"},
+            exclusive_seed={},
+            declared_budgets={"qwen36": 0.75},
+            declared_exclusive=set(),
+            default_budget=1.0,
+            log=False,  # the error fires regardless of log (correctness gate)
+        )
+
+
+def test_resolve_pool_config_rejects_explicit_cost_over_budget():
+    # The same guard catches an explicit overlaat_cost above the pool budget.
+    with pytest.raises(ValueError, match="qwen36"):
+        qp.resolve_pool_config(
+            caps={"m": 4},
+            costs={"m": 1.5},  # explicit override > default budget 1.0
+            pool_of={"m": "qwen36"},
+            exclusive_seed={},
+            declared_budgets={"qwen36": 1.0},
+            declared_exclusive=set(),
+            default_budget=1.0,
+        )
+
+
+def test_resolve_pool_config_ok_when_cost_fits_pool():
+    # Costs at or under the pool budget load cleanly (cost == budget is fine; a
+    # cap-3 model's 1/3 fits a 0.75 pool). No raise; pools are returned.
+    pool_budget, pool_exclusive = qp.resolve_pool_config(
+        caps={"prod": 3, "solo": 1},
+        costs={},
+        pool_of={"prod": "qwen36", "solo": "qwen36"},
+        exclusive_seed={},
+        declared_budgets={"qwen36": 1.0},  # solo cost 1.0 == budget 1.0 (boundary)
+        declared_exclusive=set(),
+        default_budget=1.0,
+        log=False,
+    )
+    assert pool_budget["qwen36"] == 1.0
 
 
 # -- per-request workload label (#19) ----------------------------------------

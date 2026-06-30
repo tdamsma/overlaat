@@ -8,6 +8,23 @@ versions without a compatibility guarantee.
 
 ## [Unreleased]
 
+### Fixed
+- **Cost-scheduler no longer deadlocks a whole pool when a model's cost exceeds the pool
+  budget.** A model whose effective admission cost (`overlaat_cost`, else
+  `1/max_parallel_requests`) is greater than its pool's `budget` can never be admitted
+  (`used + cost <= B_pool` is unsatisfiable even at `used == 0`), yet the anti-starvation
+  reservation logic reserved the pool *for it* — and that reservation never cleared,
+  head-of-line-blocking **every other** member of the pool indefinitely (a `cap: 1` model,
+  cost 1.0, in a `budget: 0.75` pool was the production repro). Fixed with belt-and-suspenders:
+  (1) **config-load validation** now **fails fast** (raises at startup) if any model's cost
+  exceeds its pool budget — escalated from the previous warn-and-continue, because such a
+  model is unambiguously broken, not a tuning choice; and (2) a **runtime guard** in the
+  scheduler never enqueues/reserves a request whose cost exceeds the pool's total budget —
+  it is rejected at admission with **503** (`{"error": {"type":
+  "overlaat_cost_exceeds_pool_budget", …}}`, `wait_reason="cost_exceeds_pool_budget"`,
+  `outcome="rejected_unadmittable"`) so a sibling sharing the pool keeps being served. The
+  cost is **not** silently clamped down (that would change admission semantics). #36
+
 ## [0.0.10] — 2026-06-23
 
 Runtime-overfeed protection — a per-request prompt-size ceiling and a per-model health-gate

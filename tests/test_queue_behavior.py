@@ -999,6 +999,80 @@ async def test_small_prompt_under_ceiling_passes_through(monkeypatch, isolate_st
     await qp.app.state.client.aclose()
 
 
+# ── h2. cost > pool budget: reject, never deadlock the pool (#36) ─────────────
+
+
+async def test_over_budget_request_rejected_503_and_pool_not_deadlocked(monkeypatch, isolate_state):
+    """A request whose admission cost exceeds its pool's TOTAL budget is rejected
+    at admission with 503 (`overlaat_cost_exceeds_pool_budget`) BEFORE any slot or
+    budget is taken, emitting exactly one `rejected_unadmittable` event. Crucially
+    it never reserves the pool, so a SIBLING model sharing the pool is still served
+    end-to-end — the issue #36 deadlock regression."""
+    events = isolate_state
+    sched = scheduler_on(
+        monkeypatch,
+        caps={"think": 1, "prod": 3},
+        budget=1.0,
+        pool_of={"think": "qwen36", "prod": "qwen36"},
+        pool_budget={"qwen36": 0.75},
+    )
+    assert sched.cost("think") == pytest.approx(1.0)  # 1.0 > pool budget 0.75
+
+    hit = {"count": 0}
+
+    async def handler(request):
+        hit["count"] += 1
+        return PlainTextResponse('{"usage":{"prompt_tokens":7,"completion_tokens":9}}')
+
+    upstream = Starlette(routes=[Route("/{path:path}", handler, methods=["POST"])])
+    qp.app.state.client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=upstream), base_url=qp.UPSTREAM
+    )
+
+    async with asgi() as c:
+        r = await c.post(
+            "/v1/chat/completions",
+            json={
+                "model": "think",
+                "stream": False,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+
+    assert r.status_code == 503
+    assert r.json()["error"]["type"] == "overlaat_cost_exceeds_pool_budget"
+
+    # exactly one lifecycle event, rejected before admission (no slot/budget)
+    assert len(events) == 1
+    ev = events[0]
+    assert ev["outcome"] == "rejected_unadmittable"
+    assert ev["http_status"] == 503
+    assert ev["wait_reason"] == "cost_exceeds_pool_budget"
+    assert ev["t_acquire"] is None  # no slot acquired
+    assert hit["count"] == 0  # upstream never reached
+
+    # The pool is NOT pinned: no reservation, no committed budget, nothing queued.
+    assert sched.reserved_for_pool("qwen36") is None
+    assert sched.used_in("qwen36") == pytest.approx(0.0)
+    assert sched.queue_depth() == 0
+    assert qp.METRICS["think"]["in_flight"] == 0
+
+    # THE REGRESSION: a sibling in the SAME pool is still served end-to-end.
+    async with asgi() as c:
+        r2 = await c.post(
+            "/v1/chat/completions",
+            json={
+                "model": "prod",
+                "stream": False,
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+    assert r2.status_code == 200
+    assert hit["count"] == 1  # sibling reached the upstream
+    assert [e for e in events if e["outcome"] == "completed"]
+    await qp.app.state.client.aclose()
+
+
 # ── i. health-gated admission circuit breaker (#31) ───────────────────────────
 
 

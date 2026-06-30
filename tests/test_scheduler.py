@@ -784,6 +784,74 @@ async def test_withdraw_clears_reservation_and_repumps():
     assert admitted(cheap2)  # now packs into freed budget
 
 
+# -- cost > pool budget: reject, never reserve (#36) ------------------------
+
+
+async def test_over_budget_cost_rejected_not_reserved_no_pool_deadlock():
+    # Issue #36 regression: a model whose cost EXCEEDS its pool budget can never
+    # be admitted (used + cost <= B is unsatisfiable even at used==0). It must be
+    # REJECTED at admission, never enqueued/reserved — otherwise its unsatisfiable
+    # reservation pins the pool head forever and head-of-line-blocks every sibling.
+    #
+    # The production repro from the issue: a cap-1 `think` model (cost 1/1 = 1.0)
+    # shares pool `qwen36` (budget 0.75) with a cap-3 production model (cost 1/3).
+    s = Scheduler(
+        budget=1.0,
+        caps={"think": 1, "prod": 3},
+        pool_of={"think": "qwen36", "prod": "qwen36"},
+        pool_budget={"qwen36": 0.75},
+    )
+    assert s.cost("think") == pytest.approx(1.0)  # 1.0 > pool budget 0.75
+
+    think = make_waiter(s, "think", req_id="think")
+    s.enqueue(think)
+    # Rejected outright: the future is resolved False (NOT admitted), labeled,
+    # absent from the waiters list, and holding NO reservation / NO budget.
+    assert think.fut.done()
+    assert think.fut.result() is False
+    assert not admitted(think)
+    assert think.wait_reason == "cost_exceeds_pool_budget"
+    assert think not in s.waiters
+    assert s.reserved_for_pool("qwen36") is None
+    assert s.used_in("qwen36") == pytest.approx(0.0)
+
+    # THE CORE REGRESSION: a sibling in the SAME pool is still admitted — the
+    # impossible request never deadlocked the pool.
+    prod = make_waiter(s, "prod", req_id="prod")
+    s.enqueue(prod)
+    assert admitted(prod)
+    assert s.used_in("qwen36") == pytest.approx(1 / 3)
+
+    # And a second over-budget arrival after the pool is in use is likewise
+    # rejected without disturbing the resident sibling.
+    think2 = make_waiter(s, "think", req_id="think2")
+    s.enqueue(think2)
+    assert think2.fut.result() is False
+    assert s.reserved_for_pool("qwen36") is None
+    assert admitted(prod)  # still running, never displaced
+
+
+async def test_explicit_overlaat_cost_over_budget_also_rejected():
+    # The guard keys on the waiter's cost regardless of source: an explicit
+    # overlaat_cost above the pool budget is rejected the same as a derived 1/cap.
+    s = Scheduler(budget=1.0, caps={"m": 4}, costs={"m": 1.5})  # override 1.5 > 1.0
+    w = make_waiter(s, "m", req_id="m")
+    s.enqueue(w)
+    assert w.fut.result() is False
+    assert w.wait_reason == "cost_exceeds_pool_budget"
+    assert w not in s.waiters
+
+
+async def test_cost_equal_to_pool_budget_still_admittable():
+    # Boundary: cost == budget must still admit (same EPS as the admit test), so a
+    # cap-1 model in a budget-1.0 pool is untouched by the #36 reject guard.
+    s = Scheduler(budget=1.0, caps={"solo": 1})  # cost 1.0 == budget 1.0
+    w = make_waiter(s, "solo", req_id="solo")
+    s.enqueue(w)
+    assert admitted(w)
+    assert w.wait_reason == "none"
+
+
 # -- self-protection: oversized-prompt vector (#24) -------------------------
 
 
