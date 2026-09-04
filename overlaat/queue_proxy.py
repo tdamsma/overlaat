@@ -205,6 +205,7 @@ _EVENT_COLS = (
     "wait_reason",
     "pool",
     "workload",
+    "cached_tokens",
 )
 # Postgres uses psycopg named params (the writer feeds dict rows via executemany);
 # SQLite uses positional `?` params (rows projected to a tuple in _EVENT_COLS order).
@@ -212,33 +213,42 @@ _INSERT_SQL_PG = (
     "INSERT INTO request_events "
     "(t_enqueue, t_acquire, t_first_token, t_done, model_requested, key_fp, "
     " streamed, outcome, http_status, prompt_tokens, completion_tokens, overlaat_version, "
-    " priority, cost, wait_reason, pool, workload) "
+    " priority, cost, wait_reason, pool, workload, cached_tokens) "
     "VALUES (%(t_enqueue)s, %(t_acquire)s, %(t_first_token)s, %(t_done)s, "
     "%(model_requested)s, %(key_fp)s, %(streamed)s, %(outcome)s, "
     "%(http_status)s, %(prompt_tokens)s, %(completion_tokens)s, %(overlaat_version)s, "
-    "%(priority)s, %(cost)s, %(wait_reason)s, %(pool)s, %(workload)s)"
+    "%(priority)s, %(cost)s, %(wait_reason)s, %(pool)s, %(workload)s, %(cached_tokens)s)"
 )
 _INSERT_SQL_SQLITE = (
     "INSERT INTO request_events "
     "(t_enqueue, t_acquire, t_first_token, t_done, model_requested, key_fp, "
     " streamed, outcome, http_status, prompt_tokens, completion_tokens, overlaat_version, "
-    " priority, cost, wait_reason, pool, workload) "
-    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    " priority, cost, wait_reason, pool, workload, cached_tokens) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
 # Back-compat alias: the Postgres statement remains the module-level default.
 _INSERT_SQL = _INSERT_SQL_PG
 
 _RE_PT = re.compile(rb'"prompt_tokens"\s*:\s*(\d+)')
 _RE_CT = re.compile(rb'"completion_tokens"\s*:\s*(\d+)')
+# OpenAI `usage.prompt_tokens_details.cached_tokens` — prompt tokens the backend served
+# from its prefix/KV cache. Emitted by OpenAI, DeepSeek, antirez/ds4, vLLM, llama.cpp
+# (as `prompt_tokens_details`); absent on backends without cache accounting → NULL.
+_RE_CACHED = re.compile(rb'"cached_tokens"\s*:\s*(\d+)')
 
 
-def _extract_tokens(tail: bytes) -> tuple[int | None, int | None]:
-    """Take the LAST prompt/completion_tokens from the tail window. Works for
+def _extract_tokens(tail: bytes) -> tuple[int | None, int | None, int | None]:
+    """Take the LAST prompt/completion/cached_tokens from the tail window. Works for
     streaming (usage chunk just before [DONE]) and non-stream (usage in body).
     No JSON parse → robust against nested *_tokens_details. None = not reported."""
     pt = _RE_PT.findall(tail)
     ct = _RE_CT.findall(tail)
-    return (int(pt[-1]) if pt else None, int(ct[-1]) if ct else None)
+    cached = _RE_CACHED.findall(tail)
+    return (
+        int(pt[-1]) if pt else None,
+        int(ct[-1]) if ct else None,
+        int(cached[-1]) if cached else None,
+    )
 
 
 def load_caps(path: Path) -> dict[str, int]:
@@ -1210,9 +1220,10 @@ async def _forward(
         ev["t_done"] = time.time()
         ev["http_status"] = status_code
         ev["outcome"] = outcome
-        pt, ct = _extract_tokens(tail)
+        pt, ct, cached = _extract_tokens(tail)
         ev["prompt_tokens"] = pt
         ev["completion_tokens"] = ct
+        ev["cached_tokens"] = cached
         emit_event(ev)
         # Feed the health breaker (#31) exactly once per terminal upstream
         # outcome. This is reached only by real upstream attempts, so the

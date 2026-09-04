@@ -717,9 +717,10 @@ async def test_event_wiring_column_counts_match():
     for col in qp._EVENT_COLS:
         assert f"%({col})s" in qp._INSERT_SQL_PG
     assert qp._INSERT_SQL_PG.count("%(") == n
-    # 'workload' is the newly-added column (#19), last in the tuple; 'pool' (the
-    # prior addition) is still wired.
-    assert qp._EVENT_COLS[-1] == "workload"
+    # 'cached_tokens' is the newly-added column (0.0.12), last in the tuple;
+    # 'workload' (#19) and 'pool' (the prior additions) are still wired.
+    assert qp._EVENT_COLS[-1] == "cached_tokens"
+    assert "workload" in qp._EVENT_COLS
     assert "pool" in qp._EVENT_COLS
 
 

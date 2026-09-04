@@ -15,6 +15,7 @@ def ev(
     ct=20,
     streamed=True,
     http=200,
+    cached=None,
 ):
     return {
         "t_enqueue": enq,
@@ -28,6 +29,7 @@ def ev(
         "http_status": http,
         "prompt_tokens": pt,
         "completion_tokens": ct,
+        "cached_tokens": cached,
     }
 
 
@@ -58,6 +60,28 @@ def test_build_consumers(monkeypatch):
     assert rows[0]["abandoned"] == 1
     assert rows[0]["abandoned_rate"] == 0.5
     assert rows[0]["completion_tokens"] == 20  # only the completed call had a count
+
+
+def test_build_models_cache_hit_pct(monkeypatch):
+    # two completed calls report cache accounting (miss + hit), one reports none
+    events = [
+        ev(pt=1000, cached=0),
+        ev(pt=1000, cached=900),
+        ev(model="nocache", pt=500),
+    ]
+    monkeypatch.setattr(m, "fetch_events", lambda *a, **k: events)
+    rows = {r["model"]: r for r in m.build_models("db", 0, 100, {})}
+    assert rows["m1"]["cached_tokens"] == 900
+    assert rows["m1"]["cache_hit_pct"] == 45.0  # 900 / 2000
+    assert rows["nocache"]["cached_tokens"] is None  # never reported ≠ 0%
+    assert rows["nocache"]["cache_hit_pct"] is None
+
+
+def test_build_consumers_cached_tokens(monkeypatch):
+    events = [ev(cached=7), ev(cached=None), ev(cached=3)]
+    monkeypatch.setattr(m, "fetch_events", lambda *a, **k: events)
+    rows = m.build_consumers("db", 0, 100, {})
+    assert rows[0]["cached_tokens"] == 10
 
 
 def test_sanitize_label():

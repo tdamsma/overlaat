@@ -8,6 +8,27 @@ versions without a compatibility guarantee.
 
 ## [Unreleased]
 
+## [0.0.12] — 2026-09-04
+
+Observability release — prefix/KV-cache accounting per request.
+
+### Added
+- **`request_events.cached_tokens`** — prompt tokens the backend served from its prefix/KV
+  cache, scraped from `usage.prompt_tokens_details.cached_tokens` the same way
+  `prompt_tokens`/`completion_tokens` are (last occurrence in the response tail; works for
+  streaming and non-streaming). `NULL` when the backend reports no cache accounting; an
+  explicit `0` is a reported miss. Schema: guarded `ALTER TABLE … ADD COLUMN IF NOT EXISTS`
+  (Postgres) / `PRAGMA table_info` diff (SQLite) — apply `schema.sql` on upgrade.
+- **Cache hit rate in the API + dashboard:** `/models` gains `cached_tokens` and
+  `cache_hit_pct` (Σ cached / Σ prompt over completed calls that report it; `null` for
+  backends that never report, never a fake 0 %); `/consumers`, `/workloads`, `/now`
+  (recent-5-min per key) and `/requests` gain `cached_tokens`. Dashboard: `cache hit %`
+  column in the models table, `cached tok` in consumers and the requests table.
+
+  Motivation: an agent tool-loop that resends a 30-60k-token conversation every step is
+  either ~2 s (prefix hit) or ~100 s (full prefill) per step on a local engine, and
+  without this column the difference was invisible in the accounting.
+
 ## [0.0.11] — 2026-06-30
 
 Bug-fix release — a single mis-sized model can no longer deadlock a whole shared scheduler

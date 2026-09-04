@@ -73,8 +73,23 @@ def test_load_model_info_max_prompt_tokens(tmp_path):
 
 def test_extract_tokens():
     tail = b'data: {"usage":{"prompt_tokens":12,"completion_tokens":34}}\n\ndata: [DONE]\n'
-    assert qp._extract_tokens(tail) == (12, 34)
-    assert qp._extract_tokens(b"no usage here") == (None, None)
+    assert qp._extract_tokens(tail) == (12, 34, None)
+    assert qp._extract_tokens(b"no usage here") == (None, None, None)
+
+
+def test_extract_tokens_cached():
+    # OpenAI-style nested details (also emitted by DeepSeek, antirez/ds4, vLLM, llama.cpp)
+    tail = (
+        b'{"usage":{"prompt_tokens":50547,"completion_tokens":6,"total_tokens":50553,'
+        b'"prompt_tokens_details":{"cached_tokens":50497,"cache_write_tokens":50}}}'
+    )
+    assert qp._extract_tokens(tail) == (50547, 6, 50497)
+    # explicit zero is a reported miss, not "unknown"
+    tail0 = (
+        b'{"usage":{"prompt_tokens":10,"completion_tokens":1,'
+        b'"prompt_tokens_details":{"cached_tokens":0}}}'
+    )
+    assert qp._extract_tokens(tail0) == (10, 1, 0)
 
 
 def test_extract_tokens_takes_last():

@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS request_events (
   http_status       INTEGER,
   prompt_tokens     INTEGER,                     -- NULL = backend did not report usage (never zero-filled)
   completion_tokens INTEGER,
+  cached_tokens     INTEGER,                     -- prompt tokens served from the backend's prefix/KV cache (usage.prompt_tokens_details.cached_tokens); NULL = not reported
   overlaat_version  TEXT,                         -- Overlaat version that served this request; NULL for pre-upgrade rows
   priority          INTEGER,                      -- effective base priority used at admission (cost-scheduler); NULL = scheduler off / pre-upgrade
   cost              DOUBLE PRECISION,             -- pool-fraction cost charged for this run (1/cap by default); NULL = scheduler off / no cap
@@ -35,6 +36,7 @@ CREATE TABLE IF NOT EXISTS request_events (
 -- never alters an existing table, so a column added after the table first shipped
 -- needs its own guarded ALTER to reach already-deployed databases.
 ALTER TABLE request_events ADD COLUMN IF NOT EXISTS workload TEXT;
+ALTER TABLE request_events ADD COLUMN IF NOT EXISTS cached_tokens INTEGER;
 CREATE INDEX IF NOT EXISTS ix_re_tenq    ON request_events (t_enqueue);
 CREATE INDEX IF NOT EXISTS ix_re_tdone   ON request_events (t_done);
 CREATE INDEX IF NOT EXISTS ix_re_model   ON request_events (model_requested, t_enqueue);

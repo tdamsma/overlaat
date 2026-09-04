@@ -36,7 +36,7 @@ MAX_PLAUSIBLE_DECODE = 500  # tok/s hardware ceiling; above this a decode rate i
 _EVENT_SELECT = (
     "SELECT t_enqueue, t_acquire, t_first_token, t_done, model_requested, "
     "key_fp, streamed, outcome, http_status, prompt_tokens, completion_tokens, "
-    "priority, cost, wait_reason, workload "
+    "priority, cost, wait_reason, workload, cached_tokens "
     "FROM request_events"
 )
 _EVENT_FIELDS = (
@@ -55,6 +55,7 @@ _EVENT_FIELDS = (
     "cost",
     "wait_reason",
     "workload",
+    "cached_tokens",
 )
 
 
@@ -462,6 +463,14 @@ def build_models(db_url: str, since: float, now: float, aliases: dict[str, str])
         ]
         service = [(e["t_done"] - e["t_acquire"]) for e in completed if e["t_acquire"]]
         total = [(e["t_done"] - e["t_enqueue"]) for e in completed]
+        # Prefix-cache accounting: only over completed calls whose backend reported
+        # `cached_tokens` (NULL = no cache accounting on that backend → excluded, so a
+        # model that never reports shows None rather than a fake 0%).
+        cache_reported = [
+            e for e in completed if e.get("cached_tokens") is not None and e["prompt_tokens"]
+        ]
+        cached_sum = sum(e["cached_tokens"] for e in cache_reported)
+        cache_prompt_sum = sum(e["prompt_tokens"] for e in cache_reported)
 
         # Backend-health signal (folded in from the removed decode-trend chart):
         # solo decode tok/s = completion_tokens / (t_done - t_first_token) over
@@ -547,6 +556,10 @@ def build_models(db_url: str, since: float, now: float, aliases: dict[str, str])
                 "throughput_by_concurrency": throughput,
                 "decode_solo_tok_s": round(_pct(solo_decrates, 0.5), 1) if solo_decrates else None,
                 "out_tok_p50": round(_pct(out_toks, 0.5)) if out_toks else None,
+                "cached_tokens": cached_sum if cache_reported else None,
+                "cache_hit_pct": round(100.0 * cached_sum / cache_prompt_sum, 1)
+                if cache_prompt_sum
+                else None,
             }
         )
     out.sort(key=lambda m: m["requests"], reverse=True)
@@ -571,6 +584,7 @@ def build_consumers(db_url: str, since: float, now: float, aliases: dict[str, st
                 "cancelled_queued": 0,
                 "prompt_tokens": 0,
                 "completion_tokens": 0,
+                "cached_tokens": 0,
                 "service_s": 0.0,
                 "models": {},
             },
@@ -589,6 +603,8 @@ def build_consumers(db_url: str, since: float, now: float, aliases: dict[str, st
             d["prompt_tokens"] += e["prompt_tokens"]
         if e["completion_tokens"]:
             d["completion_tokens"] += e["completion_tokens"]
+        if e.get("cached_tokens"):
+            d["cached_tokens"] += e["cached_tokens"]
         if e["t_acquire"] is not None:
             d["service_s"] += max(0.0, e["t_done"] - e["t_acquire"])
         d["models"][e["model_requested"]] = d["models"].get(e["model_requested"], 0) + 1
@@ -633,6 +649,7 @@ def build_workloads(db_url: str, since: float, now: float) -> list[dict]:
                 "errored": 0,
                 "cancelled_queued": 0,
                 "completion_tokens": 0,
+                "cached_tokens": 0,
                 "qwait": [],  # ms, completed only
                 "total": [],  # ms, completed only
             },
@@ -652,6 +669,8 @@ def build_workloads(db_url: str, since: float, now: float) -> list[dict]:
             d["cancelled_queued"] += 1
         if e["completion_tokens"]:
             d["completion_tokens"] += e["completion_tokens"]
+        if e.get("cached_tokens"):
+            d["cached_tokens"] += e["cached_tokens"]
 
     out = []
     for d in by_wl.values():
@@ -686,7 +705,7 @@ def build_recent_requests(db_url: str, limit: int, aliases: dict[str, str]) -> l
     Per row: t_enqueue (epoch seconds), model, consumer (aliased key_fp),
     workload, outcome, http_status, streamed; the four derived latencies in ms
     (queue_wait / ttft / service / total — each defined exactly as elsewhere in
-    this module); prompt/completion tokens; decode_tok_s (completion_tokens over
+    this module); prompt/completion/cached tokens; decode_tok_s (completion_tokens over
     the decode window, dropped above the hardware ceiling as a near-zero-window
     artifact); and wait_reason."""
     events = fetch_recent_events(db_url, limit)
@@ -713,6 +732,7 @@ def build_recent_requests(db_url: str, limit: int, aliases: dict[str, str]) -> l
                 "total": _ms(e["t_enqueue"], dn),
                 "prompt_tokens": e["prompt_tokens"],
                 "completion_tokens": ct,
+                "cached_tokens": e.get("cached_tokens"),
                 "decode_tok_s": decode_tok_s,
                 "wait_reason": e["wait_reason"],
             }

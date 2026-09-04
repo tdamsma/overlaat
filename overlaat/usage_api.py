@@ -173,10 +173,14 @@ def now():
             if e["outcome"] != "completed":
                 continue
             a = aliases.get(e["key_fp"], e["key_fp"])
-            d = recent.setdefault(a, {"key": a, "calls": 0, "completion_tokens": 0})
+            d = recent.setdefault(
+                a, {"key": a, "calls": 0, "completion_tokens": 0, "cached_tokens": 0}
+            )
             d["calls"] += 1
             if e["completion_tokens"]:
                 d["completion_tokens"] += e["completion_tokens"]
+            if e.get("cached_tokens"):
+                d["cached_tokens"] += e["cached_tokens"]
     except Exception:
         pass
 
@@ -468,7 +472,7 @@ table.sortable th .ind{color:var(--accent);margin-left:3px}
       <th>model</th><th class="num">req</th><th class="num">ok</th><th class="num">aband</th>
       <th class="num">err</th><th class="num">canc</th>
       <th class="num">qwait p50</th><th class="num">ttft p50</th><th class="num">service p50/p95</th>
-      <th class="num">solo decode tok/s</th><th class="num">p50 out tok</th>
+      <th class="num">solo decode tok/s</th><th class="num">p50 out tok</th><th class="num">cache hit %</th>
       <th>throughput @ concurrency (tok/s)</th>
     </tr></thead><tbody></tbody></table>
     </div>
@@ -483,7 +487,7 @@ table.sortable th .ind{color:var(--accent);margin-left:3px}
       <table id="consumers"><thead><tr>
         <th>key</th><th class="num">req</th><th class="num">ok</th><th class="num">aband</th>
         <th class="num">aband %</th><th class="num">err</th>
-        <th class="num">prompt tok</th><th class="num">compl tok</th><th class="num">service s</th><th>models</th>
+        <th class="num">prompt tok</th><th class="num">cached tok</th><th class="num">compl tok</th><th class="num">service s</th><th>models</th>
       </tr></thead><tbody></tbody></table>
       </div>
     </div>
@@ -925,8 +929,9 @@ function renderModels(d){
       <td class="num">${ms(L.service_p50)}/${ms(L.service_p95)}</td>
       <td class="num">${m.decode_solo_tok_s??'<span class="dim">—</span>'}</td>
       <td class="num">${m.out_tok_p50==null?'<span class="dim">—</span>':fmt(m.out_tok_p50)}</td>
+      <td class="num">${m.cache_hit_pct==null?'<span class="dim">—</span>':m.cache_hit_pct.toFixed(0)+'%'}</td>
       <td>${tp}</td></tr>`;
-  }).join('')||'<tr><td colspan="12" class="dim">no calls</td></tr>';
+  }).join('')||'<tr><td colspan="13" class="dim">no calls</td></tr>';
   $('#models-note').textContent=(d.notes||[]).join('  ·  ');
 }
 
@@ -940,9 +945,9 @@ function renderConsumers(d){
       <td class="num ${c.abandoned?'hot':'dim'}">${c.abandoned}</td>
       <td class="num ${c.abandoned_rate>0.1?'hot':'dim'}">${(c.abandoned_rate*100).toFixed(0)}%</td>
       <td class="num ${c.errored?'warn':'dim'}">${c.errored}</td>
-      <td class="num">${fmt(c.prompt_tokens)}</td><td class="num">${fmt(c.completion_tokens)}</td>
+      <td class="num">${fmt(c.prompt_tokens)}</td><td class="num">${fmt(c.cached_tokens)}</td><td class="num">${fmt(c.completion_tokens)}</td>
       <td class="num">${fmt(c.service_s)}</td><td class="dim">${mdl}</td></tr>`;
-  }).join('')||'<tr><td colspan="10" class="dim">no calls</td></tr>';
+  }).join('')||'<tr><td colspan="11" class="dim">no calls</td></tr>';
 }
 
 function renderWorkloads(d){
@@ -974,6 +979,7 @@ const REQ_COLS=[
   {key:'service',label:'service',num:true,ms:true},
   {key:'total',label:'total',num:true,ms:true},
   {key:'prompt_tokens',label:'prompt tok',num:true,tok:true},
+  {key:'cached_tokens',label:'cached tok',num:true,tok:true},
   {key:'completion_tokens',label:'compl tok',num:true,tok:true},
   {key:'decode_tok_s',label:'decode tok/s',num:true},
 ];

@@ -215,7 +215,8 @@ CREATE TABLE IF NOT EXISTS request_events (
   cost              DOUBLE PRECISION,
   wait_reason       TEXT,
   pool              TEXT,
-  workload          TEXT
+  workload          TEXT,
+  cached_tokens     INTEGER
 );
 CREATE INDEX IF NOT EXISTS ix_re_tenq    ON request_events (t_enqueue);
 CREATE INDEX IF NOT EXISTS ix_re_tdone   ON request_events (t_done);
@@ -265,7 +266,7 @@ def _sqlite_add_missing_columns(conn: sqlite3.Connection) -> None:
     `PRAGMA table_info` and add only the columns that postdate the CREATE — the
     sqlite mirror of schema.sql's guarded `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`."""
     have = {row[1] for row in conn.execute("PRAGMA table_info(request_events)")}
-    for col, decl in (("workload", "TEXT"),):
+    for col, decl in (("workload", "TEXT"), ("cached_tokens", "INTEGER")):
         if col not in have:
             conn.execute(f"ALTER TABLE request_events ADD COLUMN {col} {decl}")
 

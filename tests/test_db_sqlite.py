@@ -221,6 +221,7 @@ def test_init_db_adds_workload_to_legacy_table(tmp_path):
     try:
         cols = {r[1] for r in conn.execute("PRAGMA table_info(request_events)")}
         assert "workload" in cols
+        assert "cached_tokens" in cols  # 0.0.12 column, same guarded-upgrade path
         db.init_db(url)  # second run is a no-op (no duplicate-column error)
     finally:
         conn.close()
