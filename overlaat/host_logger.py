@@ -13,10 +13,13 @@ events. It is macOS-specific: it shells out to `powermetrics`, `vm_stat`, and
 `ps`. On other platforms you would replace this module with an equivalent
 sampler (e.g. nvidia-smi + /proc on Linux) writing the same `host_samples` rows.
 
-Why RSS and not per-process GPU: on macOS, per-process GPU is not measurable for
-Metal/MLX workloads (powermetrics --show-process-gpu reports 0 ms/s). RSS IS
-measurable per process, and RSS is what causes the Metal OOM on a memory-bound
-box. So we attribute MEMORY by RSS and leave GPU% host-wide.
+Why memory and not per-process GPU: on macOS, per-process GPU is not measurable for
+Metal/MLX workloads (powermetrics --show-process-gpu reports 0 ms/s). Memory IS
+measurable per process, and memory is what causes the Metal OOM on a memory-bound
+box. So we attribute MEMORY per process and leave GPU% host-wide. Since 0.0.13 the
+figure is the PHYSICAL FOOTPRINT (proc_pid_rusage, = vmmap / Activity Monitor), not
+RSS: RSS misses the wired GPU-shared memory that MLX weights and KV pools live in
+(rapid-mlx: RSS 7.7 GB vs footprint 19.9 GB). `rss_gb` is still recorded.
 
 To read powermetrics it needs root. Run it as root (e.g. via a system service /
 launch daemon) or grant the invoking user passwordless sudo for powermetrics.
@@ -273,15 +276,80 @@ def derive_name(cmd: str) -> str:
             return "ollama-serve"
     if port and exe.startswith(BACKEND_EXE_PREFIXES):
         if exe.startswith("python"):
-            # A python-hosted server: try to recover a meaningful name from an
-            # absolute script path ending in -server / -api.
+            # A python-hosted server: recover a meaningful name from the script it runs.
+            # 1) an absolute path containing a -server / -api directory (uvicorn apps that
+            #    live in such a directory: /srv/whisper-server/.venv/bin/uvicorn -> whisper-server-8081)
+            # 2) otherwise the script's own basename (/…/bin/mlx_lm.server -> mlx-lm-server-8080,
+            #    /…/bin/rapid-mlx -> rapid-mlx-8087), so the dashboard says WHICH engine holds the
+            #    memory instead of "python-8080".
+            script = None
             for t in tokens[1:]:
                 if t.startswith("/"):
                     for d in t.split("/"):
                         if d.endswith(("-server", "-api")):
                             return f"{d}-{port}"
+                    if script is None and not t.endswith(("/python", "/python3")):
+                        script = t
+            if script:
+                base = os.path.basename(script)
+                if base.endswith(".py"):
+                    base = base[:-3]
+                base = re.sub(r"[._]+", "-", base).strip("-")
+                if base and base not in ("uvicorn", "gunicorn", "-m"):
+                    return f"{base}-{port}"
         return f"{exe}-{port}"
     return exe
+
+
+def phys_footprint_gb(pid: int) -> float | None:
+    """Physical memory footprint of `pid` in GB via macOS `proc_pid_rusage`
+    (the same number `vmmap --summary` and Activity Monitor report). RSS
+    under-counts Metal/MLX servers badly — model weights and KV pools are
+    wired GPU-shared memory that is not in RSS (rapid-mlx: RSS 7.7 GB vs
+    footprint 19.9 GB on the reference box) — so this is what the memory
+    breakdown should rank by. None on non-Darwin hosts or on any failure."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        import ctypes
+
+        class _RUsageInfoV2(ctypes.Structure):
+            _fields_ = [("ri_uuid", ctypes.c_uint8 * 16)] + [
+                (n, ctypes.c_uint64)
+                for n in (
+                    "ri_user_time",
+                    "ri_system_time",
+                    "ri_pkg_idle_wkups",
+                    "ri_interrupt_wkups",
+                    "ri_pageins",
+                    "ri_wired_size",
+                    "ri_resident_size",
+                    "ri_phys_footprint",
+                    "ri_proc_start_abstime",
+                    "ri_proc_exit_abstime",
+                    "ri_child_user_time",
+                    "ri_child_system_time",
+                    "ri_child_pkg_idle_wkups",
+                    "ri_child_interrupt_wkups",
+                    "ri_child_pageins",
+                    "ri_child_elapsed_abstime",
+                    "ri_diskio_bytesread",
+                    "ri_diskio_byteswritten",
+                )
+            ]
+
+        global _LIBPROC
+        if _LIBPROC is None:
+            _LIBPROC = ctypes.CDLL("/usr/lib/libproc.dylib")
+        ri = _RUsageInfoV2()
+        if _LIBPROC.proc_pid_rusage(ctypes.c_int(pid), ctypes.c_int(2), ctypes.byref(ri)) != 0:
+            return None
+        return round(ri.ri_phys_footprint / 1024**3, 2)
+    except Exception:
+        return None
+
+
+_LIBPROC = None
 
 
 def ps_snapshot() -> dict[int, dict]:
@@ -305,9 +373,16 @@ def ps_snapshot() -> dict[int, dict]:
             "name": derive_name(cmd),
             "cpu_pct": cpu,
             "rss_gb": round(rss_kb / 1024**2, 2),
+            "footprint_gb": None,  # filled for memory holders only (one syscall per candidate)
             "gpu_pct": 0.0,
         }
     return processes
+
+
+def mem_gb(p: dict) -> float:
+    """The memory figure a process is ranked by: physical footprint when known, else RSS."""
+    fp = p.get("footprint_gb")
+    return fp if fp is not None else p.get("rss_gb", 0.0)
 
 
 def backend_breakdown(processes: dict[int, dict], gpu_procs: list[dict]) -> list[dict]:
@@ -317,8 +392,13 @@ def backend_breakdown(processes: dict[int, dict], gpu_procs: list[dict]) -> list
         p = processes.get(gp["pid"])
         if p:
             p["gpu_pct"] = gp["gpu_pct"]
-    holders = [p for p in processes.values() if p["rss_gb"] >= RSS_MIN_GB]
-    holders.sort(key=lambda p: -p["rss_gb"])
+    # Candidates by RSS first (cheap), then measure the physical footprint of each and
+    # re-rank by it: an MLX server can hold 20 GB of wired weights on a 7 GB RSS.
+    candidates = [p for p in processes.values() if p["rss_gb"] >= RSS_MIN_GB / 4]
+    for p in candidates:
+        p["footprint_gb"] = phys_footprint_gb(p["pid"])
+    holders = [p for p in candidates if mem_gb(p) >= RSS_MIN_GB]
+    holders.sort(key=lambda p: -mem_gb(p))
     return holders[:RSS_TOP_N]
 
 

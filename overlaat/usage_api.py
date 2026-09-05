@@ -224,12 +224,23 @@ def now():
             "free_gb": host["ram_free_gb"] if host else None,
             "total_gb": host["ram_total_gb"] if host else None,
             "sample_age_s": round(time.time() - host["ts"], 1) if host else None,
-            "backends": sorted(backends, key=lambda b: -b.get("rss_gb", 0))[:12],
+            # ranked by physical footprint when the logger recorded it (0.0.13+), else RSS
+            "backends": sorted(
+                backends,
+                key=lambda b: (
+                    -(
+                        b.get("footprint_gb")
+                        if b.get("footprint_gb") is not None
+                        else b.get("rss_gb", 0)
+                    )
+                ),
+            )[:12],
         },
         "recent_5m_by_key": sorted(recent.values(), key=lambda d: -d["calls"]),
         "caveat": "Live in-flight from the queue; tokens/latency appear once a "
         "call completes. Per-process GPU is unmeasurable on macOS for "
-        "Metal/MLX workloads — memory is attributed by RSS, GPU% is "
+        "Metal/MLX workloads — memory is attributed per process (physical footprint, "
+        "falling back to RSS), GPU% is "
         "host-wide.",
     }
 
@@ -288,7 +299,8 @@ def workloads(last: str = Query("24h")):
 def requests(limit: int = Query(100)):
     """The most recent `limit` requests (newest first) as flat rows for the
     dashboard's searchable / sortable / filterable table. `limit` is clamped to
-    [1, 500] — the table is client-side, so a few hundred rows is plenty."""
+    [1, 500] — the table is client-side, so a few hundred rows is plenty. Each row
+    carries `t_enqueue`/`t_done` (epoch seconds) and `time` (ISO-8601 UTC)."""
     n = max(1, min(limit, 500))
     rows = metrics_db.build_recent_requests(DB, n, alias_map())
     return {"_meta": _meta("requests", 5), "limit": n, "requests": rows}
@@ -444,8 +456,8 @@ table.sortable th .ind{color:var(--accent);margin-left:3px}
     </div>
 
     <div class="card">
-      <h2>memory holders <span class="dim">(RSS — what fills RAM)</span></h2>
-      <table id="rss"><thead><tr><th>process</th><th class="num">RSS GB</th><th>share</th></tr></thead><tbody></tbody></table>
+      <h2>memory holders <span class="dim">(physical footprint — what fills RAM)</span></h2>
+      <table id="rss"><thead><tr><th>process</th><th class="num">GB</th><th>share</th></tr></thead><tbody></tbody></table>
     </div>
   </div>
 
@@ -811,8 +823,9 @@ function renderNow(now){
   }).join('')||'<tr><td colspan="3" class="dim">idle</td></tr>';
   $('#now-note').textContent=now.host.sample_age_s!=null?`host sample ${now.host.sample_age_s}s ago`:'';
   const rt=$('#rss tbody'),bs=now.host.backends||[];
-  const max=bs.length?bs[0].rss_gb:1;
-  rt.innerHTML=bs.map(b=>`<tr><td>${b.name}</td><td class="num">${b.rss_gb.toFixed(1)}</td><td><div class="bar"><i style="width:${(b.rss_gb/max*100).toFixed(0)}%"></i></div></td></tr>`).join('')||'<tr><td colspan="3" class="dim">—</td></tr>';
+  const gb=b=>(b.footprint_gb!=null?b.footprint_gb:b.rss_gb);
+  const max=bs.length?gb(bs[0]):1;
+  rt.innerHTML=bs.map(b=>`<tr><td>${b.name}</td><td class="num" title="RSS ${(b.rss_gb||0).toFixed(1)} GB">${gb(b).toFixed(1)}</td><td><div class="bar"><i style="width:${(gb(b)/max*100).toFixed(0)}%"></i></div></td></tr>`).join('')||'<tr><td colspan="3" class="dim">—</td></tr>';
   renderQueuedByUser(now);
   renderHealth(now);
 }

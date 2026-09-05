@@ -8,6 +8,24 @@ versions without a compatibility guarantee.
 
 ## [Unreleased]
 
+## [0.0.13] — 2026-09-05
+
+Observability release — memory attribution that matches reality, and timestamps consumers can read.
+
+### Added
+- **`host_samples.backends_json[].footprint_gb`** — per-process physical footprint via macOS
+  `proc_pid_rusage` (the number `vmmap --summary` / Activity Monitor show). RSS badly under-counts
+  Metal/MLX servers because weights and KV pools live in wired GPU-shared memory (rapid-mlx on the
+  reference box: RSS 7.7 GB vs footprint 19.9 GB). Memory holders are now ranked by footprint
+  (falling back to RSS); `rss_gb` stays. `/now` and the dashboard's "memory holders" card follow.
+- **`/requests` rows carry `time` (ISO-8601 UTC of `t_enqueue`) and `t_done`** next to the
+  existing epoch `t_enqueue`, so a consumer can correlate a run window without converting epochs.
+
+### Changed
+- **Host-logger process names**: python-hosted servers are named after the script they run when
+  no `-server`/`-api` directory is in the path — `mlx-lm-server-8080`, `rapid-mlx-8087` instead
+  of `python-8080` / `python-8087`. Names in existing samples are unchanged.
+
 ## [0.0.12] — 2026-09-04
 
 Observability release — prefix/KV-cache accounting per request.

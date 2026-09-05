@@ -696,13 +696,25 @@ def _ms(a: float | None, b: float | None) -> int | None:
     return round((b - a) * 1000)
 
 
+def _iso_utc(epoch) -> str | None:
+    if epoch is None:
+        return None
+    from datetime import UTC, datetime
+
+    return (
+        datetime.fromtimestamp(float(epoch), UTC).strftime("%Y-%m-%dT%H:%M:%S.")
+        + f"{int((float(epoch) % 1) * 1000):03d}Z"
+    )
+
+
 def build_recent_requests(db_url: str, limit: int, aliases: dict[str, str]) -> list[dict]:
     """The most recent `limit` requests, newest first, as flat per-row records for
     the dashboard's searchable requests table. One row per request_events row,
     including in-flight / queued / abandoned rows whose timestamps are still NULL
     (their un-computable latencies come back as None, never zero-filled).
 
-    Per row: t_enqueue (epoch seconds), model, consumer (aliased key_fp),
+    Per row: t_enqueue (epoch seconds) + `time` (its ISO-8601 UTC form) + t_done (epoch,
+    None while in flight), model, consumer (aliased key_fp),
     workload, outcome, http_status, streamed; the four derived latencies in ms
     (queue_wait / ttft / service / total — each defined exactly as elsewhere in
     this module); prompt/completion/cached tokens; decode_tok_s (completion_tokens over
@@ -720,6 +732,10 @@ def build_recent_requests(db_url: str, limit: int, aliases: dict[str, str]) -> l
         out.append(
             {
                 "t_enqueue": e["t_enqueue"],
+                # ISO-8601 UTC of t_enqueue and the raw t_done, so a consumer can correlate a
+                # run window without converting epochs (asked by a consumer, 2026-09-05).
+                "time": _iso_utc(e["t_enqueue"]),
+                "t_done": dn,
                 "model": e["model_requested"],
                 "consumer": aliases.get(e["key_fp"], e["key_fp"]),
                 "workload": e.get("workload"),
