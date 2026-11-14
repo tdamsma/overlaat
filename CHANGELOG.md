@@ -8,6 +8,20 @@ versions without a compatibility guarantee.
 
 ## [Unreleased]
 
+## [0.0.14] — 2026-11-14
+
+### Added
+- **`/requests?since=&until=`**: filter on `t_enqueue` (half-open), as epoch seconds or ISO-8601
+  (naive = UTC). With a time range the row cap rises from 500 to 20000; the response now carries
+  `since`, `until` and `truncated`.
+
+### Fixed
+- **Queued requests whose client disconnected are dropped before they reach the backend.** A
+  waiting request polls `request.is_disconnected()` every second and ends as `cancelled_queued`.
+  Before, a client that timed out while queued still got its request dispatched once a slot freed,
+  costing a full prefill nobody read (seen on a single-stream ds4 engine: two abandoned copies of a
+  3.6k-token prompt prefilled ahead of the live retry).
+
 ## [0.0.13] — 2026-09-05
 
 Observability release — memory attribution that matches reality, and timestamps consumers can read.
