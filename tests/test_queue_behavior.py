@@ -1147,3 +1147,72 @@ async def test_breaker_trips_503_then_recovers_after_cooldown(monkeypatch, isola
         assert hit["count"] == 4
 
     await qp.app.state.client.aclose()
+
+
+def _disconnectable_request(body: bytes, gone: asyncio.Event):
+    """A raw Request whose client 'disconnects' once `gone` is set, mirroring
+    uvicorn: receive() returns http.disconnect immediately after the drop."""
+    from starlette.requests import Request
+
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/v1/chat/completions",
+        "headers": [(b"authorization", b"Bearer sk-x"), (b"content-type", b"application/json")],
+        "query_string": b"",
+        "app": qp.app,
+    }
+    sent = False
+
+    async def receive():
+        nonlocal sent
+        if not sent:
+            sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        if not gone.is_set():
+            await gone.wait()
+        return {"type": "http.disconnect"}
+
+    return Request(scope, receive)
+
+
+@pytest.mark.parametrize("use_scheduler", [False, True])
+async def test_client_disconnect_drops_queued_request(monkeypatch, isolate_state, use_scheduler):
+    """A queued request whose client disconnects is dropped before it reaches the
+    backend (outcome cancelled_queued), so an abandoned call costs no prefill."""
+    events = isolate_state
+    monkeypatch.setattr(qp, "DISCONNECT_POLL_S", 0.01)
+    if use_scheduler:
+        scheduler_on(monkeypatch, caps={"m": 1})
+    else:
+        monkeypatch.setattr(qp, "CAPS", {"m": 1})
+    gate = asyncio.Event()
+    arrivals: list[str] = []
+    qp.app.state.client = gated_upstream(gate, arrivals)
+
+    async def call(tag):
+        async with asgi() as c:
+            r = await c.post(
+                "/v1/chat/completions", json={"model": "m", "stream": False, "tag": tag}
+            )
+        return tag, r.status_code
+
+    inflight = asyncio.ensure_future(call("inflight"))
+    await _wait_for(lambda: qp.METRICS["m"]["in_flight"] == 1)
+
+    gone = asyncio.Event()
+    request = _disconnectable_request(b'{"model":"m","stream":false,"tag":"abandoned"}', gone)
+    queued = asyncio.ensure_future(qp.proxy("v1/chat/completions", request))
+    assert await _wait_for(lambda: len(qp.QUEUED["m"]) == 1)
+
+    gone.set()
+    resp = await asyncio.wait_for(queued, timeout=2.0)
+    assert resp.status_code == 499
+    assert qp.QUEUED["m"] == {}
+    assert qp.METRICS["m"]["queue_depth"] == 0
+    assert any(e["outcome"] == "cancelled_queued" for e in events)
+
+    gate.set()
+    assert await inflight == ("inflight", 200)
+    assert "abandoned" not in arrivals
+    await qp.app.state.client.aclose()

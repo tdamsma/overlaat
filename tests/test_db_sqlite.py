@@ -383,3 +383,25 @@ def test_normalize_backends_json_silent_on_good_input(recwarn):
     assert db.normalize_backends_json(None) is None
     assert db.normalize_backends_json([{"name": "x"}]) == [{"name": "x"}]
     assert len(recwarn) == 0
+
+
+def test_fetch_recent_events_time_range(tmp_path):
+    """since/until filter on t_enqueue (half-open), newest first, still LIMITed."""
+    url = _sqlite_url(tmp_path)
+    db.init_db(url)
+    base = {
+        "model_requested": "m1",
+        "key_fp": "k1",
+        "outcome": "completed",
+        "http_status": 200,
+        "t_done": 500.0,
+        "streamed": False,
+    }
+    _write_events_via_proxy_path(
+        url, [{**base, "t_enqueue": float(t)} for t in (100, 200, 300, 400)]
+    )
+
+    got = m.fetch_recent_events(url, 10, since=200.0, until=400.0)
+    assert [e["t_enqueue"] for e in got] == [300.0, 200.0]
+    assert [e["t_enqueue"] for e in m.fetch_recent_events(url, 1, since=200.0)] == [400.0]
+    assert len(m.fetch_recent_events(url, 10)) == 4

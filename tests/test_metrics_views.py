@@ -231,7 +231,7 @@ def test_build_recent_requests(monkeypatch):
     ]
     captured = {}
 
-    def fake_fetch(db_url, limit):
+    def fake_fetch(db_url, limit, since=None, until=None):
         captured["limit"] = limit
         return rows_in
 
@@ -267,7 +267,7 @@ def test_build_recent_requests_forwards_limit(monkeypatch):
     # straight to fetch_recent_events (which applies it as SQL LIMIT).
     seen = {}
 
-    def fake(db_url, limit):
+    def fake(db_url, limit, since=None, until=None):
         seen["limit"] = limit
         return []
 

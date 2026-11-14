@@ -224,7 +224,7 @@ async def test_requests_limit_clamped(monkeypatch):
     monkeypatch.setattr(ua, "alias_map", lambda: {})
     seen = {}
 
-    def fake(db, limit, aliases):
+    def fake(db, limit, aliases, **kw):
         seen["limit"] = limit
         return []
 
@@ -236,6 +236,25 @@ async def test_requests_limit_clamped(monkeypatch):
     assert hi.json()["limit"] == 500
     assert lo.json()["limit"] == 1
     assert seen["limit"] == 1
+
+
+async def test_requests_time_range(monkeypatch):
+    monkeypatch.setattr(ua, "alias_map", lambda: {})
+    seen = {}
+
+    def fake(db, limit, aliases, since=None, until=None):
+        seen.update(limit=limit, since=since, until=until)
+        return []
+
+    monkeypatch.setattr(mdb, "build_recent_requests", fake)
+    async with asgi() as c:
+        r = await c.get("/requests?limit=5000&since=2026-11-13T09:30:00Z&until=1794571200")
+        bad = await c.get("/requests?since=yesterday")
+    assert r.status_code == 200
+    # A time range lifts the 500-row cap; ISO and epoch both parse to epoch seconds.
+    assert seen == {"limit": 5000, "since": 1794562200.0, "until": 1794571200.0}
+    assert r.json()["since"] == 1794562200.0
+    assert bad.status_code == 422
 
 
 async def test_dashboard_shows_version():

@@ -953,6 +953,21 @@ def get_semaphore(model: str) -> asyncio.Semaphore | None:
     return sem
 
 
+# How often a queued request checks whether its client is still connected.
+DISCONNECT_POLL_S = 1.0
+
+
+async def _watch_disconnect(request: Request, cancel_fut: asyncio.Future) -> None:
+    """Cancel a queued request once its client disconnects, so an abandoned call
+    never reaches the backend (it would cost a full prefill for nobody)."""
+    while not cancel_fut.done():
+        if await request.is_disconnected():
+            if not cancel_fut.done():
+                cancel_fut.set_result("client_disconnected")
+            return
+        await asyncio.sleep(DISCONNECT_POLL_S)
+
+
 def _cancelled_response(req_id: str, model: str) -> JSONResponse:
     return JSONResponse(
         status_code=499,
@@ -1462,9 +1477,11 @@ async def proxy(full_path: str, request: Request):
     metrics["queue_depth"] += 1
     enqueue_ts = time.monotonic()
     acquire_task = asyncio.ensure_future(sem.acquire())
+    watcher = asyncio.ensure_future(_watch_disconnect(request, cancel_fut))
     try:
         await asyncio.wait({acquire_task, cancel_fut}, return_when=asyncio.FIRST_COMPLETED)
     finally:
+        watcher.cancel()
         metrics["queue_depth"] -= 1
         QUEUED[model].pop(req_id, None)
 
@@ -1560,9 +1577,11 @@ async def _admit_scheduler(
         enqueued_at=sched._now(),
     )
     sched.enqueue(waiter)
+    watcher = asyncio.ensure_future(_watch_disconnect(request, cancel_fut))
     try:
         await asyncio.wait({waiter.fut, cancel_fut}, return_when=asyncio.FIRST_COMPLETED)
     finally:
+        watcher.cancel()
         metrics["queue_depth"] -= 1
         QUEUED[model].pop(req_id, None)
 

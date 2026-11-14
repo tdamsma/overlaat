@@ -246,15 +246,29 @@ def fetch_events(db_url: str, since: float, until: float | None = None) -> list[
     return out
 
 
-def fetch_recent_events(db_url: str, limit: int) -> list[dict]:
+def fetch_recent_events(
+    db_url: str, limit: int, since: float | None = None, until: float | None = None
+) -> list[dict]:
     """The most recent `limit` request events, newest first (ORDER BY t_enqueue
-    DESC). Unlike fetch_events this applies NO `t_done >= since` filter, so rows
-    still in flight or queued (NULL t_acquire / t_first_token / t_done) are
-    included — the recent-requests table wants to show them too."""
+    DESC), optionally restricted to `since <= t_enqueue < until`. Unlike
+    fetch_events this applies NO `t_done >= since` filter, so rows still in flight
+    or queued (NULL t_acquire / t_first_token / t_done) are included — the
+    recent-requests table wants to show them too."""
     ph = db.placeholder(db_url)
-    sql = _EVENT_SELECT + f" ORDER BY t_enqueue DESC LIMIT {ph}"
+    where, params = [], []
+    if since is not None:
+        where.append(f"t_enqueue >= {ph}")
+        params.append(since)
+    if until is not None:
+        where.append(f"t_enqueue < {ph}")
+        params.append(until)
+    sql = _EVENT_SELECT
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += f" ORDER BY t_enqueue DESC LIMIT {ph}"
+    params.append(limit)
     with _connect(db_url) as c, c.cursor() as cur:
-        cur.execute(sql, (limit,))
+        cur.execute(sql, tuple(params))
         rows = cur.fetchall()
     out = [dict(zip(_EVENT_FIELDS, r, strict=False)) for r in rows]
     for e in out:
@@ -707,7 +721,13 @@ def _iso_utc(epoch) -> str | None:
     )
 
 
-def build_recent_requests(db_url: str, limit: int, aliases: dict[str, str]) -> list[dict]:
+def build_recent_requests(
+    db_url: str,
+    limit: int,
+    aliases: dict[str, str],
+    since: float | None = None,
+    until: float | None = None,
+) -> list[dict]:
     """The most recent `limit` requests, newest first, as flat per-row records for
     the dashboard's searchable requests table. One row per request_events row,
     including in-flight / queued / abandoned rows whose timestamps are still NULL
@@ -720,7 +740,7 @@ def build_recent_requests(db_url: str, limit: int, aliases: dict[str, str]) -> l
     this module); prompt/completion/cached tokens; decode_tok_s (completion_tokens over
     the decode window, dropped above the hardware ceiling as a near-zero-window
     artifact); and wait_reason."""
-    events = fetch_recent_events(db_url, limit)
+    events = fetch_recent_events(db_url, limit, since, until)
     out = []
     for e in events:
         ft, dn, ct = e["t_first_token"], e["t_done"], e["completion_tokens"]

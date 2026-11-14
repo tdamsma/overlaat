@@ -34,7 +34,7 @@ import time
 import urllib.request
 from datetime import UTC, datetime
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse
 
 from overlaat import __version__, metrics_db
@@ -295,15 +295,52 @@ def workloads(last: str = Query("24h")):
     return {"_meta": _meta("workloads", 30), "window": {"last": last}, "workloads": rows}
 
 
+# Row cap without a time range (the dashboard table) and with one (bulk export).
+REQUESTS_MAX = 500
+REQUESTS_RANGE_MAX = 20000
+
+
+def parse_ts(s: str | None) -> float | None:
+    """Epoch seconds or ISO-8601 (naive = UTC) to epoch seconds; None passes through."""
+    if s is None or s == "":
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError as e:
+        raise HTTPException(422, f"not an epoch or ISO-8601 time: {s!r}") from e
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt.timestamp()
+
+
 @app.get("/requests")
-def requests(limit: int = Query(100)):
+def requests(
+    limit: int = Query(100),
+    since: str | None = Query(None),
+    until: str | None = Query(None),
+):
     """The most recent `limit` requests (newest first) as flat rows for the
-    dashboard's searchable / sortable / filterable table. `limit` is clamped to
-    [1, 500] — the table is client-side, so a few hundred rows is plenty. Each row
-    carries `t_enqueue`/`t_done` (epoch seconds) and `time` (ISO-8601 UTC)."""
-    n = max(1, min(limit, 500))
-    rows = metrics_db.build_recent_requests(DB, n, alias_map())
-    return {"_meta": _meta("requests", 5), "limit": n, "requests": rows}
+    dashboard's searchable / sortable / filterable table. Optional `since` /
+    `until` (epoch seconds or ISO-8601, naive = UTC) restrict to
+    `since <= t_enqueue < until`. `limit` is clamped to [1, 500], or to
+    [1, 20000] when a time range is given. Each row carries `t_enqueue`/`t_done`
+    (epoch seconds) and `time` (ISO-8601 UTC)."""
+    t0, t1 = parse_ts(since), parse_ts(until)
+    cap = REQUESTS_RANGE_MAX if (t0 is not None or t1 is not None) else REQUESTS_MAX
+    n = max(1, min(limit, cap))
+    rows = metrics_db.build_recent_requests(DB, n, alias_map(), since=t0, until=t1)
+    return {
+        "_meta": _meta("requests", 5),
+        "limit": n,
+        "since": t0,
+        "until": t1,
+        "truncated": len(rows) == n,
+        "requests": rows,
+    }
 
 
 @app.get("/", response_class=HTMLResponse)
